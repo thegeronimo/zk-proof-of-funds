@@ -1,0 +1,56 @@
+[workspace]
+members = [
+    "crates/common",
+    "crates/agent",
+    "crates/backend",
+    # "crates/wasm",  # Enable when WASM bindings are ready
+]
+# Exclude the SP1 program — it compiles to RISC-V with its own toolchain
+exclude = ["program"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/user/zk_proof_of_funds"
+
+[workspace.dependencies]
+# Ethereum
+alloy = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Hashing
+sha2 = "0.10"
+tiny-keccak = { version = "2", features = ["keccak"] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# HTTP
+axum = "0.7"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Database
+rusqlite = { version = "0.31", features = ["bundled"] }
+hex = "0.4"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Testing
+rand = "0.8"
+
+# Workspace crates
+zk-pof-common = { path = "crates/common" }
+zk-pof-agent = { path = "crates/agent" }

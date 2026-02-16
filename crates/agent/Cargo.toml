@@ -1,0 +1,26 @@
+[package]
+name = "zk-pof-agent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zk-pof-common = { workspace = true }
+alloy = { workspace = true }
+sha2 = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# SP1 host-side SDK — uncomment when SP1 toolchain is installed:
+# sp1-sdk = "4"
+
+# Database (SQLite for dev)
+rusqlite = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+
+# URL parsing (for RPC fetcher)
+url = "2"

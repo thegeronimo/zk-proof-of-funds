@@ -1,0 +1,15 @@
+[package]
+name = "zk-pof-wasm"
+version.workspace = true
+edition.workspace = true
+
+# Not in workspace members yet — enable in Phase 6
+# [lib]
+# crate-type = ["cdylib"]
+
+# [dependencies]
+# zk-pof-common = { workspace = true }
+# zk-pof-prover = { workspace = true }
+# zk-pof-verifier = { workspace = true }
+# wasm-bindgen = "0.2"
+# serde-wasm-bindgen = "0.6"

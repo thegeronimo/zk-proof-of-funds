@@ -1,0 +1,44 @@
+[
+  {
+    "id": "0x0000000000000000000000000000000000000000000000000000000000000001",
+    "description": "Prove >= 1 ETH on Ethereum mainnet",
+    "threshold_wei": 1000000000000000000,
+    "token_address": null,
+    "chain_id": 1,
+    "epoch_length_blocks": 100,
+    "max_block_age": 256,
+    "root_ttl_blocks": 50400,
+    "operator": "0x0000000000000000000000000000000000000000",
+    "scope": "default",
+    "trusted_mode": true,
+    "active": true
+  },
+  {
+    "id": "0x0000000000000000000000000000000000000000000000000000000000000002",
+    "description": "Prove >= 10 ETH on Ethereum mainnet",
+    "threshold_wei": 10000000000000000000,
+    "token_address": null,
+    "chain_id": 1,
+    "epoch_length_blocks": 100,
+    "max_block_age": 256,
+    "root_ttl_blocks": 50400,
+    "operator": "0x0000000000000000000000000000000000000000",
+    "scope": "default",
+    "trusted_mode": false,
+    "active": true
+  },
+  {
+    "id": "0x0000000000000000000000000000000000000000000000000000000000000003",
+    "description": "Prove >= 10,000 USDC on Ethereum mainnet",
+    "threshold_wei": 10000000000,
+    "token_address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+    "chain_id": 1,
+    "epoch_length_blocks": 200,
+    "max_block_age": 256,
+    "root_ttl_blocks": 50400,
+    "operator": "0x0000000000000000000000000000000000000000",
+    "scope": "default",
+    "trusted_mode": false,
+    "active": true
+  }
+]

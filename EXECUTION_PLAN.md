@@ -1,0 +1,618 @@
+# ZK Proof of Funds — Solvency Agent Execution Plan
+
+## Phase Overview
+
+| Phase | Name | Goal | Estimated Effort | Status |
+|-------|------|------|-----------------|--------|
+| 0 | Foundation | Workspace restructure, SP1 setup, shared types | 2-3 days | ✅ DONE |
+| 1 | Trusted Mode MVP | End-to-end flow with EIP-712 signatures (no ZK) | 3-5 days | ✅ DONE |
+| 2 | SP1 Batch Program | ZK program for batch solvency root proving | 3-5 days | |
+| 3 | Smart Contracts | SolvencyRootOracle + PolicyRegistry on-chain | 3-5 days | |
+| 4 | Agent Core | Scheduler, RPC fetcher, chain publisher | 3-5 days | |
+| 5 | Merkle Proof Service + API | Proof serving, enrollment, status endpoints | 2-3 days | |
+| 6 | Integration & Testing | End-to-end testing, testnet deployment | 3-5 days | |
+| 7 | ERC-20 + L2 Support | Token balance proofs, multi-chain | 3-5 days | |
+| 8 | Frontend & SDK | React UI, JavaScript SDK for integrators | 3-5 days | |
+| 9 | Production Hardening | Monitoring, CI/CD, audit prep, documentation | 3-5 days | |
+
+**Total estimated effort: 28-46 days**
+
+---
+
+## Phase 0: Foundation ✅ COMPLETE
+
+**Goal**: Restructure the workspace for the Solvency Agent model, install SP1 toolchain, define new shared types.
+
+### Tasks
+
+- [x] **0.1** Restructure Cargo workspace: ✅
+  - Replace `crates/prover/` + `crates/verifier/` with `crates/agent/`
+  - Keep `crates/common/`, `crates/backend/`
+  - Remove stale `crates/circuit/` directory (Halo2 remnant)
+  - Update workspace `Cargo.toml` members
+
+- [x] **0.2** Define new shared types in `crates/common/src/types.rs`: ✅
+  - `Member` — memberId, watchTarget, policyId, status, enrolledAt
+  - `MemberStatus` — enum: Solvent, Insolvent, Pending, FetchFailed
+  - `EpochRecord` — policyId, epoch, blockNumber, root, memberCount, publishedAt
+  - `Policy` — id, thresholdWei, tokenAddress, chainId, epochLengthBlocks, maxBlockAge, rootTTLBlocks, operator, scope, description, trustedMode
+  - `MerkleProofData` — memberId, status, epoch, merkleProof, leafIndex, rootIndex, root
+  - `EnrollmentRequest` / `EnrollmentResponse`
+  - `SolvencyAssertion` (for trusted mode) — EIP-712 typed data struct
+  - Remove old types: ProofBundle, VerifierPublicInputs, VerificationResult, RailId, addr_commitment, nullifier, prover_bond, challenge_bond
+
+- [x] **0.3** Add database dependency (SQLite for dev): ✅
+  - Add `rusqlite` or `sqlx` to workspace dependencies
+  - Define database schema for members, epochs, merkle_trees, webhooks
+
+- [ ] **0.4** Install SP1 toolchain (deferred — not needed for Trusted Mode MVP):
+  ```bash
+  curl -L https://sp1up.succinct.xyz | bash
+  sp1up
+  ```
+  - Update `program/Cargo.toml` to uncomment `sp1-zkvm = "4"`
+  - Build SP1 program skeleton: `cd program && cargo prove build`
+
+- [x] **0.5** Set up `crates/agent/` skeleton: ✅
+  - `lib.rs` — module declarations
+  - `scheduler.rs` — stub
+  - `rpc_fetcher.rs` — stub
+  - `proof_worker.rs` — stub
+  - `chain_publisher.rs` — stub
+  - `merkle_service.rs` — stub
+  - `enrollment.rs` — stub
+  - `db.rs` — stub
+
+- [x] **0.6** Write unit tests for new type serialization ✅
+  - Member round-trip, Policy serialization, MerkleProofData
+
+- [x] **0.7** Verify workspace compiles: `cargo build && cargo test` ✅
+
+### Deliverables ✅
+- Restructured workspace with `crates/agent/` replacing prover/verifier
+- New type definitions matching the Solvency Agent architecture
+- SP1 toolchain deferred (not needed for Trusted Mode; program skeleton exists)
+- 22 tests passing (types + merkle + db)
+
+---
+
+## Phase 1: Trusted Mode MVP ✅ COMPLETE
+
+**Goal**: Build an end-to-end flow using EIP-712 signed assertions instead of ZK proofs. This is the fastest path to a working system and validates the entire architecture without SP1 proving overhead.
+
+### Why Trusted Mode First?
+- Validates the full enrollment → monitor → publish → verify flow
+- No SP1 proving latency — instant epoch updates
+- Tests all API endpoints, database, Merkle tree logic, contract interactions
+- Can ship to early testers while ZK mode is built in parallel
+
+### Tasks
+
+- [x] **1.1** Implement enrollment flow in `crates/agent/src/enrollment.rs`: ✅
+  - Verify ECDSA signature (ecrecover via alloy EIP-191)
+  - Compute `memberId = SHA256(signature)`
+  - Store member in database
+  - Balance checking deferred to epoch update cycle
+
+- [x] **1.2** Implement Merkle tree construction in `crates/agent/src/merkle_service.rs`: ✅
+  - Binary SHA-256 Merkle tree wrapping `crates/common/src/merkle.rs`
+  - `build_epoch_tree()` — computes leaves, builds tree, stores in DB as JSON
+  - `get_member_proof()` — retrieves stored tree, generates inclusion proof
+  - Unit tests: verify proof against root
+
+- [x] **1.3** Implement basic scheduler in `crates/agent/src/scheduler.rs`: ✅
+  - `check_epoch_due()` — pure function for epoch triggering
+  - `run()` — async loop with `tokio::sync::broadcast` channels and shutdown
+  - Per-policy scheduling via `PolicySchedule`
+
+- [x] **1.4** Implement RPC balance fetcher in `crates/agent/src/rpc_fetcher.rs`: ✅
+  - `get_balance()`, `get_balance_at_block()`, `get_block_number()`
+  - `fetch_member_balances()` — batch with threshold comparison
+  - Type-erased provider (`Box<dyn Provider + Send + Sync>`)
+  - Mock module for testing
+
+- [x] **1.5** Implement EIP-712 signing for trusted mode in `crates/agent/src/proof_worker.rs`: ✅
+  - EIP-712 typed data via `alloy::sol!` macro (`SolvencyRootUpdate`)
+  - `sign_trusted_assertion()` — signs with operator key
+  - Domain: name="SolvencyRootOracle", version="1"
+
+- [x] **1.5b** Implement epoch recording in `crates/agent/src/chain_publisher.rs`: ✅
+  - `record_epoch()` — stores epoch in DB
+  - On-chain tx submission deferred to Phase 3/4
+
+- [x] **1.6** Implement database layer in `crates/agent/src/db.rs`: ✅
+  - SQLite with rusqlite
+  - Tables: members, epochs, merkle_trees, webhooks
+  - CRUD operations for all entities
+
+- [x] **1.7** Implement API endpoints in `crates/backend/`: ✅
+  - `POST /enroll` — member enrollment with signature verification
+  - `GET /proof/{policyId}/{memberId}` — Merkle proof serving
+  - `GET /status/{policyId}/{memberId}` — member status
+  - `GET /health` — health check
+  - `GET /admin/members/{policyId}` — list members
+  - `GET /admin/epochs/{policyId}` — epoch history
+
+- [x] **1.8** Write integration tests: ✅
+  - Full trusted mode flow: enroll → epoch → proof → verify
+  - Status change across epochs (solvent → insolvent → solvent)
+  - Multiple independent policies
+  - EIP-712 signing verification
+  - Scheduler epoch triggering logic
+  - Member ID uniqueness (SHA256 determinism + avalanche)
+
+### Deliverables ✅
+- Working trusted mode end-to-end flow (51 tests passing)
+- All API endpoints functional (6 routes: health, enroll, proof, status, admin/members, admin/epochs)
+- Merkle tree construction + proof serving
+- Database persistence (SQLite via rusqlite)
+- Integration tests passing (6 integration tests covering full flow)
+- EIP-712 trusted mode signing working
+- 28 agent unit tests + 6 integration tests + 17 common tests = 51 total
+
+---
+
+## Phase 2: SP1 Batch Program
+
+**Goal**: Build the SP1 ZK program that proves a batch of EIP-1186 state proofs and computes the solvency Merkle root.
+
+### Tasks
+
+- [ ] **2.1** Implement MPT verification in `program/src/mpt.rs`:
+  - Verify EIP-1186 account proof: MPT nodes + state root + address → account balance
+  - Use `alloy-trie` or minimal custom implementation (must compile to RISC-V)
+  - RLP decoding of account structure (nonce, balance, storageHash, codeHash)
+  - Unit tests with real Ethereum state proof data
+
+- [ ] **2.2** Implement Merkle tree in `program/src/merkle.rs`:
+  - Binary SHA-256 Merkle tree (must match off-chain implementation exactly)
+  - `compute_root(leaves: &[[u8; 32]]) -> [u8; 32]`
+  - Unit tests: verify root matches off-chain computation
+
+- [ ] **2.3** Implement SP1 program entry point in `program/src/main.rs`:
+  - Read global inputs (state_root, policy_id, epoch, threshold, block_number, chain_id, member_count)
+  - For each member: read inputs, verify MPT proof, determine status, compute leaf
+  - Build Merkle tree, compute root
+  - Commit public outputs (state_root, policy_id, epoch, solvency_root, threshold, member_count, block_number, chain_id)
+
+- [ ] **2.4** Implement host-side proof generation in `crates/agent/src/proof_worker.rs`:
+  - Load SP1 ELF binary
+  - Construct SP1 stdin with all member inputs
+  - Call `ProverClient::prove()` for Groth16-wrapped proof
+  - Support `ProverClient::execute()` for testing (no proof generation)
+  - Parse public outputs from proof
+
+- [ ] **2.5** End-to-end test with mock data:
+  - Create mock members with mock MPT proofs
+  - Generate SP1 proof with `execute()` mode (fast, no real proving)
+  - Verify public outputs match expected values
+  - Verify Merkle root matches off-chain computation
+
+- [ ] **2.6** Test with real Ethereum state:
+  - Fetch real `eth_getProof` for known addresses
+  - Feed real MPT proofs into SP1 program
+  - Verify proof generation succeeds with real data
+
+### Deliverables
+- SP1 batch program that verifies N state proofs and computes solvency Merkle root
+- Host-side proof generation working
+- Tests with both mock and real Ethereum data
+- Benchmarks: proving time vs batch size
+
+---
+
+## Phase 3: Smart Contracts
+
+**Goal**: Deploy Solidity contracts for on-chain root storage and membership verification.
+
+### Tasks
+
+- [ ] **3.1** Set up Foundry project in `contracts/`:
+  ```bash
+  cd contracts && forge init --no-commit
+  forge install succinctlabs/sp1-contracts
+  forge install OpenZeppelin/openzeppelin-contracts
+  ```
+
+- [ ] **3.2** Implement `PolicyRegistry.sol`:
+  - Policy struct with all fields (threshold, chainId, epochLength, maxBlockAge, rootTTL, operator, scope, trustedMode)
+  - `createPolicy()`, `updatePolicy()`, `deactivatePolicy()`, `getPolicy()`
+  - Owner-only policy creation, operator authorization
+  - Events: PolicyCreated, PolicyUpdated, PolicyDeactivated
+
+- [ ] **3.3** Implement `SolvencyRootOracle.sol`:
+  - `updateRoot()` — ZK mode: verify SP1 proof, store root
+  - `updateRootTrusted()` — Trusted mode: verify EIP-712 operator signature, store root
+  - `verifyMember()` — verify Merkle inclusion proof against stored root
+  - `isMemberSolvent()` — convenience: check latest root with status=1
+  - Root TTL enforcement
+  - Blockhash validation for freshness
+  - Events: RootUpdated
+
+- [ ] **3.4** Implement `MerkleVerifier.sol` library:
+  - SHA-256 based Merkle proof verification
+  - `verifyProof(proof, root, leaf) -> bool`
+  - Gas-optimized for on-chain use
+
+- [ ] **3.5** Generate SP1 verification key:
+  - Build SP1 program → get ELF binary
+  - Compute `vkey` from ELF using `sp1_sdk`
+  - Embed in SolvencyRootOracle constructor
+
+- [ ] **3.6** Write Foundry tests:
+  - PolicyRegistry: CRUD, authorization, deactivation
+  - SolvencyRootOracle: updateRoot (both ZK and trusted mode)
+  - SolvencyRootOracle: verifyMember with valid/invalid proofs
+  - SolvencyRootOracle: root TTL expiry
+  - MerkleVerifier: proof verification with various tree sizes
+  - Gas benchmarks for all operations
+
+- [ ] **3.7** Deploy to local Anvil fork for integration testing
+
+### Deliverables
+- Deployable Solidity contracts (Oracle + Registry + MerkleVerifier)
+- Passing Foundry test suite
+- Gas benchmarks: updateRoot ~320k, verifyMember ~10k
+- Local deployment for integration testing
+
+---
+
+## Phase 4: Agent Core
+
+**Goal**: Build the core Solvency Agent background services that run the epoch update loop.
+
+### Tasks
+
+- [ ] **4.1** Implement full RPC fetcher with EIP-1186 in `crates/agent/src/rpc_fetcher.rs`:
+  - `eth_getProof(address, [], blockNumber)` for each member
+  - Parse MPT proof nodes from response
+  - Extract balance from proven account
+  - Batch fetching with rate limiting
+  - Retry logic with exponential backoff
+  - Handle RPC failures gracefully (mark member as fetch_failed)
+
+- [ ] **4.2** Implement full scheduler in `crates/agent/src/scheduler.rs`:
+  - Block-based scheduling per policy
+  - Handle multiple concurrent policies
+  - Track last epoch block per policy
+  - Graceful shutdown
+  - Recovery after restart (resume from last completed epoch)
+
+- [ ] **4.3** Implement chain publisher for ZK mode in `crates/agent/src/chain_publisher.rs`:
+  - Build `updateRoot()` transaction with proof bytes
+  - Gas estimation and management
+  - Nonce tracking for sequential transactions
+  - Transaction confirmation with retry
+  - Gas bump if tx stuck
+  - Support both ZK mode and trusted mode
+
+- [ ] **4.4** Wire epoch update pipeline:
+  ```
+  Scheduler triggers →
+    RPC Fetcher (fetch all balances) →
+      Proof Worker (generate SP1 proof OR sign EIP-712) →
+        Chain Publisher (submit updateRoot tx) →
+          Merkle Service (store tree for proof serving) →
+            Webhook Service (notify status changes)
+  ```
+
+- [ ] **4.5** Implement webhook service:
+  - Register webhooks per policy
+  - Fire webhooks on: member.enrolled, member.status_changed, epoch.completed, epoch.failed
+  - Retry failed webhook deliveries
+  - Webhook signing for verification
+
+- [ ] **4.6** Implement configuration:
+  - Environment variables / config file for: RPC URL, operator private key, database path, SP1 settings
+  - Per-policy configuration from PolicyRegistry (read from chain or config file)
+
+- [ ] **4.7** Integration tests:
+  - Full epoch cycle: schedule → fetch → prove → publish → store
+  - Multiple policies running concurrently
+  - Member status change detection
+  - Failure recovery
+
+### Deliverables
+- Fully functional Solvency Agent background service
+- Epoch update loop running automatically
+- Supports both ZK and trusted mode
+- Webhook notifications working
+- Integration tests passing
+
+---
+
+## Phase 5: Merkle Proof Service + API
+
+**Goal**: Complete the API layer and Merkle proof serving for integrators.
+
+### Tasks
+
+- [ ] **5.1** Complete Merkle proof service in `crates/agent/src/merkle_service.rs`:
+  - Store complete Merkle tree per epoch per policy
+  - Serve per-member inclusion proofs on demand
+  - Cache recent proofs for fast serving
+  - Handle requests for historical epochs
+
+- [ ] **5.2** Implement remaining API endpoints:
+  - `GET /tx/{policyId}/{memberId}` — pre-built verify transaction
+  - `GET /policy/{policyId}` — policy details
+  - `POST /admin/policy` — create policy
+  - `PUT /admin/policy/{policyId}` — update policy
+  - `DELETE /admin/policy/{policyId}` — deactivate policy
+  - `GET /admin/members/{policyId}` — list members
+  - `GET /admin/epochs/{policyId}` — epoch history
+  - `POST /admin/webhook` — register webhook
+  - `DELETE /admin/webhook/{webhookId}` — remove webhook
+
+- [ ] **5.3** API authentication and authorization:
+  - API keys for integrators
+  - Admin endpoints require operator authentication
+  - Rate limiting
+
+- [ ] **5.4** API documentation:
+  - OpenAPI/Swagger spec
+  - Example requests and responses
+
+- [ ] **5.5** Load testing:
+  - Benchmark proof serving under load (target: <100ms p99)
+  - Benchmark enrollment throughput
+  - Benchmark concurrent policy handling
+
+### Deliverables
+- Complete REST API matching the architecture spec
+- Fast Merkle proof serving (<100ms p99)
+- API documentation
+- Load test results
+
+---
+
+## Phase 6: Integration & Testing
+
+**Goal**: End-to-end testing on a testnet, hardening, edge cases.
+
+### Tasks
+
+- [ ] **6.1** Deploy contracts to Sepolia testnet:
+  - Deploy PolicyRegistry, SolvencyRootOracle
+  - Create test policies
+  - Verify contracts on Etherscan
+
+- [ ] **6.2** Run Solvency Agent against Sepolia:
+  - Enroll real test wallets
+  - Run epoch updates against real Ethereum state
+  - Verify on-chain roots and Merkle proofs
+
+- [ ] **6.3** Build a test relying protocol contract:
+  - Simple contract that gates a function behind `oracle.verifyMember()`
+  - Test full flow: enroll → epoch update → dApp calls agent for proof → dApp includes proof in tx → contract verifies
+
+- [ ] **6.4** Edge case testing:
+  - Member balance drops below threshold → status=0 in next epoch
+  - Member balance recovers → status=1 in following epoch
+  - New member enrolled mid-epoch → appears in next epoch
+  - RPC failure for some members → graceful degradation
+  - SP1 proving failure → epoch skipped, roots still valid from previous epoch
+  - Multiple policies with different epoch lengths
+  - Large batch (100+ members)
+  - Root TTL expiry → verifyMember returns false
+
+- [ ] **6.5** Security testing:
+  - Attempt to submit invalid root (should fail ZK verification)
+  - Attempt to use expired root (should fail TTL check)
+  - Attempt to forge Merkle proof (should fail verification)
+  - Unauthorized updateRoot call (should fail operator check)
+  - Replay attacks with old proofs
+
+- [ ] **6.6** Performance benchmarks:
+  - SP1 proving time vs batch size (10, 50, 100, 500 members)
+  - End-to-end epoch latency
+  - On-chain gas for updateRoot and verifyMember
+  - API response times under load
+
+### Deliverables
+- Successful testnet deployment and operation
+- All edge cases tested and handled
+- Security test results
+- Performance benchmarks documented
+
+---
+
+## Phase 7: ERC-20 + L2 Support
+
+**Goal**: Extend the system to support ERC-20 token balances and L2 networks.
+
+### Tasks
+
+- [ ] **7.1** Extend RPC fetcher for ERC-20 storage proofs:
+  - `eth_getProof(tokenContract, [balanceSlot], blockNumber)`
+  - Compute storage slot: `keccak256(abi.encode(holderAddress, mappingSlot))`
+  - Parse storage proof for balance value
+
+- [ ] **7.2** Extend SP1 program for storage proofs:
+  - Verify both account proof (token contract exists) and storage proof (balanceOf[address])
+  - Handle different storage layouts (standard ERC-20 mapping)
+  - Same batch model: multiple members, some ETH, some ERC-20
+
+- [ ] **7.3** Extend Policy to support ERC-20:
+  - `tokenAddress` field: `address(0)` = native ETH, else ERC-20 contract address
+  - `mappingSlot` field for ERC-20 storage layout
+  - Token registry for known slot mappings (USDC, WETH, DAI, etc.)
+
+- [ ] **7.4** L2 support (Optimism, Arbitrum, Base):
+  - Per-chain policy configuration via `chainId`
+  - Agent connects to L2 RPC endpoints
+  - Same EIP-1186 proofs work on L2s (they expose the same API)
+  - Separate Oracle deployments per chain, or cross-chain root publication
+
+- [ ] **7.5** Tests with real tokens:
+  - Fetch storage proofs for USDC, WETH, DAI balances
+  - Generate batch proofs with mixed ETH + ERC-20 members
+  - Test on L2 testnets (Optimism Sepolia, Arbitrum Sepolia)
+
+### Deliverables
+- ERC-20 balance proofs working in batch model
+- L2 support for at least one rollup
+- Tests with real token contracts
+
+---
+
+## Phase 8: Frontend & SDK
+
+**Goal**: Build a frontend for enrollment/monitoring and a JavaScript SDK for integrators.
+
+### Tasks
+
+- [ ] **8.1** Set up React app (Vite + TypeScript + wagmi/viem):
+  - Wallet connection (MetaMask, WalletConnect)
+  - Policy browser
+
+- [ ] **8.2** Enrollment UI:
+  - Select policy → connect wallet → sign message → enroll
+  - Show memberId and enrollment confirmation
+
+- [ ] **8.3** Member dashboard:
+  - Current status per policy
+  - Epoch history
+  - Balance monitoring status
+
+- [ ] **8.4** JavaScript SDK for integrators:
+  ```typescript
+  const client = new SolvencyClient({ agentUrl: "..." });
+
+  // Get membership proof for a smart contract call
+  const proof = await client.getMemberProof(policyId, memberId);
+
+  // Build verify calldata for contract interaction
+  const calldata = client.buildVerifyCalldata(proof);
+  ```
+
+- [ ] **8.5** Integration examples:
+  - Example dApp that gates a feature behind solvency verification
+  - Example smart contract using `oracle.verifyMember()`
+
+### Deliverables
+- Working frontend with enrollment and monitoring
+- JavaScript/TypeScript SDK
+- Integration examples and documentation
+
+---
+
+## Phase 9: Production Hardening
+
+**Goal**: Prepare for production deployment.
+
+### Tasks
+
+- [ ] **9.1** Monitoring and alerting:
+  - Prometheus metrics for: epoch latency, proof generation time, API latency, member count, error rates
+  - Grafana dashboards
+  - PagerDuty/Slack alerts for epoch failures
+
+- [ ] **9.2** Database migration to PostgreSQL:
+  - SQLite → PostgreSQL for production workloads
+  - Connection pooling
+  - Backup strategy
+
+- [ ] **9.3** CI/CD pipeline:
+  - GitHub Actions: build, test, lint
+  - Contract deployment automation
+  - Docker containerization for the agent
+
+- [ ] **9.4** Security audit preparation:
+  - Document security model and assumptions
+  - Smart contract audit scope
+  - ZK program correctness review
+  - Dependency audit
+
+- [ ] **9.5** Documentation:
+  - Operator guide: how to run a Solvency Agent
+  - Integrator guide: how to integrate with a relying protocol
+  - API reference
+  - Smart contract documentation
+
+- [ ] **9.6** Mainnet deployment:
+  - Deploy contracts to Ethereum mainnet
+  - Configure production agent
+  - Initial policy setup
+  - Monitoring in production
+
+### Deliverables
+- Production-ready system
+- Comprehensive monitoring
+- Documentation for operators and integrators
+- Mainnet deployment
+
+---
+
+## Dependency Graph
+
+```
+Phase 0 (Foundation)
+    │
+    ├──► Phase 1 (Trusted Mode MVP)
+    │         │
+    │         ├──► Phase 5 (API + Proof Service)
+    │         │         │
+    │         │         └──► Phase 6 (Integration Testing)
+    │         │                    │
+    │         └──► Phase 4 (Agent Core)──┘
+    │                    │
+    │                    └──► Phase 7 (ERC-20 + L2)
+    │
+    ├──► Phase 2 (SP1 Batch Program)
+    │         │
+    │         └──► Phase 3 (Smart Contracts)──► Phase 4
+    │
+    └──► Phase 8 (Frontend & SDK) ◄── Phase 6
+              │
+              └──► Phase 9 (Production Hardening)
+```
+
+**Critical path**: Phase 0 → Phase 1 → Phase 4 → Phase 6 → Phase 9
+
+**Parallelizable**:
+- Phase 2 (SP1 Program) can start alongside Phase 1 (Trusted Mode)
+- Phase 3 (Contracts) can start alongside Phase 1 once Phase 2 has the vkey
+- Phase 8 (Frontend) can start once Phase 5 (API) is ready
+
+---
+
+## Risk Register
+
+| Risk | Impact | Likelihood | Mitigation |
+|------|--------|-----------|------------|
+| SP1 proving too slow for epoch window | Can't publish roots in time | Medium | Trusted mode fallback; Succinct Prover Network; increase maxBlockAge |
+| Large batches exceed SP1 memory | Can't prove large member sets | Medium | Split into sub-batches; tree of trees approach |
+| alloy-trie incompatible with SP1 RISC-V | Can't reuse MPT lib in zkVM | Medium | Write minimal MPT verifier for the program |
+| `blockhash` 256-block limit too tight | Tight window for proving | High | Block selection strategy; EIP-2935 when available |
+| RPC rate limiting | Can't fetch all member proofs in time | Medium | Multiple RPC providers; caching; batch requests |
+| SP1 SDK breaking changes | Migration effort | Low | Pin version; follow releases |
+| Gas price spikes | Expensive epoch updates | Medium | Gas price oracle; configurable gas ceiling; skip epoch if too expensive |
+| Agent key compromise | Unauthorized root updates | Low | HSM for operator key; multisig operator; ZK mode prevents false statuses |
+
+---
+
+## Getting Started
+
+1. **Install tooling**:
+   ```bash
+   # Rust (if not installed)
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   rustup update stable
+
+   # SP1
+   curl -L https://sp1up.succinct.xyz | bash
+   sp1up
+
+   # Foundry
+   curl -L https://foundry.paradigm.xyz | bash
+   foundryup
+   ```
+
+2. **Build the workspace**: `cargo build && cargo test`
+
+3. **Build SP1 program**: `cd program && cargo prove build`
+
+4. **Start with Phase 0**: Restructure workspace and define types.
+
+5. **Start Phase 1 immediately**: Trusted mode MVP gives you a working system fast.

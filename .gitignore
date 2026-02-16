@@ -1,0 +1,35 @@
+# Rust
+/target
+**/target/
+**/*.rs.bk
+Cargo.lock
+
+# Build artifacts
+*.pk.bin
+*.vk.bin
+*.params
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Node (for web/ and contracts/)
+node_modules/
+dist/
+out/
+
+# Foundry
+contracts/cache/
+contracts/out/
+
+# WASM build artifacts
+pkg/

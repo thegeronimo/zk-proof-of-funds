@@ -1,0 +1,17 @@
+[package]
+name = "zk-pof-program"
+version = "0.1.0"
+edition = "2021"
+
+# This crate compiles to RISC-V for SP1 execution.
+# Build with: cd program && cargo prove build
+
+[dependencies]
+# SP1 zkVM guest library — provides io::read/commit and entrypoint macro
+sp1-zkvm = "4"
+
+# Hashing (SP1 has SHA-256 precompile for performance)
+sha2 = "0.10"
+
+# Serialization for reading inputs
+serde = { version = "1", features = ["derive"] }

@@ -7,7 +7,7 @@
 | 0 | Foundation | Workspace restructure, SP1 setup, shared types | 2-3 days | ✅ DONE |
 | 1 | Trusted Mode MVP | End-to-end flow with EIP-712 signatures (no ZK) | 3-5 days | ✅ DONE |
 | 2 | SP1 Batch Program | ZK program for batch solvency root proving | 3-5 days | |
-| 3 | Smart Contracts | SolvencyRootOracle + PolicyRegistry on-chain | 3-5 days | |
+| 3 | Smart Contracts | SolvencyRootOracle + PolicyRegistry on-chain | 3-5 days | ✅ DONE |
 | 4 | Agent Core | Scheduler, RPC fetcher, chain publisher | 3-5 days | |
 | 5 | Merkle Proof Service + API | Proof serving, enrollment, status endpoints | 2-3 days | |
 | 6 | Integration & Testing | End-to-end testing, testnet deployment | 3-5 days | |
@@ -201,59 +201,54 @@
 
 ---
 
-## Phase 3: Smart Contracts
+## Phase 3: Smart Contracts ✅ COMPLETE
 
 **Goal**: Deploy Solidity contracts for on-chain root storage and membership verification.
 
 ### Tasks
 
-- [ ] **3.1** Set up Foundry project in `contracts/`:
-  ```bash
-  cd contracts && forge init --no-commit
-  forge install succinctlabs/sp1-contracts
-  forge install OpenZeppelin/openzeppelin-contracts
-  ```
+- [x] **3.1** Set up Foundry project in `contracts/`: ✅
+  - foundry.toml with solc 0.8.26, via_ir=true, cancun EVM, optimizer 200 runs
+  - OpenZeppelin v5 (Ownable, EIP712, ECDSA)
+  - SP1 contracts v6 (ISP1Verifier)
+  - forge-std for testing
 
-- [ ] **3.2** Implement `PolicyRegistry.sol`:
-  - Policy struct with all fields (threshold, chainId, epochLength, maxBlockAge, rootTTL, operator, scope, trustedMode)
-  - `createPolicy()`, `updatePolicy()`, `deactivatePolicy()`, `getPolicy()`
-  - Owner-only policy creation, operator authorization
-  - Events: PolicyCreated, PolicyUpdated, PolicyDeactivated
+- [x] **3.2** Implement `PolicyRegistry.sol`: ✅
+  - Policy struct: thresholdWei, tokenAddress, chainId, epochLengthBlocks, maxBlockAge, rootTTLBlocks, operator, scope, trustedMode, active
+  - `createPolicy()`, `updatePolicy()`, `deactivatePolicy()`, `getPolicy()` with custom errors
+  - Owner-only creation, owner-or-operator update, owner-only deactivation
+  - Validates maxBlockAge ≤ 256, non-zero epoch length and TTL
 
-- [ ] **3.3** Implement `SolvencyRootOracle.sol`:
-  - `updateRoot()` — ZK mode: verify SP1 proof, store root
-  - `updateRootTrusted()` — Trusted mode: verify EIP-712 operator signature, store root
-  - `verifyMember()` — verify Merkle inclusion proof against stored root
-  - `isMemberSolvent()` — convenience: check latest root with status=1
-  - Root TTL enforcement
-  - Blockhash validation for freshness
-  - Events: RootUpdated
+- [x] **3.3** Implement `SolvencyRootOracle.sol`: ✅
+  - `updateRoot()` — ZK mode: verify SP1 proof via ISP1Verifier, decode + validate public values
+  - `updateRootTrusted()` — Trusted mode: verify EIP-712 operator signature (relayers can submit)
+  - `verifyMember()` — Merkle proof + TTL + epoch match
+  - `isMemberSolvent()` — convenience with status=1
+  - `setProgramVKey()` — owner-only (updatable for Phase 2 vkey)
+  - RootEntry packed into 2 storage slots (not 5)
+  - EIP-712 domain/struct matches Rust proof_worker.rs exactly
 
-- [ ] **3.4** Implement `MerkleVerifier.sol` library:
-  - SHA-256 based Merkle proof verification
-  - `verifyProof(proof, root, leaf) -> bool`
-  - Gas-optimized for on-chain use
+- [x] **3.4** Implement `MerkleVerifier.sol` library: ✅
+  - `computeLeaf()` — sha256(memberId || status || epoch || policyId) = 73 bytes
+  - `verifyProof()` — index-based left/right hashing matching merkle.rs
+  - Uses SHA-256 precompile (cheap: ~84 gas per level)
 
-- [ ] **3.5** Generate SP1 verification key:
-  - Build SP1 program → get ELF binary
-  - Compute `vkey` from ELF using `sp1_sdk`
-  - Embed in SolvencyRootOracle constructor
+- [ ] **3.5** Generate SP1 verification key (deferred to Phase 2):
+  - Placeholder vkey (bytes32(0)) used, updatable via setProgramVKey()
 
-- [ ] **3.6** Write Foundry tests:
-  - PolicyRegistry: CRUD, authorization, deactivation
-  - SolvencyRootOracle: updateRoot (both ZK and trusted mode)
-  - SolvencyRootOracle: verifyMember with valid/invalid proofs
-  - SolvencyRootOracle: root TTL expiry
-  - MerkleVerifier: proof verification with various tree sizes
-  - Gas benchmarks for all operations
+- [x] **3.6** Write Foundry tests: ✅
+  - 12 MerkleVerifier tests (leaf computation, 2/3/4/8-leaf trees, invalid proofs)
+  - 21 PolicyRegistry tests (CRUD, auth, validation, deactivation)
+  - 25 SolvencyRootOracle tests (EIP-712, ZK mode, verifyMember, TTL, epochs, gas)
+  - MockSP1Verifier for ZK code path testing
 
-- [ ] **3.7** Deploy to local Anvil fork for integration testing
+- [ ] **3.7** Deploy to local Anvil fork (deferred to Phase 6 integration testing)
 
-### Deliverables
-- Deployable Solidity contracts (Oracle + Registry + MerkleVerifier)
-- Passing Foundry test suite
-- Gas benchmarks: updateRoot ~320k, verifyMember ~10k
-- Local deployment for integration testing
+### Deliverables ✅
+- 4 Solidity contracts + 1 interface + 1 mock = 6 contract files
+- 58 Foundry tests all passing
+- Gas benchmarks: updateRootTrusted ~100k, verifyMember ~8k (both well under targets)
+- Deploy script ready (contracts/script/Deploy.s.sol)
 
 ---
 

@@ -30,6 +30,8 @@ out/
 # Foundry
 contracts/cache/
 contracts/out/
+contracts/lib/
+contracts/broadcast/
 
 # WASM build artifacts
 pkg/

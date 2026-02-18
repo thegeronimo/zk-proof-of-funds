@@ -14,8 +14,10 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-# SP1 host-side SDK — uncomment when SP1 toolchain is installed:
-# sp1-sdk = "4"
+# SP1 host-side SDK (for ZK proof generation)
+# v6 required for riscv64 ELF support (current SP1 toolchain produces 64-bit ELFs)
+# 'blocking' feature provides synchronous API; 'network' disabled to avoid extra deps
+sp1-sdk = { version = "6", default-features = false, features = ["blocking"] }
 
 # Database (SQLite for dev)
 rusqlite = { workspace = true }
@@ -24,3 +26,13 @@ chrono = { workspace = true }
 
 # URL parsing (for RPC fetcher)
 url = "2"
+
+# HTTP client (for webhook delivery)
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tiny-keccak = { workspace = true }
+# alloy with node-bindings for spawning Anvil in integration tests
+# node-bindings is NOT included in alloy's "full" feature
+alloy = { workspace = true, features = ["node-bindings"] }
+sha2 = { workspace = true }

@@ -5,10 +5,11 @@
 //!
 //! 1. Reads global inputs (state_root, policy_id, epoch, threshold, etc.)
 //! 2. For each member:
-//!    a. Reads member inputs (member_id, watch_target, balance)
-//!    b. [Phase 2] Verifies the EIP-1186 MPT proof against the state root
-//!    c. Determines status (balance >= threshold → 1, else → 0)
-//!    d. Computes leaf = SHA256(member_id || status || epoch || policy_id)
+//!    a. Reads member inputs (member_id, watch_target, MPT proof nodes)
+//!    b. Verifies the EIP-1186 MPT proof against the state root
+//!    c. Extracts the balance from the proven account state
+//!    d. Determines status (balance >= threshold → 1, else → 0)
+//!    e. Computes leaf = SHA256(member_id || status || epoch || policy_id)
 //! 3. Builds the Merkle tree from all leaves
 //! 4. Commits public outputs (solvency_root, policy_id, epoch, etc.)
 //!
@@ -22,8 +23,9 @@ use sha2::{Digest, Sha256};
 
 /// Main entry point for the SP1 batch solvency root updater.
 ///
-/// In Phase 0 this is a skeleton that demonstrates the batch architecture
-/// with trusted balance inputs. Phase 2 will add real MPT verification.
+/// Processes a batch of members for a single policy/epoch:
+/// verifies each member's balance via MPT proof, determines solvency status,
+/// and commits the resulting Merkle root as a public output.
 pub fn main() {
     // ── 1. Read global inputs ──────────────────────────────────────────
     let state_root: [u8; 32] = sp1_zkvm::io::read();
@@ -39,18 +41,19 @@ pub fn main() {
 
     for _ in 0..member_count {
         let member_id: [u8; 32] = sp1_zkvm::io::read();
-        let _watch_target: [u8; 20] = sp1_zkvm::io::read();
-        let balance: u64 = sp1_zkvm::io::read();
+        let watch_target: [u8; 20] = sp1_zkvm::io::read();
+        let proof_nodes: Vec<Vec<u8>> = sp1_zkvm::io::read();
 
-        // TODO (Phase 2): Read and verify EIP-1186 MPT proof instead of
-        // trusting the balance input directly.
-        // let mpt_proof: Vec<Vec<u8>> = sp1_zkvm::io::read();
-        // let proven_balance = mpt::verify_account_balance(
-        //     &mpt_proof, &state_root, &watch_target
-        // );
+        // Verify the EIP-1186 MPT proof against the state root and extract balance.
+        // Panics (aborting the proof) if the proof is invalid.
+        let balance_bytes = mpt::verify_account_balance(
+            &state_root, &watch_target, &proof_nodes,
+        );
 
-        // 2b. Determine status
-        let status: u8 = if balance >= threshold_wei { 1 } else { 0 };
+        // 2b. Determine status: compare balance >= threshold (both as big-endian U256)
+        let mut threshold_bytes = [0u8; 32];
+        threshold_bytes[24..].copy_from_slice(&threshold_wei.to_be_bytes());
+        let status: u8 = if balance_bytes >= threshold_bytes { 1 } else { 0 };
 
         // 2c. Compute leaf = SHA256(member_id || status || epoch || policy_id)
         let leaf = compute_leaf(&member_id, status, epoch, &policy_id);
@@ -125,5 +128,4 @@ fn compute_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     current_level[0]
 }
 
-// TODO (Phase 2.1): Implement MPT verification
-// mod mpt;
+mod mpt;

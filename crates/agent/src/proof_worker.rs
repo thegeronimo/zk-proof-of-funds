@@ -2,12 +2,27 @@
 //!
 //! In trusted mode (Phase 1): signs an EIP-712 typed data assertion with the operator key.
 //! In ZK mode (Phase 2): loads the SP1 ELF binary, constructs stdin, generates Groth16 proof.
+//!
+//! ## ZK Mode Architecture
+//!
+//! The SP1 program (program/src/main.rs) reads inputs via `sp1_zkvm::io::read()` (bincode):
+//!   Global: state_root, policy_id, epoch, threshold_wei, block_number, chain_id, member_count
+//!   Per-member: member_id, watch_target, proof_nodes (MPT proof)
+//!
+//! It commits public outputs via `sp1_zkvm::io::commit()` (bincode):
+//!   state_root, policy_id, epoch, solvency_root, threshold_wei, member_count, block_number, chain_id
+//!
+//! The Solidity contract expects ABI-encoded public values:
+//!   abi.decode(publicValues, (bytes32, bytes32, uint64, bytes32, uint64, uint32, uint64, uint64))
+//!
+//! The host must re-encode from bincode → ABI for on-chain submission.
 
 use anyhow::{Context, Result};
 use alloy::primitives::{Address, FixedBytes};
 use alloy::signers::local::PrivateKeySigner;
-use alloy::sol_types::{SolStruct, eip712_domain};
+use alloy::sol_types::{SolStruct, SolValue, eip712_domain};
 use alloy::sol;
+use sp1_sdk::blocking::{Elf, ProverClient, Prover, ProveRequest, SP1Stdin};
 use tracing::info;
 
 // Define the EIP-712 struct for trusted mode solvency assertion.
@@ -144,9 +159,213 @@ impl ProofWorker {
     pub fn operator_address(&self) -> Address {
         self.operator_signer.address()
     }
+}
 
-    // TODO (Phase 2.4): Implement SP1 proof generation for ZK mode
-    // pub async fn generate_sp1_proof(&self, ...) -> Result<Vec<u8>> { ... }
+// ─── ZK Mode: SP1 Batch Proof Generation ─────────────────────────────────────
+
+/// Input for a single member in the SP1 batch program.
+#[derive(Debug, Clone)]
+pub struct MemberProofInput {
+    /// SHA-256 member ID (32 bytes).
+    pub member_id: [u8; 32],
+    /// Ethereum address being watched (20 bytes).
+    pub watch_target: [u8; 20],
+    /// RLP-encoded MPT proof nodes from eth_getProof.
+    pub proof_nodes: Vec<Vec<u8>>,
+}
+
+/// Global inputs for an SP1 batch solvency proof.
+#[derive(Debug, Clone)]
+pub struct BatchProofInputs {
+    /// Ethereum state root from the block header.
+    pub state_root: [u8; 32],
+    /// Policy ID (32 bytes).
+    pub policy_id: [u8; 32],
+    /// Epoch number.
+    pub epoch: u64,
+    /// Solvency threshold in wei (fits in u64 for now).
+    pub threshold_wei: u64,
+    /// Block number at which proofs were fetched.
+    pub block_number: u64,
+    /// Chain ID (e.g., 1 for mainnet).
+    pub chain_id: u64,
+    /// Per-member inputs with MPT proofs.
+    pub members: Vec<MemberProofInput>,
+}
+
+/// Result of SP1 proof generation or execution.
+#[derive(Debug, Clone)]
+pub struct ZkProofResult {
+    /// Groth16 proof bytes for on-chain verification (empty for execute-only mode).
+    pub proof_bytes: Vec<u8>,
+    /// ABI-encoded public values matching the Solidity contract's expected format.
+    pub public_values_abi: Vec<u8>,
+    /// The computed solvency Merkle root (extracted from SP1 public values).
+    pub solvency_root: [u8; 32],
+    /// The state root committed by the program.
+    pub state_root: [u8; 32],
+    /// Policy ID committed by the program.
+    pub policy_id: [u8; 32],
+    /// Epoch committed by the program.
+    pub epoch: u64,
+    /// Threshold committed by the program.
+    pub threshold_wei: u64,
+    /// Member count committed by the program.
+    pub member_count: u32,
+    /// Block number committed by the program.
+    pub block_number: u64,
+    /// Chain ID committed by the program.
+    pub chain_id: u64,
+}
+
+/// SP1 ELF binary for the batch solvency program.
+/// Built by `cd program && cargo prove build`.
+const SP1_ELF_BYTES: &[u8] = include_bytes!(
+    "../../../program/target/elf-compilation/riscv64im-succinct-zkvm-elf/release/zk-pof-program"
+);
+
+/// Build an SP1Stdin from batch proof inputs.
+///
+/// Writes global inputs followed by per-member inputs in the exact order
+/// the SP1 program reads them via `sp1_zkvm::io::read()`.
+fn build_sp1_stdin(inputs: &BatchProofInputs) -> SP1Stdin {
+    let mut stdin = SP1Stdin::new();
+
+    // Global inputs (order must match program/src/main.rs)
+    stdin.write(&inputs.state_root);
+    stdin.write(&inputs.policy_id);
+    stdin.write(&inputs.epoch);
+    stdin.write(&inputs.threshold_wei);
+    stdin.write(&inputs.block_number);
+    stdin.write(&inputs.chain_id);
+    stdin.write(&(inputs.members.len() as u32));
+
+    // Per-member inputs
+    for member in &inputs.members {
+        stdin.write(&member.member_id);
+        stdin.write(&member.watch_target);
+        stdin.write(&member.proof_nodes);
+    }
+
+    stdin
+}
+
+/// Read SP1 public values (bincode) and re-encode as ABI for the Solidity contract.
+///
+/// The SP1 program commits in this order:
+///   state_root (bytes32), policy_id (bytes32), epoch (u64), solvency_root (bytes32),
+///   threshold_wei (u64), member_count (u32), block_number (u64), chain_id (u64)
+///
+/// The Solidity contract decodes:
+///   abi.decode(publicValues, (bytes32, bytes32, uint64, bytes32, uint64, uint32, uint64, uint64))
+fn decode_and_abi_encode_public_values(
+    public_values: &mut sp1_sdk::SP1PublicValues,
+) -> Result<ZkProofResult> {
+    // Read committed values in the same order as sp1_zkvm::io::commit() in main.rs
+    let state_root: [u8; 32] = public_values.read();
+    let policy_id: [u8; 32] = public_values.read();
+    let epoch: u64 = public_values.read();
+    let solvency_root: [u8; 32] = public_values.read();
+    let threshold_wei: u64 = public_values.read();
+    let member_count: u32 = public_values.read();
+    let block_number: u64 = public_values.read();
+    let chain_id: u64 = public_values.read();
+
+    // ABI-encode for Solidity: (bytes32, bytes32, uint64, bytes32, uint64, uint32, uint64, uint64)
+    // Use alloy's SolValue encoding which produces standard ABI encoding
+    let abi_encoded = (
+        FixedBytes::<32>::from(state_root),
+        FixedBytes::<32>::from(policy_id),
+        epoch,
+        FixedBytes::<32>::from(solvency_root),
+        threshold_wei,
+        member_count,
+        block_number,
+        chain_id,
+    ).abi_encode();
+
+    Ok(ZkProofResult {
+        proof_bytes: vec![], // Filled by caller for prove() mode
+        public_values_abi: abi_encoded,
+        solvency_root,
+        state_root,
+        policy_id,
+        epoch,
+        threshold_wei,
+        member_count,
+        block_number,
+        chain_id,
+    })
+}
+
+/// Execute the SP1 program without generating a proof (fast, for testing).
+///
+/// Runs the RISC-V program in the SP1 executor, verifying all assertions
+/// (MPT proofs, hash chains, etc.) but without the expensive proving step.
+/// Returns the public values and solvency root.
+pub fn execute_sp1_program(inputs: &BatchProofInputs) -> Result<ZkProofResult> {
+    let client = ProverClient::builder().cpu().build();
+    let elf = Elf::Static(SP1_ELF_BYTES);
+    let stdin = build_sp1_stdin(inputs);
+
+    info!(
+        members = inputs.members.len(),
+        epoch = inputs.epoch,
+        "Executing SP1 program (no proof)"
+    );
+
+    let (mut public_values, report) = client
+        .execute(elf, stdin)
+        .run()
+        .context("SP1 program execution failed")?;
+
+    info!(
+        total_cycles = report.total_instruction_count(),
+        "SP1 execution complete"
+    );
+
+    decode_and_abi_encode_public_values(&mut public_values)
+}
+
+/// Generate a full SP1 Groth16 proof for on-chain verification.
+///
+/// This is the production path: runs the prover to generate a STARK proof,
+/// recursively compresses it, then wraps it in a Groth16 proof suitable
+/// for on-chain verification via ISP1Verifier.
+///
+/// **Warning**: This is computationally expensive (minutes to hours depending
+/// on batch size and hardware). Use `execute_sp1_program()` for testing.
+pub fn generate_sp1_proof(inputs: &BatchProofInputs) -> Result<ZkProofResult> {
+    let client = ProverClient::builder().cpu().build();
+    let elf = Elf::Static(SP1_ELF_BYTES);
+    let stdin = build_sp1_stdin(inputs);
+    let pk = client.setup(elf)
+        .context("SP1 setup (key generation) failed")?;
+
+    info!(
+        members = inputs.members.len(),
+        epoch = inputs.epoch,
+        "Generating SP1 Groth16 proof (this will take a while)"
+    );
+
+    let proof = client
+        .prove(&pk, stdin)
+        .groth16()
+        .run()
+        .context("SP1 proof generation failed")?;
+
+    let proof_bytes = proof.bytes();
+
+    info!(
+        proof_size = proof_bytes.len(),
+        "SP1 Groth16 proof generated"
+    );
+
+    let mut public_values = proof.public_values;
+    let mut result = decode_and_abi_encode_public_values(&mut public_values)?;
+    result.proof_bytes = proof_bytes;
+
+    Ok(result)
 }
 
 #[cfg(test)]

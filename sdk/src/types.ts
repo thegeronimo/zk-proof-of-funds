@@ -1,0 +1,146 @@
+// ─── SDK Configuration ──────────────────────────────────────────────────────
+
+/** Configuration for the SolvencyClient. */
+export interface SolvencyClientConfig {
+  /** Base URL of the Solvency Agent API (e.g., "http://localhost:3000"). */
+  agentUrl: string;
+  /** Optional request timeout in milliseconds (default: 30000). */
+  timeoutMs?: number;
+  /** Optional custom fetch implementation (default: globalThis.fetch). */
+  fetch?: typeof globalThis.fetch;
+}
+
+// ─── Enrollment ─────────────────────────────────────────────────────────────
+
+/** Request body for POST /enroll. */
+export interface EnrollmentRequest {
+  /** Hex-encoded 32-byte policy identifier. */
+  policy_id: string;
+  /** Hex-encoded Ethereum address (with or without 0x prefix). */
+  wallet_address: string;
+  /** Hex-encoded 65-byte ECDSA signature (with or without 0x prefix). */
+  signature: string;
+  /** The signed message: "zkpof-holder-v1:{scope}:{nonce}". */
+  signed_message: string;
+}
+
+/** Response from POST /enroll. */
+export interface EnrollmentResponse {
+  /** Hex-encoded 32-byte privacy-preserving member ID (SHA256 of signature). */
+  member_id: string;
+  /** Enrollment status (always "enrolled" on success). */
+  status: string;
+  /** First epoch in which this member will appear in the solvency tree. */
+  effective_epoch: number;
+}
+
+// ─── Merkle Proof ───────────────────────────────────────────────────────────
+
+/** Merkle membership proof returned by GET /proof/{policyId}/{memberId}. */
+export interface MerkleProofData {
+  /** Hex-encoded 32-byte member ID. */
+  member_id: string;
+  /** Hex-encoded 32-byte policy ID. */
+  policy_id: string;
+  /** Status byte: 1 = solvent, 0 = insolvent. */
+  status: number;
+  /** Epoch number this proof was generated for. */
+  epoch: number;
+  /** Leaf index in the Merkle tree (0-based). */
+  leaf_index: number;
+  /** Array of hex-encoded 32-byte sibling hashes (leaf to root). */
+  merkle_proof: string[];
+  /** Hex-encoded 32-byte Merkle root. */
+  root: string;
+  /** Block number the state proofs reference. */
+  block_number: number;
+}
+
+// ─── Member Status ──────────────────────────────────────────────────────────
+
+/** Member status returned by GET /status/{policyId}/{memberId}. */
+export interface MemberStatus {
+  /** Hex-encoded 32-byte member ID. */
+  member_id: string;
+  /** Hex-encoded 32-byte policy ID. */
+  policy_id: string;
+  /** Current solvency status. */
+  status: "solvent" | "insolvent" | "pending" | "fetch_failed";
+  /** Last observed balance in wei (string to handle large numbers). */
+  last_balance_wei: string;
+  /** Last block at which balance was checked. */
+  last_checked_block: number;
+  /** First epoch the member appears in. */
+  effective_epoch: number;
+  /** Unix timestamp of enrollment. */
+  enrolled_at: number;
+}
+
+// ─── Admin Types ────────────────────────────────────────────────────────────
+
+/** A member entry in the admin members list. */
+export interface AdminMember {
+  /** Hex-encoded 32-byte member ID. */
+  member_id: string;
+  /** Current solvency status. */
+  status: string;
+  /** Last observed balance in wei. */
+  last_balance_wei: string;
+  /** Last block at which balance was checked. */
+  last_checked_block: number;
+  /** First epoch the member appears in. */
+  effective_epoch: number;
+}
+
+/** Response from GET /admin/members/{policyId}. */
+export interface AdminMembersResponse {
+  /** Hex-encoded 32-byte policy ID. */
+  policy_id: string;
+  /** Number of enrolled members. */
+  member_count: number;
+  /** List of member entries. */
+  members: AdminMember[];
+}
+
+/** Epoch entry in the admin epoch history. */
+export interface EpochEntry {
+  /** Epoch number. */
+  epoch: number;
+  /** Block number the state proofs reference. */
+  block_number: number;
+  /** Hex-encoded 32-byte Merkle root. */
+  root: string;
+  /** Number of members in this epoch's tree. */
+  member_count: number;
+  /** Block at which the root was published on-chain. */
+  published_at_block: number;
+}
+
+/** Response from GET /admin/epochs/{policyId}. */
+export interface AdminEpochsResponse {
+  /** Hex-encoded 32-byte policy ID. */
+  policy_id: string;
+  /** Latest epoch record (null if no epochs yet). */
+  latest_epoch: EpochEntry | null;
+}
+
+// ─── Health ─────────────────────────────────────────────────────────────────
+
+/** Response from GET /health. */
+export interface HealthResponse {
+  /** Service status (normally "ok"). */
+  status: string;
+  /** Service version string. */
+  version: string;
+}
+
+// ─── Errors ─────────────────────────────────────────────────────────────────
+
+/** Error codes returned by the SDK. */
+export type SolvencyErrorCode =
+  | "NETWORK_ERROR"
+  | "INVALID_REQUEST"
+  | "NOT_FOUND"
+  | "CONFLICT"
+  | "SERVER_ERROR"
+  | "TIMEOUT";

@@ -1,0 +1,37 @@
+{
+  "name": "@zk-proof-of-funds/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for the ZK Proof of Funds solvency attestation system",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "vite build && tsc --emitDeclarationOnly",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0",
+    "vite": "^5.0.0",
+    "vite-plugin-dts": "^3.7.0"
+  },
+  "license": "MIT",
+  "keywords": [
+    "zk",
+    "solvency",
+    "proof-of-funds",
+    "ethereum",
+    "merkle"
+  ]
+}

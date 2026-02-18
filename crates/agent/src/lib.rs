@@ -14,11 +14,13 @@
 //! - **Enrollment** — handles member enrollment and signature verification
 //! - **Database** — persistent storage for members, epochs, trees
 
-// TODO (Phase 1): Implement each module
+pub mod config;
 pub mod scheduler;
 pub mod rpc_fetcher;
 pub mod proof_worker;
 pub mod chain_publisher;
 pub mod merkle_service;
 pub mod enrollment;
+pub mod epoch_processor;
+pub mod webhook;
 pub mod db;

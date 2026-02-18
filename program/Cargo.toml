@@ -8,10 +8,14 @@ edition = "2021"
 
 [dependencies]
 # SP1 zkVM guest library — provides io::read/commit and entrypoint macro
-sp1-zkvm = "4"
+sp1-zkvm = "6"
 
 # Hashing (SP1 has SHA-256 precompile for performance)
 sha2 = "0.10"
 
 # Serialization for reading inputs
 serde = { version = "1", features = ["derive"] }
+
+# MPT verification (Phase 2) — keccak256 for Ethereum state trie, RLP decoding for proof nodes
+tiny-keccak = { version = "2", features = ["keccak"] }
+alloy-rlp = { version = "0.3", default-features = false }

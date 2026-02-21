@@ -163,9 +163,10 @@ pub fn recover_address(message: &str, signature: &[u8]) -> Result<[u8; 20]> {
     let v = signature[64];
 
     // v should be 27 or 28, or 0/1 (some signers use 0/1)
+    // v=27 (or 0) → even parity (false), v=28 (or 1) → odd parity (true)
     let y_parity = match v {
-        27 | 1 => true,
-        28 | 0 => false,
+        28 | 1 => true,
+        27 | 0 => false,
         _ => bail!("Invalid v value in signature: {}", v),
     };
 

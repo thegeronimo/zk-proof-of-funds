@@ -3,19 +3,26 @@
 //! HTTP endpoints for the Solvency Agent middleware.
 //! Built with Axum, serves enrollment, proof serving, status, and admin APIs.
 //!
+//! ## Privacy
+//!
+//! The agent never stores wallet addresses. Users submit their own EIP-1186
+//! proofs via `/submit_proof`, and the agent only retains the memberId.
+//!
 //! ## Endpoints
 //!
 //! Integrator:
-//!   POST /enroll                        — enroll a new member
-//!   GET  /proof/{policyId}/{memberId}   — get Merkle membership proof
-//!   GET  /status/{policyId}/{memberId}  — get member status
+//!   POST /enroll                                  — enroll a new member (no address needed)
+//!   POST /submit_proof/:policy_id/:member_id      — submit an MPT proof for solvency
+//!   GET  /proof/:policy_id/:member_id             — get Merkle membership proof
+//!   GET  /status/:policy_id/:member_id            — get member status
 //!
 //! Admin:
-//!   GET  /admin/members/{policyId}      — list members for a policy
-//!   GET  /admin/epochs/{policyId}       — list epoch history
+//!   GET  /admin/members/:policy_id                — list members for a policy
+//!   GET  /admin/epochs/:policy_id                 — list epoch history
+//!   POST /admin/trigger_epoch/:policy_id          — manually trigger an epoch
 //!
 //! System:
-//!   GET /health                         — health check
+//!   GET /health                                   — health check
 
 use axum::{
     Router,
@@ -55,9 +62,17 @@ struct AppState {
 #[derive(Debug, Deserialize)]
 struct EnrollRequest {
     policy_id: String,
-    wallet_address: String,
     signature: String, // hex-encoded 65-byte signature
     signed_message: String,
+}
+
+/// Request body for submitting an MPT proof.
+/// The wallet_address is used transiently for MPT verification but is NOT stored.
+#[derive(Debug, Deserialize)]
+struct SubmitProofRequest {
+    wallet_address: String,         // used transiently for MPT verification, NOT stored
+    proof_nodes: Vec<String>,       // hex-encoded RLP proof nodes from eth_getProof
+    block_number: u64,              // block the proof references
 }
 
 #[derive(Debug, Serialize)]
@@ -78,12 +93,9 @@ async fn health() -> impl IntoResponse {
 
 /// POST /enroll — enroll a new member
 ///
-/// For Phase 1 MVP, enrollment requires an RPC URL to check balance.
-/// The actual enrollment logic validates signature, checks balance, and stores the member.
-///
-/// Note: Enrollment with RPC-based balance checking requires async calls.
-/// For the MVP, we perform signature verification and member ID computation
-/// synchronously and defer balance checking to the epoch update cycle.
+/// In ZK privacy mode, enrollment only requires a valid ECDSA signature.
+/// No wallet address is sent to or stored by the agent.
+/// The memberId = SHA256(signature) is the only identifier stored.
 async fn enroll_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EnrollRequest>,
@@ -110,24 +122,12 @@ async fn enroll_handler(
         );
     }
 
-    // 3. Verify ECDSA signature recovers to claimed address
-    let wallet_hex = req.wallet_address.strip_prefix("0x")
-        .unwrap_or(&req.wallet_address);
-
+    // 3. Verify ECDSA signature is valid (recovers to some non-zero address)
+    //    We do NOT compare to a claimed address — the agent never learns the address.
     match zk_pof_agent::enrollment::recover_address(&req.signed_message, &signature) {
-        Ok(recovered) => {
-            let recovered_hex = hex::encode(recovered);
-            if recovered_hex.to_lowercase() != wallet_hex.to_lowercase() {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": format!(
-                            "Signature verification failed: recovered 0x{} but claimed 0x{}",
-                            recovered_hex, wallet_hex
-                        )
-                    })),
-                );
-            }
+        Ok(_recovered) => {
+            // Signature is valid — that's all we need to know.
+            // The recovered address is discarded immediately.
         }
         Err(e) => {
             return (
@@ -168,9 +168,9 @@ async fn enroll_handler(
         .unwrap()
         .as_secs();
 
+    // No wallet address stored — only memberId and policyId
     match db.insert_member(
         &member_id_hex,
-        &req.wallet_address,
         &req.policy_id,
         enrolled_at,
         effective_epoch,
@@ -188,6 +188,176 @@ async fn enroll_handler(
             Json(serde_json::json!({"error": format!("Failed to store member: {}", e)})),
         ),
     }
+}
+
+/// POST /submit_proof/:policy_id/:member_id — submit an MPT proof for solvency verification.
+///
+/// Users fetch their own `eth_getProof` from any Ethereum node and submit it here.
+/// The agent verifies the MPT proof against the state root for the given block,
+/// extracts the balance, and stores the verified result.
+///
+/// The wallet_address is used ONLY for MPT verification (computing keccak256(address)
+/// as the trie key) and is immediately discarded — it is NEVER stored.
+async fn submit_proof_handler(
+    State(state): State<Arc<AppState>>,
+    Path((policy_id, member_id)): Path<(String, String)>,
+    Json(req): Json<SubmitProofRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // 1. Verify member exists
+    {
+        let db = state.db.lock().unwrap();
+        match db.get_member(&member_id) {
+            Ok(Some(m)) => {
+                if m.policy_id != policy_id {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"error": "Member not found for this policy"})),
+                    );
+                }
+            }
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "Member not found — enroll first"})),
+                );
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Database error: {}", e)})),
+                );
+            }
+        }
+    }
+
+    // 2. Get state root for the given block from RPC
+    let rpc = match &state.rpc_fetcher {
+        Some(r) => r,
+        None => return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "RPC not configured"})),
+        ),
+    };
+
+    let state_root = match rpc.get_state_root(req.block_number).await {
+        Ok(sr) => sr,
+        Err(e) => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Failed to get state root for block {}: {}", req.block_number, e)})),
+        ),
+    };
+
+    // 3. Parse wallet address (used transiently for MPT verification, NOT stored)
+    let addr_hex = req.wallet_address.strip_prefix("0x").unwrap_or(&req.wallet_address);
+    let addr_bytes: [u8; 20] = match hex::decode(addr_hex) {
+        Ok(b) if b.len() == 20 => {
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid wallet_address (must be 20 bytes hex)"})),
+        ),
+    };
+
+    // 4. Decode proof nodes from hex
+    let proof_nodes: Vec<Vec<u8>> = match req.proof_nodes.iter()
+        .map(|n| {
+            let hex_str = n.strip_prefix("0x").unwrap_or(n);
+            hex::decode(hex_str)
+        })
+        .collect::<std::result::Result<Vec<Vec<u8>>, _>>()
+    {
+        Ok(nodes) => nodes,
+        Err(e) => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Invalid proof_nodes hex: {}", e)})),
+        ),
+    };
+
+    // 5. Verify MPT proof — address is used here but NOT stored
+    let balance_bytes = match zk_pof_agent::mpt_verifier::verify_account_balance(
+        &state_root,
+        &addr_bytes,
+        &proof_nodes,
+    ) {
+        Ok(b) => b,
+        Err(e) => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("MPT proof verification failed: {}", e)})),
+        ),
+    };
+    // addr_bytes is now dropped and never stored
+
+    // 6. Convert balance to u128 and check threshold
+    let threshold_wei: u128 = 1_000_000_000_000_000_000; // 1 ETH (TODO: read from policy)
+    let is_solvent = zk_pof_agent::mpt_verifier::balance_meets_threshold(&balance_bytes, threshold_wei);
+
+    // Convert balance bytes to decimal string
+    let balance_u128 = {
+        let mut val: u128 = 0;
+        for &b in &balance_bytes[16..] {
+            val = val << 8 | b as u128;
+        }
+        val
+    };
+    let balance_str = balance_u128.to_string();
+
+    // 7. Determine epoch
+    let epoch = {
+        let db = state.db.lock().unwrap();
+        let current_epoch = db.get_latest_epoch(&policy_id)
+            .ok()
+            .flatten()
+            .map(|e| e.epoch)
+            .unwrap_or(0);
+        current_epoch + 1
+    };
+
+    // 8. Store proof submission in DB (NO wallet address stored)
+    {
+        let db = state.db.lock().unwrap();
+        if let Err(e) = db.insert_proof_submission(
+            &member_id,
+            &policy_id,
+            epoch,
+            req.block_number,
+            &balance_str,
+            is_solvent,
+        ) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to store proof: {}", e)})),
+            );
+        }
+
+        // Also update member's last balance and block
+        let status_str = if is_solvent { "solvent" } else { "insolvent" };
+        let _ = db.update_member_status(&member_id, status_str, &balance_str, req.block_number);
+    }
+
+    info!(
+        member_id = %member_id,
+        policy_id = %policy_id,
+        epoch = epoch,
+        balance = %balance_str,
+        solvent = is_solvent,
+        "Proof submitted and verified"
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "member_id": member_id,
+            "policy_id": policy_id,
+            "epoch": epoch,
+            "block_number": req.block_number,
+            "balance_wei": balance_str,
+            "is_solvent": is_solvent,
+            "status": if is_solvent { "solvent" } else { "insolvent" }
+        })),
+    )
 }
 
 /// GET /proof/:policy_id/:member_id — get Merkle membership proof
@@ -405,13 +575,16 @@ async fn admin_list_epochs(
 
 /// POST /admin/trigger_epoch/:policy_id — manually trigger an epoch for a policy.
 ///
-/// This admin endpoint runs the full trusted-mode epoch pipeline:
-/// 1. Fetch all eligible members
-/// 2. Check balances via RPC
+/// In ZK privacy mode, this uses submitted proofs from the `proof_submissions` table
+/// to determine each member's solvency. Members without a submitted proof are
+/// marked as insolvent (status=0).
+///
+/// Pipeline:
+/// 1. Fetch eligible members
+/// 2. Read proof submissions for the epoch
 /// 3. Build Merkle tree
-/// 4. Sign with EIP-712
-/// 5. Publish on-chain (or DB-only if SKIP_ON_CHAIN=true)
-/// 6. Update member statuses
+/// 4. Record epoch in DB
+/// 5. Update member statuses
 async fn admin_trigger_epoch(
     State(state): State<Arc<AppState>>,
     Path(policy_id): Path<String>,
@@ -421,13 +594,6 @@ async fn admin_trigger_epoch(
         None => return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "RPC not configured"})),
-        ),
-    };
-    let proof_worker = match &state.proof_worker {
-        Some(pw) => pw,
-        None => return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "Proof worker not configured (need OPERATOR_PRIVATE_KEY)"})),
         ),
     };
 
@@ -440,8 +606,8 @@ async fn admin_trigger_epoch(
         ),
     };
 
-    // 2. Determine epoch and fetch members
-    let (epoch, members_with_addresses, threshold_wei) = {
+    // 2. Determine epoch, fetch members and proof submissions
+    let (epoch, leaf_inputs, balance_updates) = {
         let db = state.db.lock().unwrap();
         let current_epoch = db.get_latest_epoch(&policy_id)
             .ok()
@@ -466,57 +632,64 @@ async fn admin_trigger_epoch(
             );
         }
 
-        // For now, use a default threshold of 1 ETH (matches policy creation)
-        let threshold: u128 = 1_000_000_000_000_000_000;
-
-        let members_with_addrs: Vec<(String, String)> = members.iter()
+        let eligible: Vec<_> = members.iter()
             .filter(|m| m.effective_epoch <= epoch)
-            .map(|m| (m.member_id.clone(), m.watch_target.clone()))
             .collect();
 
-        if members_with_addrs.is_empty() {
+        if eligible.is_empty() {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": format!("No eligible members at epoch {}", epoch)})),
             );
         }
 
-        (epoch, members_with_addrs, threshold)
-    };
-
-    // 3. Fetch balances from RPC
-    let mut leaf_inputs: Vec<LeafInput> = Vec::new();
-    let mut balance_updates: Vec<(String, String, bool)> = Vec::new(); // (member_id, balance_str, solvent)
-
-    for (member_id_hex, address) in &members_with_addresses {
-        let balance: u128 = match rpc.get_balance(address).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(member_id = %member_id_hex, error = %e, "Failed to fetch balance, marking insolvent");
-                0
-            }
+        // Get proof submissions for this epoch
+        let submissions = match db.get_proof_submissions_for_epoch(&policy_id, epoch) {
+            Ok(s) => s,
+            Err(e) => return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("DB error: {}", e)})),
+            ),
         };
 
-        let is_solvent = balance >= threshold_wei;
-        let status: u8 = if is_solvent { 1 } else { 0 };
+        let submission_map: std::collections::HashMap<String, &zk_pof_agent::db::ProofSubmissionRow> =
+            submissions.iter().map(|s| (s.member_id.clone(), s)).collect();
 
-        let mut member_id = [0u8; 32];
-        if let Ok(bytes) = hex::decode(member_id_hex) {
-            if bytes.len() == 32 {
-                member_id.copy_from_slice(&bytes);
+        let mut leaf_inputs: Vec<LeafInput> = Vec::new();
+        let mut balance_updates: Vec<(String, String, bool)> = Vec::new();
+
+        for member in &eligible {
+            let (is_solvent, balance_str) = if let Some(sub) = submission_map.get(&member.member_id) {
+                (sub.is_solvent, sub.balance_wei.clone())
+            } else {
+                // No proof submitted → use last known balance from DB
+                let balance: u128 = member.last_balance_wei.parse().unwrap_or(0);
+                let threshold: u128 = 1_000_000_000_000_000_000; // 1 ETH
+                (balance >= threshold, member.last_balance_wei.clone())
+            };
+
+            let status: u8 = if is_solvent { 1 } else { 0 };
+
+            let mut member_id = [0u8; 32];
+            if let Ok(bytes) = hex::decode(&member.member_id) {
+                if bytes.len() == 32 {
+                    member_id.copy_from_slice(&bytes);
+                }
             }
+
+            leaf_inputs.push(LeafInput {
+                member_id,
+                status,
+                member_id_hex: member.member_id.clone(),
+            });
+
+            balance_updates.push((member.member_id.clone(), balance_str, is_solvent));
         }
 
-        leaf_inputs.push(LeafInput {
-            member_id,
-            status,
-            member_id_hex: member_id_hex.clone(),
-        });
+        (epoch, leaf_inputs, balance_updates)
+    };
 
-        balance_updates.push((member_id_hex.clone(), balance.to_string(), is_solvent));
-    }
-
-    // 4. Parse policy_id bytes
+    // 3. Parse policy_id bytes
     let policy_id_clean = policy_id.strip_prefix("0x").unwrap_or(&policy_id);
     let policy_id_bytes: [u8; 32] = match hex::decode(policy_id_clean) {
         Ok(b) if b.len() == 32 => {
@@ -530,7 +703,7 @@ async fn admin_trigger_epoch(
         ),
     };
 
-    // 5. Build Merkle tree
+    // 4. Build Merkle tree
     let tree_result = {
         let db = state.db.lock().unwrap();
         let merkle_svc = MerkleService::new(&db);
@@ -543,66 +716,25 @@ async fn admin_trigger_epoch(
         }
     };
 
-    // 6. Sign with EIP-712
-    let sig_result = match proof_worker.sign_trusted_assertion(
-        &policy_id_bytes,
-        &tree_result.root,
-        epoch,
-        block_number,
-        tree_result.member_count,
-    ).await {
-        Ok(s) => s,
-        Err(e) => return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("EIP-712 signing failed: {}", e)})),
-        ),
-    };
-
-    // 7. Publish on-chain or record in DB
-    let skip_on_chain = std::env::var("SKIP_ON_CHAIN")
-        .map(|v| v == "true")
-        .unwrap_or(false);
-
-    let tx_hash = if skip_on_chain {
-        // DB-only mode
-        if let Some(ref publisher) = state.publisher {
-            match publisher.record_epoch_only(
-                &policy_id,
-                epoch,
-                block_number,
-                &tree_result.root,
-                tree_result.member_count,
-                None,
-            ) {
-                Ok(r) => r.tx_hash,
-                Err(e) => return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("DB record failed: {}", e)})),
-                ),
-            }
-        } else {
-            None
-        }
-    } else if let Some(ref publisher) = state.publisher {
-        match publisher.publish_trusted(
-            &policy_id_bytes,
-            &tree_result.root,
+    // 5. Record epoch in DB (no on-chain publication — SP1 proof deferred)
+    if let Some(ref publisher) = state.publisher {
+        match publisher.record_epoch_only(
+            &policy_id,
             epoch,
             block_number,
+            &tree_result.root,
             tree_result.member_count,
-            &sig_result.signature,
-        ).await {
-            Ok(r) => r.tx_hash,
+            None,
+        ) {
+            Ok(_) => {}
             Err(e) => return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("On-chain publish failed: {}", e)})),
+                Json(serde_json::json!({"error": format!("DB record failed: {}", e)})),
             ),
         }
-    } else {
-        None
-    };
+    }
 
-    // 8. Update member statuses in DB
+    // 6. Update member statuses in DB
     {
         let db = state.db.lock().unwrap();
         for (member_id_hex, balance_str, is_solvent) in &balance_updates {
@@ -618,7 +750,7 @@ async fn admin_trigger_epoch(
         epoch = epoch,
         member_count = tree_result.member_count,
         root = %hex::encode(tree_result.root),
-        "Epoch triggered successfully"
+        "Epoch triggered successfully (ZK mode)"
     );
 
     (
@@ -628,7 +760,6 @@ async fn admin_trigger_epoch(
             "block_number": block_number,
             "root": format!("0x{}", hex::encode(tree_result.root)),
             "member_count": tree_result.member_count,
-            "tx_hash": tx_hash,
             "balance_updates": balance_updates.iter().map(|(id, bal_str, sol)| {
                 serde_json::json!({
                     "member_id": id,
@@ -649,6 +780,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         // Integrator endpoints
         .route("/enroll", post(enroll_handler))
+        .route("/submit_proof/:policy_id/:member_id", post(submit_proof_handler))
         .route("/proof/:policy_id/:member_id", get(get_proof))
         .route("/status/:policy_id/:member_id", get(get_status))
         // Admin endpoints

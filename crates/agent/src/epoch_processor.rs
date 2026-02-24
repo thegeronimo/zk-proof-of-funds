@@ -4,13 +4,18 @@
 //! complete pipeline for each trigger:
 //!
 //! 1. Fetch eligible members from DB
-//! 2. Query balances (trusted mode) or account proofs (ZK mode) from RPC
+//! 2. Read user-submitted proof results from proof_submissions table
 //! 3. Determine solvency statuses, detect changes
 //! 4. Build Merkle tree for the epoch
-//! 5. Generate proof (EIP-712 signature or SP1 ZK proof)
-//! 6. Publish on-chain (or DB-only if `skip_on_chain`)
-//! 7. Update member statuses in DB
-//! 8. Fire webhooks for status changes and epoch completion
+//! 5. Record epoch in DB (on-chain publication via SP1 proof deferred)
+//! 6. Update member statuses in DB
+//! 7. Fire webhooks for status changes and epoch completion
+//!
+//! ## Privacy
+//!
+//! The agent never fetches balances directly. Users submit their own EIP-1186
+//! proofs via `/submit_proof`, and the epoch processor reads the verified
+//! results from the `proof_submissions` table.
 
 use anyhow::{Context, Result};
 use std::sync::{Arc, Mutex};
@@ -251,23 +256,137 @@ impl EpochProcessor {
         })
     }
 
-    /// Process a ZK-mode epoch (SP1 proof).
+    /// Process a ZK-mode epoch using user-submitted MPT proofs.
     ///
-    /// Note: ZK mode requires real RPC data (MPT proofs) which cannot be mocked easily.
-    /// This path is primarily for production use. For testing, use trusted mode.
+    /// In ZK mode, the agent never fetches balances itself. Instead, users submit
+    /// their own EIP-1186 proofs via `/submit_proof`. The epoch processor reads
+    /// these verified proof submissions from the DB to build the Merkle tree.
+    ///
+    /// Members who haven't submitted a proof for this epoch are marked insolvent (status=0).
     async fn process_zk_epoch(&self, trigger: &EpochTrigger) -> Result<EpochResult> {
-        // ZK mode follows the same structure but uses SP1 proof generation
-        // instead of EIP-712 signing. Full implementation requires real MPT proofs
-        // from an Ethereum node, so it's structured for production use.
-        //
-        // For now, return an error indicating ZK mode epoch processing
-        // requires the full RPC pipeline (not yet wired into the processor).
-        anyhow::bail!(
-            "ZK mode epoch processing not yet fully wired (requires real RPC for MPT proofs). \
-             Policy: {}, epoch: {}",
-            trigger.policy_id_hex,
-            trigger.epoch
+        // 1. Fetch eligible members from DB
+        let members = self.get_eligible_members(&trigger.policy_id_hex, trigger.epoch)?;
+
+        if members.is_empty() {
+            anyhow::bail!("No eligible members for policy {} at epoch {}",
+                trigger.policy_id_hex, trigger.epoch);
+        }
+
+        info!(
+            policy_id = %trigger.policy_id_hex,
+            eligible_members = members.len(),
+            "Fetched eligible members for ZK epoch"
         );
+
+        // 2. Look up proof submissions for this epoch
+        let submissions = {
+            let db = self.db.lock().unwrap();
+            db.get_proof_submissions_for_epoch(&trigger.policy_id_hex, trigger.epoch)?
+        };
+
+        // Build a lookup map: member_id -> submission
+        let submission_map: std::collections::HashMap<String, &crate::db::ProofSubmissionRow> =
+            submissions.iter().map(|s| (s.member_id.clone(), s)).collect();
+
+        info!(
+            policy_id = %trigger.policy_id_hex,
+            submissions = submissions.len(),
+            eligible = members.len(),
+            "Proof submissions found for epoch"
+        );
+
+        // 3. Build balance results from submissions (missing = insolvent)
+        let balance_results: Vec<BalanceResult> = members.iter()
+            .map(|m| {
+                if let Some(sub) = submission_map.get(&m.member_id) {
+                    BalanceResult {
+                        member_id_hex: m.member_id.clone(),
+                        balance_wei: sub.balance_wei.parse().unwrap_or(0),
+                        is_solvent: sub.is_solvent,
+                    }
+                } else {
+                    // No proof submitted → insolvent
+                    BalanceResult {
+                        member_id_hex: m.member_id.clone(),
+                        balance_wei: 0,
+                        is_solvent: false,
+                    }
+                }
+            })
+            .collect();
+
+        // 4. Detect status changes
+        let status_changes = self.detect_status_changes(&members, &balance_results);
+
+        // 5. Build leaf inputs for Merkle tree
+        let leaf_inputs: Vec<LeafInput> = balance_results.iter()
+            .map(|br| {
+                let mut member_id = [0u8; 32];
+                if let Ok(bytes) = hex::decode(&br.member_id_hex) {
+                    if bytes.len() == 32 {
+                        member_id.copy_from_slice(&bytes);
+                    }
+                }
+                LeafInput {
+                    member_id,
+                    status: if br.is_solvent { 1 } else { 0 },
+                    member_id_hex: br.member_id_hex.clone(),
+                }
+            })
+            .collect();
+
+        // 6. Build Merkle tree
+        let tree_result = {
+            let db = self.db.lock().unwrap();
+            let merkle_svc = MerkleService::new(&db);
+            merkle_svc.build_epoch_tree(
+                &trigger.policy_id,
+                trigger.epoch,
+                &leaf_inputs,
+                &trigger.policy_id_hex,
+            )?
+        };
+
+        // 7. Record epoch in DB (on-chain publication deferred — SP1 proof generation not wired yet)
+        let publish_result = self.publisher.record_epoch_only(
+            &trigger.policy_id_hex,
+            trigger.epoch,
+            trigger.block_number,
+            &tree_result.root,
+            tree_result.member_count,
+            None,
+        )?;
+
+        // 8. Update member statuses in DB
+        self.update_member_statuses(&balance_results, trigger.block_number)?;
+
+        // 9. Fire webhooks
+        let root_hex = hex::encode(tree_result.root);
+        self.webhook_svc.fire_epoch_completed(
+            &trigger.policy_id_hex,
+            trigger.epoch,
+            trigger.block_number,
+            &root_hex,
+            tree_result.member_count,
+            publish_result.tx_hash.as_deref(),
+        ).await;
+
+        if !status_changes.is_empty() {
+            self.webhook_svc.fire_status_changes(
+                &trigger.policy_id_hex,
+                trigger.epoch,
+                &status_changes,
+            ).await;
+        }
+
+        Ok(EpochResult {
+            policy_id_hex: trigger.policy_id_hex.clone(),
+            epoch: trigger.epoch,
+            root: tree_result.root,
+            member_count: tree_result.member_count,
+            status_changes,
+            tx_hash: publish_result.tx_hash,
+        })
     }
 
     // ── Helper methods ───────────────────────────────────────────────────────
@@ -289,11 +408,9 @@ impl EpochProcessor {
         Ok(eligible)
     }
 
-    /// Fetch balance information from the DB for trusted mode.
+    /// Fetch balance information from the DB.
     ///
-    /// In testing (skip_on_chain), we use the DB's stored `last_balance_wei`.
-    /// In production, the real flow fetches from RPC — but that's driven externally
-    /// or by a pre-fetch step before the epoch trigger.
+    /// Uses the DB's stored `last_balance_wei` (updated via proof submissions).
     fn fetch_balances_from_db(
         &self,
         members: &[crate::db::MemberRow],
@@ -305,7 +422,6 @@ impl EpochProcessor {
             let is_solvent = balance >= threshold_wei;
             results.push(BalanceResult {
                 member_id_hex: member.member_id.clone(),
-                watch_target: member.watch_target.clone(),
                 balance_wei: balance,
                 is_solvent,
             });
@@ -463,12 +579,11 @@ mod tests {
 
         let policy_id_hex = hex::encode([0x01; 32]);
 
-        // Enroll members
+        // Enroll members (no wallet address stored)
         {
             let db = db.lock().unwrap();
             db.insert_member(
                 &hex::encode([0xAA; 32]),
-                "0xaaaa1234567890abcdef1234567890abcdef1234",
                 &policy_id_hex,
                 1700000000,
                 1, // effective_epoch = 1
@@ -484,7 +599,6 @@ mod tests {
 
             db.insert_member(
                 &hex::encode([0xBB; 32]),
-                "0xbbbb1234567890abcdef1234567890abcdef1234",
                 &policy_id_hex,
                 1700000000,
                 1,
@@ -541,12 +655,11 @@ mod tests {
 
         let policy_id_hex = hex::encode([0x02; 32]);
 
-        // Enroll member with initial solvent status
+        // Enroll member with initial solvent status (no wallet address stored)
         {
             let db = db.lock().unwrap();
             db.insert_member(
                 &hex::encode([0xCC; 32]),
-                "0xcccc1234567890abcdef1234567890abcdef1234",
                 &policy_id_hex,
                 1700000000,
                 1,
@@ -599,12 +712,11 @@ mod tests {
 
         let policy_id_hex = hex::encode([0x03; 32]);
 
-        // Enroll a member with effective_epoch = 5
+        // Enroll a member with effective_epoch = 5 (no wallet address stored)
         {
             let db = db.lock().unwrap();
             db.insert_member(
                 &hex::encode([0xDD; 32]),
-                "0xdddd1234567890abcdef1234567890abcdef1234",
                 &policy_id_hex,
                 1700000000,
                 5, // Not eligible until epoch 5

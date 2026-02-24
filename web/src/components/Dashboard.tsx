@@ -1,14 +1,29 @@
 import { useState } from "react";
+import { useAccount, useConnect, useDisconnect } from "wagmi";
 import type { MemberStatus, MerkleProofData } from "@zk-proof-of-funds/sdk";
 import { apiClient } from "../services/apiClient";
 
 export default function Dashboard() {
+  const { address, isConnected } = useAccount();
+  const { connectors, connect } = useConnect();
+  const { disconnect } = useDisconnect();
+
   const [policyId, setPolicyId] = useState("");
   const [memberId, setMemberId] = useState("");
   const [status, setStatus] = useState<MemberStatus | null>(null);
   const [proof, setProof] = useState<MerkleProofData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  // Submit Proof state
+  const [proofSubmitting, setProofSubmitting] = useState(false);
+  const [proofResult, setProofResult] = useState<{
+    status: string;
+    balance_wei: string;
+    epoch: number;
+    block_number: number;
+  } | null>(null);
+  const [blockNumber, setBlockNumber] = useState("");
 
   async function fetchStatus() {
     if (!policyId || !memberId) return;
@@ -38,6 +53,56 @@ export default function Dashboard() {
     }
   }
 
+  async function submitProof() {
+    if (!policyId || !memberId || !address || !window.ethereum) return;
+    setError(null);
+    setProofSubmitting(true);
+    setProofResult(null);
+    try {
+      // 1. Determine block number — use user-provided or fetch latest
+      let targetBlock: string;
+      if (blockNumber) {
+        targetBlock = "0x" + parseInt(blockNumber, 10).toString(16);
+      } else {
+        const blockHex = await window.ethereum.request({
+          method: "eth_blockNumber",
+          params: [],
+        });
+        targetBlock = blockHex as string;
+      }
+      const blockNum = parseInt(targetBlock, 16);
+
+      // 2. Call eth_getProof via the connected wallet's provider
+      const proofResponse = await window.ethereum.request({
+        method: "eth_getProof",
+        params: [address, [], targetBlock],
+      });
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const accountProof = (proofResponse as any).accountProof as string[];
+
+      // 3. Submit to agent — wallet_address is used transiently for MPT verification only
+      const result = await apiClient.submitProof(policyId, memberId, {
+        wallet_address: address,
+        proof_nodes: accountProof,
+        block_number: blockNum,
+      });
+
+      setProofResult({
+        status: result.status,
+        balance_wei: result.balance_wei,
+        epoch: result.epoch,
+        block_number: result.block_number,
+      });
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Failed to submit proof"
+      );
+    } finally {
+      setProofSubmitting(false);
+    }
+  }
+
   function copyProofCalldata() {
     if (!proof) return;
     const calldata = {
@@ -63,8 +128,8 @@ export default function Dashboard() {
     <div className="max-w-2xl mx-auto">
       <h1 className="text-2xl font-bold mb-2">Member Dashboard</h1>
       <p className="text-gray-500 mb-6">
-        Check your solvency status and retrieve Merkle proofs for on-chain
-        verification.
+        Check your solvency status, submit proofs, and retrieve Merkle proofs
+        for on-chain verification.
       </p>
 
       {/* Input form */}
@@ -119,6 +184,107 @@ export default function Dashboard() {
           {error}
         </div>
       )}
+
+      {/* Submit Proof section */}
+      <div className="bg-white rounded-lg border border-gray-200 p-6 mb-6">
+        <h2 className="text-lg font-semibold mb-2">Submit Solvency Proof</h2>
+        <p className="text-sm text-gray-500 mb-4">
+          Fetch an EIP-1186 state proof from your Ethereum node and submit it to
+          the agent. Your wallet address is used only for MPT verification and is
+          never stored.
+        </p>
+
+        {!isConnected ? (
+          <div>
+            <p className="text-sm text-gray-500 mb-3">
+              Connect your wallet to submit a proof:
+            </p>
+            <div className="flex flex-col gap-2">
+              {connectors.map((connector) => (
+                <button
+                  key={connector.uid}
+                  onClick={() => connect({ connector })}
+                  className="w-full px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 transition-colors font-medium text-sm"
+                >
+                  {connector.name}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between p-3 bg-green-50 rounded-lg">
+              <span className="text-sm text-green-700">
+                Connected: {address?.slice(0, 6)}...{address?.slice(-4)}
+              </span>
+              <button
+                onClick={() => disconnect()}
+                className="text-sm text-gray-500 hover:text-gray-700"
+              >
+                Disconnect
+              </button>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Block Number (optional — uses latest if empty)
+              </label>
+              <input
+                type="text"
+                value={blockNumber}
+                onChange={(e) => setBlockNumber(e.target.value)}
+                placeholder="e.g., 19500000"
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent text-sm font-mono"
+              />
+            </div>
+            <button
+              onClick={submitProof}
+              disabled={proofSubmitting || !policyId || !memberId}
+              className="w-full px-4 py-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {proofSubmitting
+                ? "Fetching proof & submitting..."
+                : "Submit Solvency Proof"}
+            </button>
+          </div>
+        )}
+
+        {/* Proof submission result */}
+        {proofResult && (
+          <div className="mt-4 p-4 bg-gray-50 rounded-lg">
+            <h3 className="text-sm font-semibold mb-2">Proof Verified</h3>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <p className="text-xs text-gray-500">Status</p>
+                <span
+                  className={`inline-block mt-1 px-2 py-0.5 rounded-full text-xs font-medium border ${
+                    proofResult.status === "solvent"
+                      ? "text-green-700 bg-green-50 border-green-200"
+                      : "text-red-700 bg-red-50 border-red-200"
+                  }`}
+                >
+                  {proofResult.status}
+                </span>
+              </div>
+              <div>
+                <p className="text-xs text-gray-500">Balance</p>
+                <p className="text-sm font-mono mt-1">
+                  {proofResult.balance_wei} wei
+                </p>
+              </div>
+              <div>
+                <p className="text-xs text-gray-500">Epoch</p>
+                <p className="text-sm font-mono mt-1">{proofResult.epoch}</p>
+              </div>
+              <div>
+                <p className="text-xs text-gray-500">Block</p>
+                <p className="text-sm font-mono mt-1">
+                  {proofResult.block_number}
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
 
       {/* Status display */}
       {status && (

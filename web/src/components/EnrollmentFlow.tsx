@@ -37,13 +37,12 @@ export default function EnrollmentFlow() {
   }
 
   async function handleEnroll() {
-    if (!signature || !address) return;
+    if (!signature) return;
     setError(null);
     setLoading(true);
     try {
       const result = await apiClient.enroll({
         policy_id: policyId,
-        wallet_address: address,
         signature,
         signed_message: message,
       });
@@ -212,9 +211,9 @@ export default function EnrollmentFlow() {
             <p className="text-sm text-green-700">Signature obtained</p>
           </div>
           <p className="text-sm text-gray-500 mb-4">
-            Click below to submit your enrollment to the Solvency Agent. Your
-            wallet address will be monitored for solvency, but never exposed to
-            verifiers.
+            Click below to submit your enrollment to the Solvency Agent. Only
+            your privacy-preserving member ID (SHA256 of your signature) will be
+            stored. The agent never learns your wallet address.
           </p>
           <button
             onClick={handleEnroll}

@@ -30,8 +30,11 @@ url = "2"
 # HTTP client (for webhook delivery)
 reqwest = { workspace = true }
 
-[dev-dependencies]
+# MPT verification (host-side port of program/src/mpt.rs)
 tiny-keccak = { workspace = true }
+alloy-rlp = { version = "0.3", default-features = false }
+
+[dev-dependencies]
 # alloy with node-bindings for spawning Anvil in integration tests
 # node-bindings is NOT included in alloy's "full" feature
 alloy = { workspace = true, features = ["node-bindings"] }

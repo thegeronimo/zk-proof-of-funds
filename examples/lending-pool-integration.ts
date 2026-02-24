@@ -29,7 +29,6 @@ const client = new SolvencyClient({ agentUrl: AGENT_URL });
 // ─── Step 2: Enrollment (one-time) ──────────────────────────────────────────
 
 async function enrollUser(
-  walletAddress: string,
   signMessage: (msg: string) => Promise<string>
 ) {
   // Build the enrollment message
@@ -43,10 +42,9 @@ async function enrollUser(
   const memberId = await computeMemberId(signature);
   console.log("Computed memberId:", memberId);
 
-  // Submit enrollment to the agent
+  // Submit enrollment to the agent (no wallet address sent — full privacy)
   const result = await client.enroll({
     policy_id: POLICY_ID,
-    wallet_address: walletAddress,
     signature,
     signed_message: message,
   });
@@ -111,10 +109,7 @@ async function main() {
   const mockSignMessage = async (_msg: string) =>
     "0x" + "ab".repeat(65); // placeholder
 
-  const memberId = await enrollUser(
-    "0x1234567890abcdef1234567890abcdef12345678",
-    mockSignMessage
-  );
+  const memberId = await enrollUser(mockSignMessage);
 
   await checkStatus(memberId);
   await depositWithProof(memberId);

@@ -293,32 +293,26 @@ async fn test_anvil_full_epoch_pipeline() {
     );
     let webhook_svc = Arc::new(WebhookService::new(db.clone()));
 
-    // Enroll 3 members using Anvil pre-funded accounts as watch targets
+    // Enroll 3 members
     let member_a = make_member_id(0xAA);
     let member_b = make_member_id(0xBB);
     let member_c = make_member_id(0xCC);
 
-    // Use Anvil accounts 1, 2, 3 as watch targets (each has 10000 ETH)
+    // Fetch real balances from Anvil pre-funded accounts
     let watch_a = format!("{:?}", anvil.addresses()[1]);
     let watch_b = format!("{:?}", anvil.addresses()[2]);
-    let watch_c = format!("{:?}", anvil.addresses()[3]);
 
-    // Fetch real balances from Anvil
     let rpc_fetcher = RpcFetcher::new(&rpc_url).unwrap();
     let balance_a = rpc_fetcher.get_balance(&watch_a).await.unwrap();
     let balance_b = rpc_fetcher.get_balance(&watch_b).await.unwrap();
-
-    // For member C, we'll set a low balance by not using a funded account
-    // Actually all Anvil accounts are funded with 10000 ETH.
-    // We'll just set member C's stored balance low in the DB to simulate insolvency.
 
     let block_number = rpc_fetcher.get_block_number().await.unwrap();
 
     {
         let db = db.lock().unwrap();
-        db.insert_member(&hex::encode(member_a), &watch_a, &policy_id_hex, 1700000000, 1).unwrap();
-        db.insert_member(&hex::encode(member_b), &watch_b, &policy_id_hex, 1700000000, 1).unwrap();
-        db.insert_member(&hex::encode(member_c), &watch_c, &policy_id_hex, 1700000000, 1).unwrap();
+        db.insert_member(&hex::encode(member_a), &policy_id_hex, 1700000000, 1).unwrap();
+        db.insert_member(&hex::encode(member_b), &policy_id_hex, 1700000000, 1).unwrap();
+        db.insert_member(&hex::encode(member_c), &policy_id_hex, 1700000000, 1).unwrap();
 
         // Store real balance for A & B (solvent), low balance for C (insolvent)
         db.update_member_status(&hex::encode(member_a), "pending", &balance_a.to_string(), block_number).unwrap();
@@ -587,16 +581,15 @@ async fn test_anvil_status_change_balance_drop() {
 
     let member = make_member_id(0xDD);
     let member_hex = hex::encode(member);
-    let watch_target = format!("{:?}", anvil.addresses()[1]); // 10000 ETH
 
     // Epoch 1: member is solvent (10000 ETH >> 1 ETH threshold)
     let rpc_fetcher = RpcFetcher::new(&rpc_url).unwrap();
-    let balance = rpc_fetcher.get_balance(&watch_target).await.unwrap();
+    let balance = rpc_fetcher.get_balance(&format!("{:?}", anvil.addresses()[1])).await.unwrap();
     let block_number = rpc_fetcher.get_block_number().await.unwrap();
 
     {
         let db = db.lock().unwrap();
-        db.insert_member(&member_hex, &watch_target, &policy_id_hex, 1700000000, 1).unwrap();
+        db.insert_member(&member_hex, &policy_id_hex, 1700000000, 1).unwrap();
         db.update_member_status(&member_hex, "pending", &balance.to_string(), block_number).unwrap();
     }
 
@@ -690,8 +683,8 @@ async fn test_anvil_sequential_epochs() {
 
     {
         let db = db.lock().unwrap();
-        db.insert_member(&hex::encode(member_a), &format!("{:?}", anvil.addresses()[1]), &policy_id_hex, 1700000000, 1).unwrap();
-        db.insert_member(&hex::encode(member_b), &format!("{:?}", anvil.addresses()[2]), &policy_id_hex, 1700000000, 1).unwrap();
+        db.insert_member(&hex::encode(member_a), &policy_id_hex, 1700000000, 1).unwrap();
+        db.insert_member(&hex::encode(member_b), &policy_id_hex, 1700000000, 1).unwrap();
         db.update_member_status(&hex::encode(member_a), "pending", "5000000000000000000", block_number).unwrap();
         db.update_member_status(&hex::encode(member_b), "pending", "3000000000000000000", block_number).unwrap();
     }
@@ -797,8 +790,8 @@ async fn test_anvil_insolvent_member_proof() {
 
     {
         let db = db.lock().unwrap();
-        db.insert_member(&hex::encode(member_solvent), &format!("{:?}", anvil.addresses()[1]), &policy_id_hex, 1700000000, 1).unwrap();
-        db.insert_member(&hex::encode(member_insolvent), &format!("{:?}", anvil.addresses()[2]), &policy_id_hex, 1700000000, 1).unwrap();
+        db.insert_member(&hex::encode(member_solvent), &policy_id_hex, 1700000000, 1).unwrap();
+        db.insert_member(&hex::encode(member_insolvent), &policy_id_hex, 1700000000, 1).unwrap();
 
         db.update_member_status(&hex::encode(member_solvent), "pending", "5000000000000000000", block_number).unwrap(); // 5 ETH
         db.update_member_status(&hex::encode(member_insolvent), "pending", "100000000000000000", block_number).unwrap(); // 0.1 ETH

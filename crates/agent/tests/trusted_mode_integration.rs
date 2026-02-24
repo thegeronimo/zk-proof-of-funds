@@ -34,16 +34,15 @@ fn test_full_trusted_mode_flow() {
     // Simulating enrollment by inserting directly into DB
     // (real enrollment involves RPC + signature verification)
     let members = vec![
-        ("member_a", make_member_id(0xAA), "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
-        ("member_b", make_member_id(0xBB), "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"),
-        ("member_c", make_member_id(0xCC), "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"),
+        ("member_a", make_member_id(0xAA)),
+        ("member_b", make_member_id(0xBB)),
+        ("member_c", make_member_id(0xCC)),
     ];
 
-    for (_, member_id, watch_target) in &members {
+    for (_, member_id) in &members {
         let member_id_hex = hex::encode(member_id);
         db.insert_member(
             &member_id_hex,
-            watch_target,
             &policy_id_hex,
             1700000000, // enrolled_at
             1,          // effective_epoch
@@ -80,7 +79,7 @@ fn test_full_trusted_mode_flow() {
     // ─── Step 3: Build Merkle tree for epoch 1 ──────────────────────────
     let merkle_svc = MerkleService::new(&db);
 
-    let leaf_inputs: Vec<LeafInput> = members.iter().enumerate().map(|(i, (_, member_id, _))| {
+    let leaf_inputs: Vec<LeafInput> = members.iter().enumerate().map(|(i, (_, member_id))| {
         let status = if balances[i].2 { 1u8 } else { 0u8 };
         LeafInput {
             member_id: *member_id,
@@ -111,7 +110,7 @@ fn test_full_trusted_mode_flow() {
     assert!(publish_result.trusted_mode);
 
     // ─── Step 5: Retrieve per-member Merkle proofs ──────────────────────
-    for (i, (_, member_id, _)) in members.iter().enumerate() {
+    for (i, (_, member_id)) in members.iter().enumerate() {
         let member_id_hex = hex::encode(member_id);
         let status = if balances[i].2 { 1u8 } else { 0u8 };
 
@@ -155,7 +154,7 @@ fn test_status_change_across_epochs() {
     let member_id_hex = hex::encode(member_id);
 
     // Enroll member
-    db.insert_member(&member_id_hex, "0xAAAA", &policy_id_hex, 1700000000, 1).unwrap();
+    db.insert_member(&member_id_hex, &policy_id_hex, 1700000000, 1).unwrap();
 
     // ─── Epoch 1: Member is solvent ──────────────────────────────────────
     db.update_member_status(&member_id_hex, "solvent", "10000000000000000000", 19_000_000).unwrap();
@@ -238,12 +237,12 @@ fn test_multiple_policies() {
     // Enroll 2 members in policy A
     let member_1 = make_member_id(0x01);
     let member_2 = make_member_id(0x02);
-    db.insert_member(&hex::encode(member_1), "0xAAAA", &policy_a_hex, 1700000000, 1).unwrap();
-    db.insert_member(&hex::encode(member_2), "0xBBBB", &policy_a_hex, 1700000000, 1).unwrap();
+    db.insert_member(&hex::encode(member_1), &policy_a_hex, 1700000000, 1).unwrap();
+    db.insert_member(&hex::encode(member_2), &policy_a_hex, 1700000000, 1).unwrap();
 
     // Enroll 1 member in policy B
     let member_3 = make_member_id(0x03);
-    db.insert_member(&hex::encode(member_3), "0xCCCC", &policy_b_hex, 1700000000, 1).unwrap();
+    db.insert_member(&hex::encode(member_3), &policy_b_hex, 1700000000, 1).unwrap();
 
     // Build trees for each policy
     let merkle_svc = MerkleService::new(&db);
@@ -307,7 +306,7 @@ async fn test_trusted_mode_eip712_signing() {
 
     // Enroll a member and build a tree
     let member_id = make_member_id(0xAA);
-    db.insert_member(&hex::encode(member_id), "0xAAAA", &policy_id_hex, 1700000000, 1).unwrap();
+    db.insert_member(&hex::encode(member_id), &policy_id_hex, 1700000000, 1).unwrap();
 
     let merkle_svc = MerkleService::new(&db);
     let tree = merkle_svc.build_epoch_tree(

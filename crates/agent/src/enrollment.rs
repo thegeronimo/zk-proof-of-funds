@@ -107,10 +107,9 @@ impl<'a> EnrollmentService<'a> {
             .unwrap()
             .as_secs();
 
-        // 8. Store in database
+        // 8. Store in database (no wallet address stored)
         self.db.insert_member(
             &member_id_hex,
-            wallet_address_hex,
             policy_id_hex,
             enrolled_at,
             effective_epoch,

@@ -16,8 +16,6 @@ export interface SolvencyClientConfig {
 export interface EnrollmentRequest {
   /** Hex-encoded 32-byte policy identifier. */
   policy_id: string;
-  /** Hex-encoded Ethereum address (with or without 0x prefix). */
-  wallet_address: string;
   /** Hex-encoded 65-byte ECDSA signature (with or without 0x prefix). */
   signature: string;
   /** The signed message: "zkpof-holder-v1:{scope}:{nonce}". */
@@ -32,6 +30,36 @@ export interface EnrollmentResponse {
   status: string;
   /** First epoch in which this member will appear in the solvency tree. */
   effective_epoch: number;
+}
+
+// ─── Proof Submission ──────────────────────────────────────────────────────
+
+/** Request body for POST /submit_proof/{policyId}/{memberId}. */
+export interface ProofSubmissionRequest {
+  /** Hex-encoded Ethereum address (used transiently for MPT verification, NOT stored). */
+  wallet_address: string;
+  /** Hex-encoded RLP-encoded MPT proof nodes from eth_getProof. */
+  proof_nodes: string[];
+  /** Block number the proof references. */
+  block_number: number;
+}
+
+/** Response from POST /submit_proof/{policyId}/{memberId}. */
+export interface ProofSubmissionResponse {
+  /** Hex-encoded 32-byte member ID. */
+  member_id: string;
+  /** Hex-encoded 32-byte policy ID. */
+  policy_id: string;
+  /** Epoch the proof was submitted for. */
+  epoch: number;
+  /** Block number the proof references. */
+  block_number: number;
+  /** Verified balance in wei (string to handle large numbers). */
+  balance_wei: string;
+  /** Whether the balance meets the policy threshold. */
+  is_solvent: boolean;
+  /** Solvency status string ("solvent" or "insolvent"). */
+  status: string;
 }
 
 // ─── Merkle Proof ───────────────────────────────────────────────────────────

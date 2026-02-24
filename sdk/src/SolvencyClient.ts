@@ -2,6 +2,8 @@ import type {
   SolvencyClientConfig,
   EnrollmentRequest,
   EnrollmentResponse,
+  ProofSubmissionRequest,
+  ProofSubmissionResponse,
   MerkleProofData,
   MemberStatus,
   AdminMembersResponse,
@@ -31,12 +33,18 @@ export class SolvencyError extends Error {
  * ```typescript
  * const client = new SolvencyClient({ agentUrl: "http://localhost:3000" });
  *
- * // Enroll a member
+ * // Enroll a member (no wallet address sent to agent)
  * const { member_id } = await client.enroll({
  *   policy_id: "0x...",
- *   wallet_address: "0x...",
  *   signature: "0x...",
  *   signed_message: "zkpof-holder-v1:my-scope:42",
+ * });
+ *
+ * // Submit a solvency proof (wallet address used transiently, never stored)
+ * const result = await client.submitProof(policyId, member_id, {
+ *   wallet_address: "0x...",
+ *   proof_nodes: ["0x...", ...],
+ *   block_number: 19500000,
  * });
  *
  * // Fetch a Merkle proof for on-chain verification
@@ -62,12 +70,38 @@ export class SolvencyClient {
    *
    * The member must first sign the enrollment message with their wallet.
    * The agent verifies the signature, computes a privacy-preserving memberId,
-   * and stores the member for future solvency monitoring.
+   * and stores the member. No wallet address is sent or stored by the agent.
    *
    * @throws {SolvencyError} INVALID_REQUEST (400), CONFLICT (409), SERVER_ERROR (500)
    */
   async enroll(req: EnrollmentRequest): Promise<EnrollmentResponse> {
     return this.post<EnrollmentResponse>("/enroll", req);
+  }
+
+  /**
+   * Submit an EIP-1186 state proof to verify solvency for a member.
+   *
+   * The user fetches `eth_getProof` from their own Ethereum node and submits
+   * the proof here. The agent verifies the MPT proof against the state root,
+   * extracts the balance, and stores the verified result.
+   *
+   * The wallet_address is used ONLY for MPT verification (computing
+   * keccak256(address) as the trie key) and is immediately discarded.
+   *
+   * @param policyId Hex-encoded 32-byte policy ID.
+   * @param memberId Hex-encoded 32-byte member ID.
+   * @param req Proof submission request containing wallet address, proof nodes, and block number.
+   * @throws {SolvencyError} NOT_FOUND (404), INVALID_REQUEST (400), SERVER_ERROR (500)
+   */
+  async submitProof(
+    policyId: string,
+    memberId: string,
+    req: ProofSubmissionRequest
+  ): Promise<ProofSubmissionResponse> {
+    return this.post<ProofSubmissionResponse>(
+      `/submit_proof/${policyId}/${memberId}`,
+      req
+    );
   }
 
   /**

@@ -94,21 +94,18 @@ async fn test_full_epoch_pipeline_trusted_mode() {
         let db = db.lock().unwrap();
         db.insert_member(
             &hex::encode(member_a),
-            "0xaaaa1234567890abcdef1234567890abcdef1234",
             &policy_id_hex,
             1700000000,
             1,
         ).unwrap();
         db.insert_member(
             &hex::encode(member_b),
-            "0xbbbb1234567890abcdef1234567890abcdef1234",
             &policy_id_hex,
             1700000000,
             1,
         ).unwrap();
         db.insert_member(
             &hex::encode(member_c),
-            "0xcccc1234567890abcdef1234567890abcdef1234",
             &policy_id_hex,
             1700000000,
             1,
@@ -172,7 +169,7 @@ async fn test_status_change_detection_across_epochs() {
     // Enroll with 5 ETH (solvent)
     {
         let db = db.lock().unwrap();
-        db.insert_member(&member_hex, "0xdddd0000000000000000000000000000dddd0000", &policy_id_hex, 1700000000, 1).unwrap();
+        db.insert_member(&member_hex, &policy_id_hex, 1700000000, 1).unwrap();
         db.update_member_status(&member_hex, "pending", "5000000000000000000", 19_000_000).unwrap();
     }
 
@@ -236,7 +233,6 @@ async fn test_epoch_with_no_eligible_members() {
         let db = db.lock().unwrap();
         db.insert_member(
             &hex::encode(make_member_id(0xEE)),
-            "0xeeee0000000000000000000000000000eeee0000",
             &policy_id_hex,
             1700000000,
             10, // Not eligible until epoch 10
@@ -282,9 +278,9 @@ async fn test_multiple_policies_independent() {
     // Policy B: member 3
     {
         let db = db.lock().unwrap();
-        db.insert_member(&hex::encode(member_1), "0x1111000000000000000000000000000011110000", &policy_a_hex, 1700000000, 1).unwrap();
-        db.insert_member(&hex::encode(member_2), "0x2222000000000000000000000000000022220000", &policy_a_hex, 1700000000, 1).unwrap();
-        db.insert_member(&hex::encode(member_3), "0x3333000000000000000000000000000033330000", &policy_b_hex, 1700000000, 1).unwrap();
+        db.insert_member(&hex::encode(member_1), &policy_a_hex, 1700000000, 1).unwrap();
+        db.insert_member(&hex::encode(member_2), &policy_a_hex, 1700000000, 1).unwrap();
+        db.insert_member(&hex::encode(member_3), &policy_b_hex, 1700000000, 1).unwrap();
 
         // Set balances
         db.update_member_status(&hex::encode(member_1), "pending", "5000000000000000000", 19_000_000).unwrap(); // 5 ETH
@@ -342,7 +338,7 @@ async fn test_epoch_roots_differ_across_epochs() {
 
     {
         let db = db.lock().unwrap();
-        db.insert_member(&member_hex, "0xffff0000000000000000000000000000ffff0000", &policy_id_hex, 1700000000, 1).unwrap();
+        db.insert_member(&member_hex, &policy_id_hex, 1700000000, 1).unwrap();
         db.update_member_status(&member_hex, "pending", "5000000000000000000", 19_000_000).unwrap();
     }
 
@@ -370,7 +366,7 @@ async fn test_merkle_proofs_available_after_epoch() {
 
     {
         let db = db.lock().unwrap();
-        db.insert_member(&member_hex, "0x4242000000000000000000000000000042420000", &policy_id_hex, 1700000000, 1).unwrap();
+        db.insert_member(&member_hex, &policy_id_hex, 1700000000, 1).unwrap();
         db.update_member_status(&member_hex, "pending", "5000000000000000000", 19_000_000).unwrap();
     }
 

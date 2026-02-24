@@ -9,24 +9,12 @@ use alloy::providers::{Provider, ProviderBuilder};
 use std::str::FromStr;
 use tracing::{debug, warn};
 
-/// Balance check result for a single member (trusted mode).
+/// Balance check result for a single member.
 #[derive(Debug, Clone)]
 pub struct BalanceResult {
     pub member_id_hex: String,
-    pub watch_target: String,
     pub balance_wei: u128,
     pub is_solvent: bool,
-}
-
-/// Account proof result for a single member (ZK mode).
-#[derive(Debug, Clone)]
-pub struct AccountProofResult {
-    pub member_id_hex: String,
-    pub watch_target: String,
-    pub balance_wei: u128,
-    pub is_solvent: bool,
-    /// RLP-encoded MPT proof nodes from eth_getProof (for SP1 program input).
-    pub proof_nodes: Vec<Vec<u8>>,
 }
 
 /// RPC fetcher for querying Ethereum node.
@@ -128,7 +116,6 @@ impl RpcFetcher {
                     );
                     results.push(BalanceResult {
                         member_id_hex: member_id_hex.clone(),
-                        watch_target: watch_target.clone(),
                         balance_wei: balance,
                         is_solvent,
                     });
@@ -141,7 +128,6 @@ impl RpcFetcher {
                     );
                     results.push(BalanceResult {
                         member_id_hex: member_id_hex.clone(),
-                        watch_target: watch_target.clone(),
                         balance_wei: 0,
                         is_solvent: false,
                     });
@@ -208,58 +194,6 @@ impl RpcFetcher {
         let mut state_root = [0u8; 32];
         state_root.copy_from_slice(block.header.state_root.as_slice());
         Ok(state_root)
-    }
-
-    /// Fetch account proofs for all members in a policy (ZK mode).
-    ///
-    /// Returns results including the RLP-encoded MPT proof nodes for each member,
-    /// suitable for constructing SP1 program inputs.
-    pub async fn fetch_member_proofs(
-        &self,
-        members: &[(String, String)], // (member_id_hex, watch_target_hex)
-        threshold_wei: u128,
-        block_number: u64,
-    ) -> Vec<AccountProofResult> {
-        let mut results = Vec::with_capacity(members.len());
-
-        for (member_id_hex, watch_target) in members {
-            match self.get_account_proof(watch_target, block_number).await {
-                Ok((balance, proof_nodes)) => {
-                    let is_solvent = balance >= threshold_wei;
-                    debug!(
-                        member_id = %member_id_hex,
-                        balance = balance,
-                        threshold = threshold_wei,
-                        solvent = is_solvent,
-                        proof_nodes = proof_nodes.len(),
-                        "Account proof fetched"
-                    );
-                    results.push(AccountProofResult {
-                        member_id_hex: member_id_hex.clone(),
-                        watch_target: watch_target.clone(),
-                        balance_wei: balance,
-                        is_solvent,
-                        proof_nodes,
-                    });
-                }
-                Err(e) => {
-                    warn!(
-                        member_id = %member_id_hex,
-                        error = %e,
-                        "Failed to fetch account proof, marking as insolvent"
-                    );
-                    results.push(AccountProofResult {
-                        member_id_hex: member_id_hex.clone(),
-                        watch_target: watch_target.clone(),
-                        balance_wei: 0,
-                        is_solvent: false,
-                        proof_nodes: vec![],
-                    });
-                }
-            }
-        }
-
-        results
     }
 
     /// Get the RPC URL this fetcher is connected to.
@@ -335,7 +269,6 @@ pub mod mock {
 
                 results.push(BalanceResult {
                     member_id_hex: member_id_hex.clone(),
-                    watch_target: watch_target.clone(),
                     balance_wei: balance,
                     is_solvent,
                 });

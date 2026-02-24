@@ -36,12 +36,13 @@ impl MemberStatus {
 }
 
 /// An enrolled member in the solvency system.
+///
+/// No wallet address is stored — the agent only retains the memberId.
+/// Users submit their own EIP-1186 proofs to prove solvency.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Member {
     /// Privacy-preserving identifier: SHA256(wallet_signature).
     pub member_id: MemberId,
-    /// The Ethereum address the agent monitors (private — never exposed via API).
-    pub watch_target: [u8; 20],
     /// Which policy this member is enrolled in.
     pub policy_id: PolicyId,
     /// Current solvency status.
@@ -137,16 +138,33 @@ pub struct MerkleProofData {
 // ─── Enrollment ─────────────────────────────────────────────────────────────
 
 /// Request to enroll a new member.
+///
+/// No wallet address is included — the agent never learns the member's address.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrollmentRequest {
     /// Which policy to enroll in.
     pub policy_id: PolicyId,
-    /// The wallet address (watchTarget) — revealed to the agent.
-    pub wallet_address: [u8; 20],
     /// ECDSA signature proving wallet control.
     pub signature: Vec<u8>,
     /// The message that was signed: "zkpof-holder-v1:{scope}:{nonce}".
     pub signed_message: String,
+}
+
+/// A user-submitted EIP-1186 proof for a specific epoch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofSubmission {
+    /// The member's privacy-preserving ID.
+    pub member_id: MemberId,
+    /// The policy this proof is for.
+    pub policy_id: PolicyId,
+    /// Epoch this proof is for.
+    pub epoch: u64,
+    /// Block number the MPT proof references.
+    pub block_number: u64,
+    /// Verified balance extracted from the MPT proof (wei as string).
+    pub balance_wei: String,
+    /// Whether the balance meets the policy threshold.
+    pub is_solvent: bool,
 }
 
 /// Response after successful enrollment.
@@ -252,7 +270,6 @@ mod tests {
     fn test_member_serialization_roundtrip() {
         let member = Member {
             member_id: [0xAA; 32],
-            watch_target: [0xBB; 20],
             policy_id: [0xCC; 32],
             status: MemberStatus::Solvent,
             enrolled_at: 1700000000,
@@ -265,7 +282,6 @@ mod tests {
         let deserialized: Member = serde_json::from_str(&json).unwrap();
 
         assert_eq!(deserialized.member_id, member.member_id);
-        assert_eq!(deserialized.watch_target, member.watch_target);
         assert_eq!(deserialized.status, MemberStatus::Solvent);
         assert_eq!(deserialized.last_balance_wei, 10_000_000_000_000_000_000);
     }
@@ -354,7 +370,6 @@ mod tests {
     fn test_enrollment_roundtrip() {
         let request = EnrollmentRequest {
             policy_id: [0xCC; 32],
-            wallet_address: [0xDD; 20],
             signature: vec![1, 2, 3, 4, 5],
             signed_message: "zkpof-holder-v1:defi-xyz:42".to_string(),
         };
@@ -363,7 +378,6 @@ mod tests {
         let deserialized: EnrollmentRequest = serde_json::from_str(&json).unwrap();
 
         assert_eq!(deserialized.policy_id, request.policy_id);
-        assert_eq!(deserialized.wallet_address, request.wallet_address);
         assert_eq!(deserialized.signed_message, "zkpof-holder-v1:defi-xyz:42");
     }
 

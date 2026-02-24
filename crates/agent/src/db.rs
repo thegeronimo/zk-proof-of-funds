@@ -1,13 +1,20 @@
-//! Database — persistent storage for members, epochs, Merkle trees, webhooks.
+//! Database — persistent storage for members, epochs, Merkle trees, proof submissions, webhooks.
 //!
 //! Uses SQLite for development and PostgreSQL for production.
 //!
 //! ## Schema
 //!
-//! - `members`: memberId, watchTarget, policyId, status, enrolledAt, effectiveEpoch, lastBalanceWei, lastCheckedBlock
+//! - `members`: memberId, policyId, status, enrolledAt, effectiveEpoch, lastBalanceWei, lastCheckedBlock
+//! - `proof_submissions`: memberId, policyId, epoch, blockNumber, balanceWei, isSolvent
 //! - `epochs`: policyId, epoch, blockNumber, root, proofBytes, memberCount, publishedAtBlock
 //! - `merkle_trees`: policyId, epoch, leaves (JSON blob of leaf hashes)
 //! - `webhooks`: id, url, policyId, events (comma-separated), active
+//!
+//! ## Privacy
+//!
+//! The `members` table does NOT store wallet addresses (watch_target).
+//! The agent never persists any address data. Users submit their own
+//! EIP-1186 proofs, and the agent only stores the memberId and verified balance.
 
 use anyhow::Result;
 use rusqlite::{params, Connection};
@@ -42,8 +49,7 @@ impl Database {
         self.conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS members (
-                member_id       TEXT PRIMARY KEY,   -- hex-encoded 32 bytes
-                watch_target    TEXT NOT NULL,       -- hex-encoded 20 bytes
+                member_id       TEXT PRIMARY KEY,   -- hex-encoded 32 bytes (SHA256 of signature)
                 policy_id       TEXT NOT NULL,       -- hex-encoded 32 bytes
                 status          TEXT NOT NULL DEFAULT 'pending',  -- solvent/insolvent/pending/fetch_failed
                 enrolled_at     INTEGER NOT NULL,    -- unix timestamp
@@ -54,6 +60,19 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_members_policy ON members(policy_id);
             CREATE INDEX IF NOT EXISTS idx_members_status ON members(policy_id, status);
+
+            CREATE TABLE IF NOT EXISTS proof_submissions (
+                member_id       TEXT NOT NULL,       -- hex-encoded 32 bytes
+                policy_id       TEXT NOT NULL,       -- hex-encoded 32 bytes
+                epoch           INTEGER NOT NULL,    -- epoch this proof is for
+                block_number    INTEGER NOT NULL,    -- block the MPT proof references
+                balance_wei     TEXT NOT NULL,       -- verified balance extracted from MPT proof
+                is_solvent      INTEGER NOT NULL,    -- 1 or 0
+                submitted_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (member_id, policy_id, epoch)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_proof_submissions_epoch ON proof_submissions(policy_id, epoch);
 
             CREATE TABLE IF NOT EXISTS epochs (
                 policy_id       TEXT NOT NULL,       -- hex-encoded 32 bytes
@@ -92,18 +111,19 @@ impl Database {
     // ── Members ─────────────────────────────────────────────────────────
 
     /// Insert a new member.
+    ///
+    /// No wallet address is stored — the agent only knows the memberId.
     pub fn insert_member(
         &self,
         member_id: &str,
-        watch_target: &str,
         policy_id: &str,
         enrolled_at: u64,
         effective_epoch: u64,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO members (member_id, watch_target, policy_id, status, enrolled_at, effective_epoch)
-             VALUES (?1, ?2, ?3, 'pending', ?4, ?5)",
-            params![member_id, watch_target, policy_id, enrolled_at, effective_epoch],
+            "INSERT INTO members (member_id, policy_id, status, enrolled_at, effective_epoch)
+             VALUES (?1, ?2, 'pending', ?3, ?4)",
+            params![member_id, policy_id, enrolled_at, effective_epoch],
         )?;
         Ok(())
     }
@@ -111,20 +131,19 @@ impl Database {
     /// Get all members for a policy.
     pub fn get_members_for_policy(&self, policy_id: &str) -> Result<Vec<MemberRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT member_id, watch_target, policy_id, status, enrolled_at,
+            "SELECT member_id, policy_id, status, enrolled_at,
                     effective_epoch, last_balance_wei, last_checked_block
              FROM members WHERE policy_id = ?1"
         )?;
         let rows = stmt.query_map(params![policy_id], |row| {
             Ok(MemberRow {
                 member_id: row.get(0)?,
-                watch_target: row.get(1)?,
-                policy_id: row.get(2)?,
-                status: row.get(3)?,
-                enrolled_at: row.get(4)?,
-                effective_epoch: row.get(5)?,
-                last_balance_wei: row.get(6)?,
-                last_checked_block: row.get(7)?,
+                policy_id: row.get(1)?,
+                status: row.get(2)?,
+                enrolled_at: row.get(3)?,
+                effective_epoch: row.get(4)?,
+                last_balance_wei: row.get(5)?,
+                last_checked_block: row.get(6)?,
             })
         })?;
         let mut members = Vec::new();
@@ -137,20 +156,19 @@ impl Database {
     /// Get a single member by ID.
     pub fn get_member(&self, member_id: &str) -> Result<Option<MemberRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT member_id, watch_target, policy_id, status, enrolled_at,
+            "SELECT member_id, policy_id, status, enrolled_at,
                     effective_epoch, last_balance_wei, last_checked_block
              FROM members WHERE member_id = ?1"
         )?;
         let mut rows = stmt.query_map(params![member_id], |row| {
             Ok(MemberRow {
                 member_id: row.get(0)?,
-                watch_target: row.get(1)?,
-                policy_id: row.get(2)?,
-                status: row.get(3)?,
-                enrolled_at: row.get(4)?,
-                effective_epoch: row.get(5)?,
-                last_balance_wei: row.get(6)?,
-                last_checked_block: row.get(7)?,
+                policy_id: row.get(1)?,
+                status: row.get(2)?,
+                enrolled_at: row.get(3)?,
+                effective_epoch: row.get(4)?,
+                last_balance_wei: row.get(5)?,
+                last_checked_block: row.get(6)?,
             })
         })?;
         match rows.next() {
@@ -249,6 +267,93 @@ impl Database {
         }
     }
 
+    // ── Proof Submissions ──────────────────────────────────────────────
+
+    /// Insert or update a proof submission for a member/policy/epoch.
+    ///
+    /// Called when a user submits an MPT proof via `/submit_proof`.
+    /// The balance and solvency status are already verified by the MPT verifier.
+    pub fn insert_proof_submission(
+        &self,
+        member_id: &str,
+        policy_id: &str,
+        epoch: u64,
+        block_number: u64,
+        balance_wei: &str,
+        is_solvent: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO proof_submissions
+                (member_id, policy_id, epoch, block_number, balance_wei, is_solvent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                member_id,
+                policy_id,
+                epoch,
+                block_number,
+                balance_wei,
+                is_solvent as i32,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get all proof submissions for a policy/epoch.
+    ///
+    /// Used during epoch processing to determine each member's solvency status.
+    pub fn get_proof_submissions_for_epoch(
+        &self,
+        policy_id: &str,
+        epoch: u64,
+    ) -> Result<Vec<ProofSubmissionRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT member_id, policy_id, epoch, block_number, balance_wei, is_solvent
+             FROM proof_submissions WHERE policy_id = ?1 AND epoch = ?2"
+        )?;
+        let rows = stmt.query_map(params![policy_id, epoch], |row| {
+            Ok(ProofSubmissionRow {
+                member_id: row.get(0)?,
+                policy_id: row.get(1)?,
+                epoch: row.get(2)?,
+                block_number: row.get(3)?,
+                balance_wei: row.get(4)?,
+                is_solvent: row.get::<_, i32>(5)? != 0,
+            })
+        })?;
+        let mut submissions = Vec::new();
+        for row in rows {
+            submissions.push(row?);
+        }
+        Ok(submissions)
+    }
+
+    /// Get the latest proof submission for a specific member in a policy.
+    pub fn get_latest_proof_submission(
+        &self,
+        member_id: &str,
+        policy_id: &str,
+    ) -> Result<Option<ProofSubmissionRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT member_id, policy_id, epoch, block_number, balance_wei, is_solvent
+             FROM proof_submissions WHERE member_id = ?1 AND policy_id = ?2
+             ORDER BY epoch DESC LIMIT 1"
+        )?;
+        let mut rows = stmt.query_map(params![member_id, policy_id], |row| {
+            Ok(ProofSubmissionRow {
+                member_id: row.get(0)?,
+                policy_id: row.get(1)?,
+                epoch: row.get(2)?,
+                block_number: row.get(3)?,
+                balance_wei: row.get(4)?,
+                is_solvent: row.get::<_, i32>(5)? != 0,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
     // ── Webhooks ────────────────────────────────────────────────────────
 
     /// Register a new webhook.
@@ -284,16 +389,30 @@ impl Database {
 // ─── Row types ──────────────────────────────────────────────────────────────
 
 /// A member row from the database.
+///
+/// No wallet address is stored — the agent only retains the privacy-preserving memberId.
 #[derive(Debug, Clone)]
 pub struct MemberRow {
     pub member_id: String,
-    pub watch_target: String,
     pub policy_id: String,
     pub status: String,
     pub enrolled_at: u64,
     pub effective_epoch: u64,
     pub last_balance_wei: String,  // Stored as string to support large balances (up to U256)
     pub last_checked_block: u64,
+}
+
+/// A proof submission row from the database.
+///
+/// Represents a user-submitted MPT proof that has been verified by the agent.
+#[derive(Debug, Clone)]
+pub struct ProofSubmissionRow {
+    pub member_id: String,
+    pub policy_id: String,
+    pub epoch: u64,
+    pub block_number: u64,
+    pub balance_wei: String,
+    pub is_solvent: bool,
 }
 
 /// An epoch row from the database.
@@ -331,10 +450,9 @@ mod tests {
     fn test_member_crud() {
         let db = Database::open_in_memory().unwrap();
 
-        // Insert a member
+        // Insert a member (no wallet address stored)
         db.insert_member(
             "aabbcc",
-            "0x1234567890abcdef1234567890abcdef12345678",
             "policy_001",
             1700000000,
             42,
@@ -349,7 +467,7 @@ mod tests {
 
         // Retrieve by ID
         let member = db.get_member("aabbcc").unwrap().unwrap();
-        assert_eq!(member.watch_target, "0x1234567890abcdef1234567890abcdef12345678");
+        assert_eq!(member.policy_id, "policy_001");
 
         // Update status (10 ETH in wei — exceeds i64 max, stored as string)
         db.update_member_status("aabbcc", "solvent", "10000000000000000000", 19_500_000).unwrap();
@@ -357,6 +475,53 @@ mod tests {
         assert_eq!(updated.status, "solvent");
         assert_eq!(updated.last_balance_wei, "10000000000000000000");
         assert_eq!(updated.last_checked_block, 19_500_000);
+    }
+
+    #[test]
+    fn test_proof_submission_crud() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Insert a proof submission
+        db.insert_proof_submission(
+            "member_001",
+            "policy_001",
+            1,
+            19_000_000,
+            "5000000000000000000",
+            true,
+        ).unwrap();
+
+        // Retrieve by epoch
+        let submissions = db.get_proof_submissions_for_epoch("policy_001", 1).unwrap();
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions[0].member_id, "member_001");
+        assert_eq!(submissions[0].balance_wei, "5000000000000000000");
+        assert!(submissions[0].is_solvent);
+
+        // Get latest for member
+        let latest = db.get_latest_proof_submission("member_001", "policy_001").unwrap().unwrap();
+        assert_eq!(latest.epoch, 1);
+
+        // Insert for next epoch (should not affect epoch 1)
+        db.insert_proof_submission(
+            "member_001",
+            "policy_001",
+            2,
+            19_000_100,
+            "100000000000000000",
+            false,
+        ).unwrap();
+
+        let submissions_e1 = db.get_proof_submissions_for_epoch("policy_001", 1).unwrap();
+        assert_eq!(submissions_e1.len(), 1);
+
+        let submissions_e2 = db.get_proof_submissions_for_epoch("policy_001", 2).unwrap();
+        assert_eq!(submissions_e2.len(), 1);
+        assert!(!submissions_e2[0].is_solvent);
+
+        // Latest should be epoch 2
+        let latest = db.get_latest_proof_submission("member_001", "policy_001").unwrap().unwrap();
+        assert_eq!(latest.epoch, 2);
     }
 
     #[test]

@@ -9,3 +9,11 @@ interface ImportMetaEnv {
 interface ImportMeta {
   readonly env: ImportMetaEnv;
 }
+
+// EIP-1193 provider for window.ethereum
+interface Window {
+  ethereum?: {
+    request(args: { method: string; params?: unknown[] }): Promise<unknown>;
+    isMetaMask?: boolean;
+  };
+}

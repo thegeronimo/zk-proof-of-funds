@@ -6,6 +6,8 @@ export type {
   SolvencyClientConfig,
   EnrollmentRequest,
   EnrollmentResponse,
+  ProofSubmissionRequest,
+  ProofSubmissionResponse,
   MerkleProofData,
   MemberStatus,
   AdminMember,

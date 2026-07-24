@@ -15,6 +15,7 @@
 | 8 | Frontend & SDK | React UI, JavaScript SDK for integrators | 3-5 days | |
 | 9 | Production Hardening | Monitoring, CI/CD, audit prep, documentation | 3-5 days | |
 | 10 | Privacy V2 | Solvent-set membership + deterministic nullifiers (see PRIVACY_V2.md) | 3-5 days | ✅ DONE (initial) |
+| 11 | Privacy V2 Completion | Proven set derivation (Stage B), streak solvency, client tooling | 3-5 days | 🚧 IN PROGRESS |
 
 **Total estimated effort: 28-46 days**
 
@@ -651,3 +652,89 @@ one-identity-per-key identifiers. Full design: **PRIVACY_V2.md**.
 - [ ] Wallet-side nullifier support (snap / local signer) + React app V2 flow
 - [ ] Stage B: SP1-proven solvent-set derivation from receipt logs (ERC-20)
 - [ ] Streak/time-weighted solvency leaf extension (anti-flash-loan)
+
+---
+
+## Phase 11: Privacy V2 Completion — Proven Derivation, Streak Solvency, Client Tooling
+
+**Goal**: Close the gaps left by Phase 10 (see PRIVACY_V2.md §4.4/§7): remove the
+operator-safety trust from solvent-set publication, add the time dimension
+(streak solvency + unpredictable reference blocks), and ship the client-side
+tooling that makes V2 usable end to end.
+
+### Design decisions (normative)
+
+- **Leaf v2 (streak-aware)**: `SHA256("zkpof-solvent-leaf-v2" || addr20 || streak_be4)`,
+  `streak: u32 >= 1` = consecutive epochs (including this one) the address has
+  been in the set. Replaces the v1 leaf everywhere in the V2 flow — nothing V2
+  is deployed (placeholder vkeys), so the ABI evolves in place rather than
+  versioning.
+- **Membership public values v2 (192 bytes)**:
+  `abi.encode(bytes32 root, bytes32 policyId, uint64 epoch, bytes32 nullifierHash,
+  uint64 chainId, uint64 minStreak)` — the circuit asserts `witness.streak >= minStreak`,
+  so a relying dApp requiring "solvent ≥ k epochs" checks `minStreak >= k`.
+- **Derivation public values (320 bytes)**:
+  `abi.encode(bytes32 stateRoot, bytes32 prevRoot, bytes32 newRoot, bytes32 policyId,
+  uint64 epoch, uint64 blockNumber, uint64 chainId, uint256 thresholdWei,
+  uint32 memberCount, uint32 candidateCount)`.
+- **What the derivation proof guarantees (Stage B)**: every address in the
+  published set had a balance ≥ threshold *proven via EIP-1186 against the
+  block's state root*, and every streak is continuous with the previously
+  published set (prev entries recommitted and matched against `prevRoot`).
+  This removes the operator **safety** failure (including an insolvent
+  address). Candidate **completeness** (censorship/liveness) remains
+  operator-side — provable later by exhaustive receipt-trie enumeration
+  ("Stage B.2", out of scope here).
+- **On-chain state-root binding**: `publishRootProven` takes the RLP block
+  header; checks `keccak256(headerRlp) == blockhash(pv.blockNumber)` (via an
+  overridable `_blockhash` hook for testability/EIP-2935), extracts
+  `stateRoot` with a fixed-shape RLP walk (items 0/1 are 32-byte strings,
+  item 2 is a 20-byte string, item 3 is the state root — invariant for all
+  Ethereum headers), and requires it to equal `pv.stateRoot`. Anyone can
+  publish a proven root; the operator path remains for Stage A policies.
+- **Unpredictable reference blocks**: `select_reference_block()` derives the
+  sample offset from a recent blockhash, making "rent funds for the sampled
+  block" strategies unable to predict which block will be sampled.
+
+### Explicitly out of scope (with rationale)
+
+- **Browser-native proving**: SP1 cannot prove in-browser; a dedicated
+  circom/noir circuit needs a trusted setup and wallet PLUME support to be
+  meaningful. The local-signer CLI (11.7) is the supported client prover.
+- **MetaMask snap**: separate package + signing infra; CLI covers the
+  raw-key path until wallet PLUME lands.
+- **V1 (watched-tree) streaks**: the streak mechanism lands in the V2 flow;
+  retrofitting the V1 leaf/contract/batch-program is deferred until V1
+  policies need it.
+
+### Tasks
+
+- [ ] **11.1** Move account-MPT verification into `crates/common/src/mpt.rs`
+  (agent re-exports) so SP1 guests share it; add `alloy-rlp` to common.
+- [ ] **11.2** Streak-aware solvent sets in `crates/common/src/solvent_set.rs`
+  (entries, leaf v2, paths) + membership statement with `minStreak`
+  (192-byte ABI) + updated `program-membership/`; rebuild ELF.
+- [ ] **11.3** `crates/common/src/solvent_derivation.rs` — host mirror of the
+  derivation statement (per-candidate EIP-1186 verify, streak continuity,
+  canonical set, 320-byte ABI) with synthetic-trie tests.
+- [ ] **11.4** `program-solvent-set/` SP1 guest sharing the statement via
+  zk-pof-common; build ELF; `crates/agent/src/derivation_prover.rs`
+  (stdin builder, execute, Groth16 prove, runtime ELF loading).
+- [ ] **11.5** Agent service: entries-with-streaks persistence (backward-
+  compatible JSON), automatic streak computation from the previous set,
+  `build_proven_from_candidates` (eth_getProof per candidate),
+  `select_reference_block` + tests.
+- [ ] **11.6** `SolventSetOracle`: 192-byte membership decode returning
+  `(nullifierHash, minStreak)`; `publishRootProven` (header binding,
+  derivation vkey, prev-root continuity, threshold/chain checks,
+  permissionless); `proven` flag on entries; Foundry tests incl. RLP header
+  fixture via `_blockhash` override harness.
+- [ ] **11.7** Client tooling: `print-vkeys` bin (setup → bytes32 vkeys for
+  deployment); `zkpof-client` bin (nullifier/enroll/witness/prove against a
+  running agent — the local-signer path).
+- [ ] **11.8** Backend: serve entries with streaks (keep `addresses` for
+  compat); SDK: streak-aware utils/types/client.
+- [ ] **11.9** Web app: solvent-set panel with client-side "is my wallet in
+  the set" check (no address leaves the browser).
+- [ ] **11.10** Docs (PRIVACY_V2.md Stage B status), full test sweep
+  (both guests re-verified against mirrors in the SP1 emulator), commit.

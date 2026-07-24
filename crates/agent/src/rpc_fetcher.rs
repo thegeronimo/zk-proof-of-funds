@@ -201,6 +201,28 @@ impl RpcFetcher {
         &self.rpc_url
     }
 
+    /// Get the chain ID of the connected node.
+    pub async fn get_chain_id(&self) -> Result<u64> {
+        self.provider
+            .get_chain_id()
+            .await
+            .context("eth_chainId RPC call failed")
+    }
+
+    /// Get the hash of a specific block (entropy for reference-block selection).
+    pub async fn get_block_hash(&self, block_number: u64) -> Result<[u8; 32]> {
+        let block = self.provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Number(block_number))
+            .hashes()
+            .await
+            .context("Failed to fetch block")?
+            .context("Block not found")?;
+
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(block.header.hash.as_slice());
+        Ok(hash)
+    }
+
     // --- Privacy V2: solvent-set derivation helpers ---
 
     /// Get an ERC-20 balance at a specific block via `eth_call` of

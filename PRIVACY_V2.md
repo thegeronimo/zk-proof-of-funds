@@ -1,7 +1,12 @@
 # Privacy V2 — Solvent-Set Membership & Deterministic Nullifiers
 
-**Status**: Design + initial implementation (Phase 10)
+**Status**: Implemented (Phase 10 + Phase 11 — see EXECUTION_PLAN.md)
 **Depends on**: ARCHITECTURE.md (V1 batch model), Phase 9 (ZK privacy mode)
+
+> **Phase 11 amendments** (normative): solvent-set leaves are streak-aware
+> (`"zkpof-solvent-leaf-v2"`, §4.1), membership public values carry
+> `minStreak` (192 bytes, §4.2), and Stage B — SP1-proven set derivation with
+> permissionless publication — is implemented (§4.4).
 
 ---
 
@@ -150,9 +155,11 @@ Computing `N` requires raw access to `sk`. Browser wallets (MetaMask et al.) do
 not expose it; PLUME requires wallet cooperation (`eth_getPlumeSignature`
 proposals, MetaMask snaps, or embedded/local signers). Consequences:
 
-- The Rust implementation is the reference; a CLI or local signer can enroll
-  today. The React app keeps the legacy signature flow until wallet support
-  exists.
+- The Rust implementation is the reference, and `zkpof-client` (Phase 11) is
+  the supported local-signer path: `nullifier`/`enroll`/`witness`/`prove`
+  subcommands compute everything key-touching on the user's machine. The React
+  app keeps the legacy signature flow for enrollment (plus a read-only
+  solvent-set panel with local membership checks) until wallet support exists.
 - The legacy `SHA256(signature)` path is **retained but hardened**: low-`s`
   signatures are now enforced (EIP-2 half-order check), which closes the
   third-party malleability attack. The owner-multiplicity attack is inherent to
@@ -177,11 +184,22 @@ addresses, the agent commits to `S` itself, once per epoch:
 ```
 Per epoch:
   1. Derive S(threshold, B) for the policy's asset at reference block B
-  2. leaf_i = SHA256("zkpof-solvent-leaf-v1" ‖ addr_i)       (addresses sorted ascending, deduped)
-  3. solvent_set_root = SHA256-Merkle-root(leaves)            (same tree rules as V1: odd level duplicates last)
-  4. Publish (policy_id, solvent_set_root, epoch, B, |S|) on-chain (SolventSetOracle)
-  5. Serve the full leaf list via API (it is public data)
+     (B is blockhash-derived and unpredictable — see the streak note below)
+  2. streak_i = prev_streak(addr_i) + 1 if addr_i was in the previous set, else 1
+  3. leaf_i = SHA256("zkpof-solvent-leaf-v2" ‖ addr_i ‖ streak_i_be4)
+     (entries sorted ascending by address, deduped)
+  4. solvent_set_root = SHA256-Merkle-root(leaves)            (same tree rules as V1: odd level duplicates last)
+  5. Publish (policy_id, solvent_set_root, epoch, B, |S|) on-chain (SolventSetOracle)
+  6. Serve the full entry list via API (it is public data)
 ```
+
+**Streaks (the time dimension, Phase 11).** A single balance snapshot is
+gameable — borrow funds for the sampled block, prove, return them. Each leaf
+therefore carries the number of consecutive epochs the address has qualified,
+and the reference block is sampled unpredictably (blockhash-derived offset
+within the freshness window; `select_reference_block`). A policy demanding
+"solvent for ≥ k epochs" then makes rented solvency cost roughly as much as
+real solvency.
 
 A user proves membership entirely client-side:
 
@@ -200,22 +218,26 @@ downloaders. The anonymity set is every solvent address on the chain.
 ### 4.2 The membership statement (SP1 program `program-membership/`)
 
 ```
-Private inputs:  sk (32B), merkle_siblings (Vec<[u8;32]>), leaf_index (u64)
-Public inputs:   solvent_set_root (32B), policy_id (32B), epoch (u64), chain_id (u64)
+Private inputs:  sk (32B), streak (u32), merkle_siblings (Vec<[u8;32]>), leaf_index (u64)
+Public inputs:   solvent_set_root (32B), policy_id (32B), epoch (u64), chain_id (u64), min_streak (u64)
 
 1. assert sk is a valid nonzero scalar; pk = g · sk
 2. address = keccak256(pk_uncompressed[1..65])[12..32]
-3. leaf = SHA256("zkpof-solvent-leaf-v1" ‖ address)
-4. assert MerkleVerify(leaf, leaf_index, merkle_siblings, solvent_set_root)
-5. N = hash_to_curve("zkpof-nullifier-v2:" ‖ hex(policy_id) ‖ pk_compressed, DST_H2C) · sk
-6. nullifier_hash = SHA256(N_compressed)
-7. commit abi.encode(solvent_set_root, policy_id, epoch, nullifier_hash, chain_id)
+3. assert streak >= min_streak                       (time-dimension gate)
+4. leaf = SHA256("zkpof-solvent-leaf-v2" ‖ address ‖ streak_be4)
+5. assert MerkleVerify(leaf, leaf_index, merkle_siblings, solvent_set_root)
+6. N = hash_to_curve("zkpof-nullifier-v2:" ‖ hex(policy_id) ‖ pk_compressed, DST_H2C) · sk
+7. nullifier_hash = SHA256(N_compressed)
+8. commit abi.encode(solvent_set_root, policy_id, epoch, nullifier_hash, chain_id, min_streak)
 ```
 
+The exact streak stays private — the proof reveals only that it meets the
+policy minimum, not how long the member has actually held funds.
+
 **Public values ABI (normative):** `abi.encode(bytes32 solventSetRoot,
-bytes32 policyId, uint64 epoch, bytes32 nullifierHash, uint64 chainId)` — five
-32-byte words, 160 bytes, committed as a single `commit_slice` blob so Solidity
-`abi.decode` consumes it directly.
+bytes32 policyId, uint64 epoch, bytes32 nullifierHash, uint64 chainId,
+uint64 minStreak)` — six 32-byte words, 192 bytes, committed as a single
+`commit_slice` blob so Solidity `abi.decode` consumes it directly.
 
 Note the unification: `nullifier_hash` here equals `member_id` from Construction
 A. A member enrolled in monitored mode and the same key proving client-side in V2
@@ -225,11 +247,18 @@ interchangeable per policy without integration changes.
 ### 4.3 On-chain: `SolventSetOracle.sol`
 
 - `publishRoot(policyId, root, epoch, blockNumber, memberCount)` — operator-only,
-  epoch strictly increasing, policy active. (Publication is operator-trusted in
-  Stage A; Stage B replaces this with an SP1-proven derivation — §4.4.)
-- `verifyMembership(policyId, rootIndex, publicValues, proofBytes) → nullifierHash`
-  — view; checks TTL, verifies the SP1 proof against `membershipVKey`, decodes and
-  cross-checks the public values against the stored entry, returns the nullifier.
+  epoch strictly increasing, policy active (Stage A, operator-trusted).
+- `publishRootProven(policyId, headerRlp, publicValues, proofBytes)` — **anyone**
+  may call (Stage B): verifies the SP1 derivation proof against `derivationVKey`,
+  binds `stateRoot` to the chain via `keccak256(headerRlp) == blockhash(blockNumber)`
+  (state root extracted from the header by a fixed-shape RLP walk), checks
+  `prevRoot` against the stored history (streak continuity), and cross-checks
+  the policy's threshold/chain. Entries record a `proven` flag.
+- `verifyMembership(policyId, rootIndex, publicValues, proofBytes) →
+  (nullifierHash, minStreak)` — view; checks TTL, verifies the SP1 proof
+  against `membershipVKey`, decodes and cross-checks the public values against
+  the stored entry. Relying protocols requiring "solvent ≥ k epochs" check
+  `minStreak >= k`.
 - `verifyAndConsume(...)` — same, then marks `usedNullifiers[policyId][nullifierHash]`,
   reverting on reuse. For one-per-address semantics (votes, mints). Protocols that
   want their own consumption namespace use the view function and track nullifiers
@@ -251,21 +280,29 @@ The derivation is the only part of V2 where trust is staged rather than immediat
   - *Native ETH*: candidate lists (config or discovery heuristics) checked via
     `eth_getBalance` at block B. Full-state enumeration needs node-level access
     (`debug_accountRange`/snapshots) and is out of scope here.
-- **Stage B (future)**: prove the derivation in SP1. For ERC-20s the set is
-  maintainable purely from Transfer logs verified against per-block receipt roots
-  and the header chain — a rolling proof, far cheaper than state-trie iteration.
-  Caveats: nonstandard tokens (rebasing, fee-on-transfer) break log accounting and
-  must be flagged per policy. Native ETH requires proving state reads (RSP-style
-  block execution or EIP-1186 sampling) and stays on the watch/monitored path
-  until that is economical.
-- **Stage C (research)**: multi-party or light-client-verified publication so even
-  root publication needs no single trusted operator.
+- **Stage B (implemented, Phase 11)**: prove the derivation in SP1
+  (`program-solvent-set/`, mirror in `crates/common/src/solvent_derivation.rs`).
+  The proof shows every entry's balance was verified via **EIP-1186 against the
+  block's state root** and every streak chains from the previously published
+  set (`prevRoot` recommitted inside the proof and matched against on-chain
+  history). `SolventSetOracle.publishRootProven` binds the state root to the
+  chain through the block header and accepts the root from **anyone** —
+  publication itself is permissionless. Native ETH; ERC-20 needs storage
+  proofs (future). This removes the operator *safety* failure (smuggling an
+  insolvent address or inflated streak is impossible).
+- **Stage B.2 (future)**: prove candidate *completeness* for ERC-20s by
+  exhaustively enumerating Transfer logs against per-block receipt roots — a
+  rolling proof, far cheaper than state-trie iteration. Caveats: nonstandard
+  tokens (rebasing, fee-on-transfer) break log accounting and must be flagged
+  per policy.
+- **Stage C (research)**: multi-party or light-client-verified candidate
+  sourcing so even the candidate list needs no single operator.
 
-An honest framing of Stage A: the operator can omit an address from the set
-(censorship → liveness failure for that user, visible to them immediately) or
-include an insolvent address (safety failure — requires operator misbehavior
-exactly as trusted-mode V1 does). Stage B removes the safety failure; the TTL and
-epoch-increasing rules already bound the damage window on-chain.
+An honest framing of the residual trust: with Stage B, an operator (or anyone
+publishing) can no longer fake balances or streaks — but whoever assembles the
+candidate list can still *omit* an address (censorship → liveness failure for
+that user, visible to them immediately in the public set). TTL and
+epoch-increasing rules bound the damage window on-chain.
 
 ### 4.5 What V2 deliberately does not solve
 
@@ -275,10 +312,11 @@ epoch-increasing rules already bound the damage window on-chain.
   proof a use-time, user-held step. TEEs/MPC could move that back to a service at
   the cost of new trust; out of scope.
 - **Non-encumbrance**: proving funds aren't borrowed, key-shared, or pledged
-  elsewhere is not possible on a transparent account chain. Mitigation is
-  economic: streak/time-weighted solvency (consecutive epochs in the set, with
-  blockhash-randomized reference blocks) is a planned leaf extension — idea 3 from
-  the design discussion, not part of this change.
+  elsewhere is not possible on a transparent account chain. The economic
+  mitigation — streak solvency with blockhash-randomized reference blocks
+  (§4.1) — landed in Phase 11 and raises the cost of rented solvency to
+  roughly the cost of real solvency over the streak window, but it is a price,
+  not a proof.
 
 ---
 
@@ -287,30 +325,37 @@ epoch-increasing rules already bound the damage window on-chain.
 | Piece | Location | Notes |
 |---|---|---|
 | Nullifier + DLEQ | `crates/common/src/plume.rs` | k256 `hash2curve`, deterministic nonce, 98-byte proof |
-| Solvent-set tree | `crates/common/src/solvent_set.rs` | Domain-separated leaves, sorted/deduped, path building |
-| Membership statement (host mirror) | `crates/common/src/membership.rs` | Native execution + ABI encoding; must match the guest byte-for-byte |
-| SP1 guest program | `program-membership/` | Excluded from workspace, `cargo prove build`, sp1-zkvm 6 |
+| Solvent-set tree (streaks) | `crates/common/src/solvent_set.rs` | Leaf v2 with streak, sorted/deduped entries, path building |
+| Membership statement (host mirror) | `crates/common/src/membership.rs` | Native execution + 192-byte ABI; same code as the guest |
+| Derivation statement (host mirror) | `crates/common/src/solvent_derivation.rs` | EIP-1186 per candidate, streak continuity, 320-byte ABI; synthetic-trie fixtures |
+| Shared MPT verification | `crates/common/src/mpt.rs` | Used by host and guests (agent re-exports as `mpt_verifier`) |
+| SP1 membership guest | `program-membership/` | Imports the shared statement; `cargo prove build`, sp1-zkvm 6 |
+| SP1 derivation guest | `program-solvent-set/` | Imports the shared statement; `cargo prove build`, sp1-zkvm 6 |
 | Low-s hardening | `crates/agent/src/enrollment.rs` | EIP-2 half-order check; malleated signatures rejected |
-| Nullifier enrollment | `crates/agent/src/enrollment.rs` | `enroll_with_nullifier`; `member_id = nullifier_hash` |
-| Solvent-set service | `crates/agent/src/solvent_set_service.rs` | Build from candidates, Transfer-log discovery, DB persistence |
-| DB | `crates/agent/src/db.rs` | `nullifiers`, `solvent_sets` tables |
-| API | `crates/backend/src/main.rs` | `POST /v2/enroll`, `GET /v2/solvent_set/:policy_id`, `GET /v2/solvent_set/:policy_id/leaves`, `POST /v2/admin/build_solvent_set/:policy_id` |
-| Oracle | `contracts/src/SolventSetOracle.sol` | publish + verifyMembership + verifyAndConsume; Foundry tests with MockSP1Verifier |
-| SDK | `sdk/src/` | Solvent-set fetch + local tree/path computation (still zero-dep) |
+| Nullifier enrollment | `crates/agent/src/enrollment.rs` | `register_nullifier_member`; `member_id = nullifier_hash` |
+| Solvent-set service | `crates/agent/src/solvent_set_service.rs` | Streak persistence, Stage A + Stage B builds, Transfer-log discovery, `select_reference_block` |
+| Provers (host drivers) | `crates/agent/src/{membership,derivation}_prover.rs` | Runtime-loaded ELFs, execute + Groth16 prove |
+| Client tooling | `crates/agent/src/bin/{zkpof-client,print-vkeys}.rs` | Local signer/prover CLI; vkey generation for deployment |
+| DB | `crates/agent/src/db.rs` | `nullifiers`, `solvent_sets` (entries + streaks) tables |
+| API | `crates/backend/src/main.rs` | `POST /v2/enroll`, `GET /v2/solvent_set/:policy_id[/leaves]`, `POST /v2/admin/build_solvent_set/:policy_id` (`proven` flag) |
+| Oracle | `contracts/src/SolventSetOracle.sol` | publishRoot + publishRootProven (header binding) + verifyMembership/verifyAndConsume |
+| SDK | `sdk/src/` | Streak-aware set fetch + local tree/path computation (still zero-dep) |
+| Web | `web/src/components/SolventSetPanel.tsx` | Client-side set explorer + local membership check |
 
 **No server-side path endpoint exists by design** — asking the agent for "the path
-for address X" would reveal X. Paths are computed client-side from the public leaf
-list (SDK and `crates/common` both implement it).
+for address X" would reveal X. Paths are computed client-side from the public
+entry list (SDK, `crates/common`, and `zkpof-client` all implement it).
 
 ## 6. Rollout
 
-1. Land V2 alongside V1 (this change): additive routes, tables, contracts. Nothing
-   existing breaks; legacy enrollment is hardened but keeps its API shape.
-2. Wire real SP1 proving for `program-membership` (needs `cargo prove build` ELF +
-   prover infra; same operational gate as the existing batch program).
-3. Wallet-side PLUME (snap or local signer) → surface V2 enrollment and
-   client-side proving in the React app.
-4. Stage B proven set derivation for ERC-20 policies.
+1. ✅ Land V2 alongside V1 (Phase 10): additive routes, tables, contracts.
+2. ✅ Streak solvency + unpredictable reference blocks (Phase 11).
+3. ✅ Stage B proven derivation + permissionless publication (Phase 11, native ETH).
+4. ✅ Local-signer client path (`zkpof-client`) + vkey deployment wiring (Phase 11).
+5. Generate + set the production vkeys (`print-vkeys`, `setMembershipVKey` /
+   `setDerivationVKey`) and run Groth16 proving on real infrastructure.
+6. Wallet-side PLUME (snap or `eth_getPlumeSignature`) → surface V2 enrollment
+   and client-side proving in the React app beyond the read-only panel.
 
 ## 7. Open items
 
@@ -318,6 +363,7 @@ list (SDK and `crates/common` both implement it).
 - Browser proving target: SP1 is not browser-feasible today; either delegate
   proving with TEE privacy, or compile the membership statement to a small
   dedicated circuit (circom/noir) with the same public-values ABI.
-- Streak/time-weighted solvency leaf extension (anti-flash-loan).
+- Stage B.2: prove ERC-20 candidate completeness from receipt-trie enumeration;
+  ERC-20 storage proofs for proven builds.
 - Purge `wallet_address` from the legacy `/submit_proof` request path once V2
   covers its use cases.

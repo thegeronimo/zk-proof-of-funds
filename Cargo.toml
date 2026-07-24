@@ -6,7 +6,7 @@ members = [
     # "crates/wasm",  # Enable when WASM bindings are ready
 ]
 # Exclude the SP1 programs — they compile to RISC-V with their own toolchain
-exclude = ["program", "program-membership"]
+exclude = ["program", "program-membership", "program-solvent-set"]
 resolver = "2"
 
 [workspace.package]

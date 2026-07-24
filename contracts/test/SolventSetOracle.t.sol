@@ -6,9 +6,31 @@ import {PolicyRegistry} from "../src/PolicyRegistry.sol";
 import {SolventSetOracle} from "../src/SolventSetOracle.sol";
 import {MockSP1Verifier} from "./mocks/MockSP1Verifier.sol";
 
+/// @dev Test harness exposing a settable blockhash source, since Foundry's
+///      default environment has no real block hashes. Production code path is
+///      identical except for the `_blockhash` virtual hook.
+contract TestableSolventSetOracle is SolventSetOracle {
+    mapping(uint64 => bytes32) private _hashes;
+
+    constructor(
+        address _policyRegistry,
+        address _sp1Verifier,
+        bytes32 _membershipVKey,
+        bytes32 _derivationVKey
+    ) SolventSetOracle(_policyRegistry, _sp1Verifier, _membershipVKey, _derivationVKey) {}
+
+    function setBlockhash(uint64 blockNumber, bytes32 hash) external {
+        _hashes[blockNumber] = hash;
+    }
+
+    function _blockhash(uint64 blockNumber) internal view override returns (bytes32) {
+        return _hashes[blockNumber];
+    }
+}
+
 contract SolventSetOracleTest is Test {
     PolicyRegistry registry;
-    SolventSetOracle oracle;
+    TestableSolventSetOracle oracle;
     MockSP1Verifier mockVerifier;
 
     address operatorAddr;
@@ -18,7 +40,9 @@ contract SolventSetOracleTest is Test {
     bytes32 constant OTHER_POLICY_ID = bytes32(uint256(0x02));
     bytes32 constant SET_ROOT = bytes32(uint256(0xABCD));
     bytes32 constant NULLIFIER_HASH = bytes32(uint256(0xFEED));
+    bytes32 constant STATE_ROOT = bytes32(uint256(0x57A7E));
     uint64 constant ROOT_TTL = 1000;
+    uint256 constant THRESHOLD = 1 ether;
 
     function setUp() public {
         operatorAddr = makeAddr("operator");
@@ -26,14 +50,15 @@ contract SolventSetOracleTest is Test {
 
         registry = new PolicyRegistry();
         mockVerifier = new MockSP1Verifier();
-        oracle = new SolventSetOracle(
+        oracle = new TestableSolventSetOracle(
             address(registry),
             address(mockVerifier),
-            bytes32(0) // placeholder membership vkey
+            bytes32(0), // placeholder membership vkey
+            bytes32(0)  // placeholder derivation vkey
         );
 
         PolicyRegistry.Policy memory policy = PolicyRegistry.Policy({
-            thresholdWei: 1 ether,
+            thresholdWei: THRESHOLD,
             tokenAddress: address(0),
             chainId: uint64(block.chainid),
             epochLengthBlocks: 100,
@@ -55,9 +80,40 @@ contract SolventSetOracleTest is Test {
         bytes32 root,
         bytes32 policyId,
         uint64 epoch,
-        bytes32 nullifierHash
+        bytes32 nullifierHash,
+        uint64 minStreak
     ) internal view returns (bytes memory) {
-        return abi.encode(root, policyId, epoch, nullifierHash, uint64(block.chainid));
+        return abi.encode(root, policyId, epoch, nullifierHash, uint64(block.chainid), minStreak);
+    }
+
+    /// @dev ABI-encode derivation public values exactly as the SP1 program
+    ///      commits them (crates/common/src/solvent_derivation.rs::abi_encode).
+    function _derivationValues(
+        bytes32 stateRoot,
+        bytes32 prevRoot,
+        bytes32 newRoot,
+        uint64 epoch,
+        uint64 blockNumber,
+        uint64 chainId,
+        uint256 thresholdWei
+    ) internal pure returns (bytes memory) {
+        return abi.encode(
+            stateRoot, prevRoot, newRoot, POLICY_ID, epoch, blockNumber, chainId,
+            thresholdWei, uint32(3), uint32(5)
+        );
+    }
+
+    /// @dev A minimal header the fixed-shape walker accepts: list prefix, two
+    ///      32-byte hashes, a 20-byte coinbase, then the state root. Anything
+    ///      beyond item 3 is irrelevant — real binding comes from the keccak.
+    function _buildHeader(bytes32 stateRoot) internal pure returns (bytes memory) {
+        return abi.encodePacked(
+            hex"f90200",
+            hex"a0", bytes32(uint256(0x1111)), // parentHash
+            hex"a0", bytes32(uint256(0x2222)), // unclesHash
+            hex"94", bytes20(uint160(0x3333)), // coinbase
+            hex"a0", stateRoot
+        );
     }
 
     function _publishDefaultRoot() internal {
@@ -65,7 +121,17 @@ contract SolventSetOracleTest is Test {
         oracle.publishRoot(POLICY_ID, SET_ROOT, 1, uint64(block.number), 42);
     }
 
-    // --- publishRoot ---
+    /// @dev Roll forward and prepare a provable reference block: header +
+    ///      registered blockhash. Returns (refBlock, headerRlp).
+    function _prepareProvenBlock(bytes32 stateRoot) internal returns (uint64, bytes memory) {
+        vm.roll(1000);
+        uint64 refBlock = 900;
+        bytes memory headerRlp = _buildHeader(stateRoot);
+        oracle.setBlockhash(refBlock, keccak256(headerRlp));
+        return (refBlock, headerRlp);
+    }
+
+    // --- publishRoot (Stage A) ---
 
     function test_PublishRoot() public {
         _publishDefaultRoot();
@@ -78,11 +144,14 @@ contract SolventSetOracleTest is Test {
         assertEq(entry.epoch, 1);
         assertEq(entry.memberCount, 42);
         assertEq(entry.publishedAt, uint64(block.number));
+        assertFalse(entry.proven, "Stage A publication is operator-trusted");
     }
 
     function test_PublishRoot_EmitsEvent() public {
         vm.expectEmit(true, false, false, true);
-        emit SolventSetOracle.SolventSetRootPublished(POLICY_ID, SET_ROOT, 1, block.number, 42);
+        emit SolventSetOracle.SolventSetRootPublished(
+            POLICY_ID, SET_ROOT, 1, block.number, 42, false, operatorAddr
+        );
         _publishDefaultRoot();
     }
 
@@ -126,21 +195,197 @@ contract SolventSetOracleTest is Test {
         oracle.publishRoot(OTHER_POLICY_ID, SET_ROOT, 1, uint64(block.number), 42);
     }
 
+    // --- publishRootProven (Stage B) ---
+
+    function test_PublishRootProven_FirstEpoch_Permissionless() public {
+        (uint64 refBlock, bytes memory headerRlp) = _prepareProvenBlock(STATE_ROOT);
+        bytes memory pv = _derivationValues(
+            STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock, uint64(block.chainid), THRESHOLD
+        );
+
+        // Anyone can publish a proven root — the proof is trusted, not the caller.
+        vm.prank(stranger);
+        oracle.publishRootProven(POLICY_ID, headerRlp, pv, hex"");
+
+        SolventSetOracle.SetEntry memory entry = oracle.getSetEntry(POLICY_ID, 0);
+        assertEq(entry.root, SET_ROOT);
+        assertEq(entry.epoch, 1);
+        assertEq(entry.blockNumber, refBlock);
+        assertEq(entry.memberCount, 3);
+        assertTrue(entry.proven, "Stage B publication is proof-backed");
+    }
+
+    function test_PublishRootProven_ChainsFromTrustedRoot() public {
+        _publishDefaultRoot(); // epoch 1, SET_ROOT, trusted
+
+        (uint64 refBlock, bytes memory headerRlp) = _prepareProvenBlock(STATE_ROOT);
+        bytes32 newRoot = bytes32(uint256(0xD00D));
+        bytes memory pv = _derivationValues(
+            STATE_ROOT, SET_ROOT, newRoot, 2, refBlock, uint64(block.chainid), THRESHOLD
+        );
+
+        oracle.publishRootProven(POLICY_ID, headerRlp, pv, hex"");
+        assertEq(oracle.getSetEntry(POLICY_ID, 1).root, newRoot);
+        assertTrue(oracle.getSetEntry(POLICY_ID, 1).proven);
+    }
+
+    function test_PublishRootProven_RevertsOnPrevRootMismatch() public {
+        _publishDefaultRoot(); // stored prev root = SET_ROOT
+
+        (uint64 refBlock, bytes memory headerRlp) = _prepareProvenBlock(STATE_ROOT);
+        bytes32 wrongPrev = bytes32(uint256(0xBAD));
+        bytes memory pv = _derivationValues(
+            STATE_ROOT, wrongPrev, bytes32(uint256(0xD00D)), 2, refBlock,
+            uint64(block.chainid), THRESHOLD
+        );
+
+        vm.expectRevert(
+            abi.encodeWithSelector(SolventSetOracle.PrevRootMismatch.selector, SET_ROOT, wrongPrev)
+        );
+        oracle.publishRootProven(POLICY_ID, headerRlp, pv, hex"");
+    }
+
+    function test_PublishRootProven_RevertsOnThresholdMismatch() public {
+        (uint64 refBlock, bytes memory headerRlp) = _prepareProvenBlock(STATE_ROOT);
+        bytes memory pv = _derivationValues(
+            STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock, uint64(block.chainid), THRESHOLD + 1
+        );
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SolventSetOracle.ThresholdMismatch.selector, THRESHOLD, THRESHOLD + 1
+            )
+        );
+        oracle.publishRootProven(POLICY_ID, headerRlp, pv, hex"");
+    }
+
+    function test_PublishRootProven_RevertsOnChainIdMismatch() public {
+        (uint64 refBlock, bytes memory headerRlp) = _prepareProvenBlock(STATE_ROOT);
+        uint64 wrongChain = uint64(block.chainid) + 1;
+        bytes memory pv = _derivationValues(
+            STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock, wrongChain, THRESHOLD
+        );
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SolventSetOracle.ChainIdMismatch.selector, uint64(block.chainid), wrongChain
+            )
+        );
+        oracle.publishRootProven(POLICY_ID, headerRlp, pv, hex"");
+    }
+
+    function test_PublishRootProven_RevertsOnStaleReferenceBlock() public {
+        vm.roll(1000);
+        uint64 staleBlock = 1000 - 257; // beyond maxBlockAge = 256
+        bytes memory headerRlp = _buildHeader(STATE_ROOT);
+        oracle.setBlockhash(staleBlock, keccak256(headerRlp));
+        bytes memory pv = _derivationValues(
+            STATE_ROOT, bytes32(0), SET_ROOT, 1, staleBlock, uint64(block.chainid), THRESHOLD
+        );
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SolventSetOracle.StaleReferenceBlock.selector, uint256(1000), staleBlock, uint64(256)
+            )
+        );
+        oracle.publishRootProven(POLICY_ID, headerRlp, pv, hex"");
+    }
+
+    function test_PublishRootProven_RevertsOnMissingBlockhash() public {
+        vm.roll(1000);
+        uint64 refBlock = 900; // no blockhash registered in the harness
+        bytes memory headerRlp = _buildHeader(STATE_ROOT);
+        bytes memory pv = _derivationValues(
+            STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock, uint64(block.chainid), THRESHOLD
+        );
+
+        vm.expectRevert(
+            abi.encodeWithSelector(SolventSetOracle.BlockhashUnavailable.selector, refBlock)
+        );
+        oracle.publishRootProven(POLICY_ID, headerRlp, pv, hex"");
+    }
+
+    function test_PublishRootProven_RevertsOnHeaderHashMismatch() public {
+        (uint64 refBlock, ) = _prepareProvenBlock(STATE_ROOT);
+        // Present a different header than the one whose hash is registered.
+        bytes memory forgedHeader = _buildHeader(bytes32(uint256(0xE71)));
+        bytes memory pv = _derivationValues(
+            STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock, uint64(block.chainid), THRESHOLD
+        );
+
+        vm.expectRevert();
+        oracle.publishRootProven(POLICY_ID, forgedHeader, pv, hex"");
+    }
+
+    function test_PublishRootProven_RevertsOnStateRootMismatch() public {
+        // Header commits a different state root than the proof's public values.
+        bytes32 otherStateRoot = bytes32(uint256(0x0DD));
+        (uint64 refBlock, bytes memory headerRlp) = _prepareProvenBlock(otherStateRoot);
+        bytes memory pv = _derivationValues(
+            STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock, uint64(block.chainid), THRESHOLD
+        );
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SolventSetOracle.StateRootMismatch.selector, otherStateRoot, STATE_ROOT
+            )
+        );
+        oracle.publishRootProven(POLICY_ID, headerRlp, pv, hex"");
+    }
+
+    function test_PublishRootProven_RevertsOnMalformedHeader() public {
+        vm.roll(1000);
+        uint64 refBlock = 900;
+        bytes memory badHeader = abi.encodePacked(hex"f90200", hex"80"); // not a 32-byte item
+        oracle.setBlockhash(refBlock, keccak256(badHeader));
+        bytes memory pv = _derivationValues(
+            STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock, uint64(block.chainid), THRESHOLD
+        );
+
+        vm.expectRevert(SolventSetOracle.MalformedHeader.selector);
+        oracle.publishRootProven(POLICY_ID, badHeader, pv, hex"");
+    }
+
+    function test_PublishRootProven_RevertsOnInvalidProof() public {
+        (uint64 refBlock, bytes memory headerRlp) = _prepareProvenBlock(STATE_ROOT);
+        mockVerifier.setShouldPass(false);
+        bytes memory pv = _derivationValues(
+            STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock, uint64(block.chainid), THRESHOLD
+        );
+
+        vm.expectRevert(MockSP1Verifier.MockVerifierRejected.selector);
+        oracle.publishRootProven(POLICY_ID, headerRlp, pv, hex"");
+    }
+
+    function test_PublishRootProven_RevertsOnBadLength() public {
+        (uint64 refBlock, bytes memory headerRlp) = _prepareProvenBlock(STATE_ROOT);
+        bytes memory truncated = abi.encode(STATE_ROOT, bytes32(0), SET_ROOT, POLICY_ID, refBlock);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SolventSetOracle.InvalidPublicValuesLength.selector, truncated.length
+            )
+        );
+        oracle.publishRootProven(POLICY_ID, headerRlp, truncated, hex"");
+    }
+
     // --- verifyMembership ---
 
     function test_VerifyMembership() public {
         _publishDefaultRoot();
 
-        bytes memory publicValues = _publicValues(SET_ROOT, POLICY_ID, 1, NULLIFIER_HASH);
-        bytes32 nullifierHash = oracle.verifyMembership(POLICY_ID, 0, publicValues, hex"");
+        bytes memory publicValues = _publicValues(SET_ROOT, POLICY_ID, 1, NULLIFIER_HASH, 3);
+        (bytes32 nullifierHash, uint64 minStreak) =
+            oracle.verifyMembership(POLICY_ID, 0, publicValues, hex"");
         assertEq(nullifierHash, NULLIFIER_HASH);
+        assertEq(minStreak, 3, "Relying protocols gate on the attested min streak");
     }
 
     function test_VerifyMembership_RevertsOnInvalidProof() public {
         _publishDefaultRoot();
         mockVerifier.setShouldPass(false);
 
-        bytes memory publicValues = _publicValues(SET_ROOT, POLICY_ID, 1, NULLIFIER_HASH);
+        bytes memory publicValues = _publicValues(SET_ROOT, POLICY_ID, 1, NULLIFIER_HASH, 1);
         vm.expectRevert(MockSP1Verifier.MockVerifierRejected.selector);
         oracle.verifyMembership(POLICY_ID, 0, publicValues, hex"");
     }
@@ -148,7 +393,8 @@ contract SolventSetOracleTest is Test {
     function test_VerifyMembership_RevertsOnWrongRoot() public {
         _publishDefaultRoot();
 
-        bytes memory publicValues = _publicValues(bytes32(uint256(0xBEEF)), POLICY_ID, 1, NULLIFIER_HASH);
+        bytes memory publicValues =
+            _publicValues(bytes32(uint256(0xBEEF)), POLICY_ID, 1, NULLIFIER_HASH, 1);
         vm.expectRevert(SolventSetOracle.PublicValuesMismatch.selector);
         oracle.verifyMembership(POLICY_ID, 0, publicValues, hex"");
     }
@@ -156,9 +402,8 @@ contract SolventSetOracleTest is Test {
     function test_VerifyMembership_RevertsOnWrongPolicy() public {
         _publishDefaultRoot();
 
-        // Proof generated for a different policy id must not verify here,
-        // even against the same root.
-        bytes memory publicValues = _publicValues(SET_ROOT, OTHER_POLICY_ID, 1, NULLIFIER_HASH);
+        bytes memory publicValues =
+            _publicValues(SET_ROOT, OTHER_POLICY_ID, 1, NULLIFIER_HASH, 1);
         vm.expectRevert(SolventSetOracle.PublicValuesMismatch.selector);
         oracle.verifyMembership(POLICY_ID, 0, publicValues, hex"");
     }
@@ -166,7 +411,7 @@ contract SolventSetOracleTest is Test {
     function test_VerifyMembership_RevertsOnWrongEpoch() public {
         _publishDefaultRoot();
 
-        bytes memory publicValues = _publicValues(SET_ROOT, POLICY_ID, 99, NULLIFIER_HASH);
+        bytes memory publicValues = _publicValues(SET_ROOT, POLICY_ID, 99, NULLIFIER_HASH, 1);
         vm.expectRevert(SolventSetOracle.PublicValuesMismatch.selector);
         oracle.verifyMembership(POLICY_ID, 0, publicValues, hex"");
     }
@@ -174,8 +419,9 @@ contract SolventSetOracleTest is Test {
     function test_VerifyMembership_RevertsOnWrongChainId() public {
         _publishDefaultRoot();
 
-        bytes memory publicValues =
-            abi.encode(SET_ROOT, POLICY_ID, uint64(1), NULLIFIER_HASH, uint64(block.chainid + 1));
+        bytes memory publicValues = abi.encode(
+            SET_ROOT, POLICY_ID, uint64(1), NULLIFIER_HASH, uint64(block.chainid + 1), uint64(1)
+        );
         vm.expectRevert(SolventSetOracle.PublicValuesMismatch.selector);
         oracle.verifyMembership(POLICY_ID, 0, publicValues, hex"");
     }
@@ -194,13 +440,13 @@ contract SolventSetOracleTest is Test {
         _publishDefaultRoot();
         vm.roll(block.number + ROOT_TTL + 1);
 
-        bytes memory publicValues = _publicValues(SET_ROOT, POLICY_ID, 1, NULLIFIER_HASH);
+        bytes memory publicValues = _publicValues(SET_ROOT, POLICY_ID, 1, NULLIFIER_HASH, 1);
         vm.expectRevert();
         oracle.verifyMembership(POLICY_ID, 0, publicValues, hex"");
     }
 
     function test_VerifyMembership_RevertsOnMissingSet() public {
-        bytes memory publicValues = _publicValues(SET_ROOT, POLICY_ID, 1, NULLIFIER_HASH);
+        bytes memory publicValues = _publicValues(SET_ROOT, POLICY_ID, 1, NULLIFIER_HASH, 1);
         vm.expectRevert(
             abi.encodeWithSelector(SolventSetOracle.SetIndexOutOfBounds.selector, POLICY_ID, 0, 0)
         );
@@ -214,12 +460,14 @@ contract SolventSetOracleTest is Test {
         oracle.publishRoot(POLICY_ID, newRoot, 2, uint64(block.number), 43);
 
         // Proof against epoch 1 still verifies at index 0 (within TTL)...
-        bytes memory oldValues = _publicValues(SET_ROOT, POLICY_ID, 1, NULLIFIER_HASH);
-        assertEq(oracle.verifyMembership(POLICY_ID, 0, oldValues, hex""), NULLIFIER_HASH);
+        bytes memory oldValues = _publicValues(SET_ROOT, POLICY_ID, 1, NULLIFIER_HASH, 1);
+        (bytes32 oldNullifier, ) = oracle.verifyMembership(POLICY_ID, 0, oldValues, hex"");
+        assertEq(oldNullifier, NULLIFIER_HASH);
 
         // ...and the new epoch verifies at index 1.
-        bytes memory newValues = _publicValues(newRoot, POLICY_ID, 2, NULLIFIER_HASH);
-        assertEq(oracle.verifyMembership(POLICY_ID, 1, newValues, hex""), NULLIFIER_HASH);
+        bytes memory newValues = _publicValues(newRoot, POLICY_ID, 2, NULLIFIER_HASH, 1);
+        (bytes32 newNullifier, ) = oracle.verifyMembership(POLICY_ID, 1, newValues, hex"");
+        assertEq(newNullifier, NULLIFIER_HASH);
     }
 
     // --- verifyAndConsume ---
@@ -227,16 +475,18 @@ contract SolventSetOracleTest is Test {
     function test_VerifyAndConsume() public {
         _publishDefaultRoot();
 
-        bytes memory publicValues = _publicValues(SET_ROOT, POLICY_ID, 1, NULLIFIER_HASH);
-        bytes32 nullifierHash = oracle.verifyAndConsume(POLICY_ID, 0, publicValues, hex"");
+        bytes memory publicValues = _publicValues(SET_ROOT, POLICY_ID, 1, NULLIFIER_HASH, 2);
+        (bytes32 nullifierHash, uint64 minStreak) =
+            oracle.verifyAndConsume(POLICY_ID, 0, publicValues, hex"");
         assertEq(nullifierHash, NULLIFIER_HASH);
+        assertEq(minStreak, 2);
         assertTrue(oracle.isNullifierUsed(POLICY_ID, NULLIFIER_HASH));
     }
 
     function test_VerifyAndConsume_RevertsOnReuse() public {
         _publishDefaultRoot();
 
-        bytes memory publicValues = _publicValues(SET_ROOT, POLICY_ID, 1, NULLIFIER_HASH);
+        bytes memory publicValues = _publicValues(SET_ROOT, POLICY_ID, 1, NULLIFIER_HASH, 1);
         oracle.verifyAndConsume(POLICY_ID, 0, publicValues, hex"");
 
         // One identity per key per policy: the same nullifier cannot be
@@ -251,7 +501,7 @@ contract SolventSetOracleTest is Test {
 
     function test_VerifyAndConsume_NamespacedPerPolicy() public {
         _publishDefaultRoot();
-        bytes memory publicValues = _publicValues(SET_ROOT, POLICY_ID, 1, NULLIFIER_HASH);
+        bytes memory publicValues = _publicValues(SET_ROOT, POLICY_ID, 1, NULLIFIER_HASH, 1);
         oracle.verifyAndConsume(POLICY_ID, 0, publicValues, hex"");
 
         // Consumption under one policy does not mark other policies.
@@ -266,10 +516,19 @@ contract SolventSetOracleTest is Test {
         assertEq(oracle.membershipVKey(), newVKey);
     }
 
-    function test_SetMembershipVKey_OnlyOwner() public {
-        vm.prank(stranger);
+    function test_SetDerivationVKey() public {
+        bytes32 newVKey = bytes32(uint256(0x5678));
+        oracle.setDerivationVKey(newVKey);
+        assertEq(oracle.derivationVKey(), newVKey);
+    }
+
+    function test_SetVKeys_OnlyOwner() public {
+        vm.startPrank(stranger);
         vm.expectRevert();
         oracle.setMembershipVKey(bytes32(uint256(0x1234)));
+        vm.expectRevert();
+        oracle.setDerivationVKey(bytes32(uint256(0x5678)));
+        vm.stopPrank();
     }
 
     function test_LatestSetIndex_RevertsWhenEmpty() public {

@@ -153,33 +153,39 @@ export class SolvencyClient {
   }
 
   /**
-   * Download the complete solvent-set address list (all pages).
+   * Download the complete solvent-set entry list (all pages).
    *
    * Downloading the full set — rather than querying for a specific address —
    * is what keeps the lookup oblivious: use it with
    * `computeSolventSetPath()` to build a membership path locally.
    *
+   * Falls back to bare address lists (streak 1) from pre-streak agents.
+   *
    * @throws {SolvencyError} NOT_FOUND (404), INVALID_REQUEST (400)
    */
-  async fetchAllSolventSetAddresses(
+  async fetchAllSolventSetEntries(
     policyId: string,
     epoch?: number
-  ): Promise<{ info: SolventSetInfo; addresses: string[] }> {
+  ): Promise<{ info: SolventSetInfo; entries: [string, number][] }> {
     const pageSize = 10_000;
+    const pageEntries = (page: SolventSetLeavesPage): [string, number][] =>
+      page.entries ?? page.addresses.map((address): [string, number] => [address, 1]);
+
     const first = await this.getSolventSetLeaves(policyId, {
       epoch,
       offset: 0,
       limit: pageSize,
     });
-    const addresses = [...first.addresses];
-    while (addresses.length < first.total) {
+    const entries = [...pageEntries(first)];
+    while (entries.length < first.total) {
       const page = await this.getSolventSetLeaves(policyId, {
         epoch: first.epoch,
-        offset: addresses.length,
+        offset: entries.length,
         limit: pageSize,
       });
-      if (page.addresses.length === 0) break; // defensive: avoid infinite loop
-      addresses.push(...page.addresses);
+      const chunk = pageEntries(page);
+      if (chunk.length === 0) break; // defensive: avoid infinite loop
+      entries.push(...chunk);
     }
     return {
       info: {
@@ -189,8 +195,24 @@ export class SolvencyClient {
         root: first.root,
         member_count: first.total,
       },
-      addresses,
+      entries,
     };
+  }
+
+  /**
+   * Download the complete solvent-set address list (all pages).
+   *
+   * Prefer {@link fetchAllSolventSetEntries} — membership witnesses need the
+   * streaks, not just the addresses.
+   *
+   * @throws {SolvencyError} NOT_FOUND (404), INVALID_REQUEST (400)
+   */
+  async fetchAllSolventSetAddresses(
+    policyId: string,
+    epoch?: number
+  ): Promise<{ info: SolventSetInfo; addresses: string[] }> {
+    const { info, entries } = await this.fetchAllSolventSetEntries(policyId, epoch);
+    return { info, addresses: entries.map(([address]) => address) };
   }
 
   /**

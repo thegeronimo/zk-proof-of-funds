@@ -46,10 +46,12 @@ pub fn build_membership_stdin(
     policy_id: &[u8; 32],
     epoch: u64,
     chain_id: u64,
+    min_streak: u64,
 ) -> SP1Stdin {
     let mut stdin = SP1Stdin::new();
     // Private inputs
     stdin.write(&witness.sk);
+    stdin.write(&witness.streak);
     stdin.write(&witness.leaf_index);
     stdin.write(&witness.siblings);
     // Public inputs
@@ -57,6 +59,7 @@ pub fn build_membership_stdin(
     stdin.write(policy_id);
     stdin.write(&epoch);
     stdin.write(&chain_id);
+    stdin.write(&min_streak);
     stdin
 }
 
@@ -69,12 +72,14 @@ pub fn execute_membership_program(
     policy_id: &[u8; 32],
     epoch: u64,
     chain_id: u64,
+    min_streak: u64,
 ) -> Result<MembershipPublicValues> {
     let client = ProverClient::builder().cpu().build();
     // Elf::Static needs 'static; leaking once per invocation is fine for the
     // CLI/test contexts this runs in.
     let elf = Elf::Static(Box::leak(elf_bytes.into_boxed_slice()));
-    let stdin = build_membership_stdin(witness, solvent_set_root, policy_id, epoch, chain_id);
+    let stdin =
+        build_membership_stdin(witness, solvent_set_root, policy_id, epoch, chain_id, min_streak);
 
     let (public_values, report) = client
         .execute(elf, stdin)
@@ -101,10 +106,12 @@ pub fn prove_membership(
     policy_id: &[u8; 32],
     epoch: u64,
     chain_id: u64,
+    min_streak: u64,
 ) -> Result<(Vec<u8>, MembershipPublicValues)> {
     let client = ProverClient::builder().cpu().build();
     let elf = Elf::Static(Box::leak(elf_bytes.into_boxed_slice()));
-    let stdin = build_membership_stdin(witness, solvent_set_root, policy_id, epoch, chain_id);
+    let stdin =
+        build_membership_stdin(witness, solvent_set_root, policy_id, epoch, chain_id, min_streak);
 
     let pk = client
         .setup(elf)

@@ -180,6 +180,50 @@ impl RpcFetcher {
         Ok((balance_u128, proof_nodes))
     }
 
+    /// Fetch an EIP-1186 proof with storage keys: the account proof plus one
+    /// storage proof per requested slot (aligned with `storage_slots` order).
+    ///
+    /// Used for ERC-20 proven builds: one call against the token contract
+    /// yields its account proof and every candidate's balance-slot proof.
+    pub async fn get_proof_with_storage(
+        &self,
+        address_hex: &str,
+        storage_slots: &[[u8; 32]],
+        block_number: u64,
+    ) -> Result<(Vec<Vec<u8>>, Vec<Vec<Vec<u8>>>)> {
+        use alloy::primitives::B256;
+
+        let addr = Address::from_str(address_hex)
+            .context("Invalid address")?;
+        let keys: Vec<B256> = storage_slots.iter().map(|s| B256::from(*s)).collect();
+
+        let response = self.provider
+            .get_proof(addr, keys)
+            .block_id(alloy::eips::BlockNumberOrTag::Number(block_number).into())
+            .await
+            .context("eth_getProof RPC call failed")?;
+
+        let account_proof: Vec<Vec<u8>> = response
+            .account_proof
+            .iter()
+            .map(|node| node.to_vec())
+            .collect();
+
+        anyhow::ensure!(
+            response.storage_proof.len() == storage_slots.len(),
+            "eth_getProof returned {} storage proofs for {} keys",
+            response.storage_proof.len(),
+            storage_slots.len()
+        );
+        let storage_proofs: Vec<Vec<Vec<u8>>> = response
+            .storage_proof
+            .iter()
+            .map(|sp| sp.proof.iter().map(|node| node.to_vec()).collect())
+            .collect();
+
+        Ok((account_proof, storage_proofs))
+    }
+
     /// Get the state root for a specific block.
     ///
     /// The state root is needed as input to the SP1 program for MPT verification.

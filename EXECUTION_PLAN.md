@@ -15,7 +15,8 @@
 | 8 | Frontend & SDK | React UI, JavaScript SDK for integrators | 3-5 days | |
 | 9 | Production Hardening | Monitoring, CI/CD, audit prep, documentation | 3-5 days | |
 | 10 | Privacy V2 | Solvent-set membership + deterministic nullifiers (see PRIVACY_V2.md) | 3-5 days | ✅ DONE (initial) |
-| 11 | Privacy V2 Completion | Proven set derivation (Stage B), streak solvency, client tooling | 3-5 days | 🚧 IN PROGRESS |
+| 11 | Privacy V2 Completion | Proven set derivation (Stage B), streak solvency, client tooling | 3-5 days | ✅ DONE |
+| 12 | Privacy V2 Follow-ups | ERC-20 proven builds, Stage B.2 completeness, wallet crypto, vkeys | 3-5 days | ✅ DONE |
 
 **Total estimated effort: 28-46 days**
 
@@ -738,3 +739,54 @@ tooling that makes V2 usable end to end.
   the set" check (no address leaves the browser).
 - [ ] **11.10** Docs (PRIVACY_V2.md Stage B status), full test sweep
   (both guests re-verified against mirrors in the SP1 emulator), commit.
+
+---
+
+## Phase 12: Privacy V2 Follow-ups — ERC-20 Proven Builds, Completeness, Wallet Crypto
+
+**Goal**: Close the items PRIVACY_V2.md §7 left open after Phase 11: proven
+builds for ERC-20 policies, the Stage B.2 completeness statement, production
+vkeys, wallet-side nullifier crypto, and removing the last plaintext-address
+transit from the legacy path.
+
+### Delivered
+
+- [x] **12.1** Storage-proof verification in `crates/common/src/mpt.rs`:
+  `verify_account_state` (balance + storage root), `verify_storage_value`
+  (balance-slot proofs under the token's storage root, key-generic trie walk),
+  `erc20_balance_slot`, `account_trie_key`.
+- [x] **12.2** ERC-20 derivation mode: witness carries the token contract's
+  account proof + per-candidate storage proofs; public values extended to
+  416 bytes with `token`, `balanceSlot`, and `candidatesRoot` (the Stage B.2
+  composition surface). `SolventSetOracle` pins the `balanceOf` slot per
+  policy (`setBalanceSlot`, operator-only) and cross-checks token/slot on
+  proven publication. Agent fetches all storage proofs in one `eth_getProof`
+  call; backend `proven` mode accepts ERC-20 policies with `balance_slot`.
+- [x] **12.3** Stage B.2 completeness statement
+  (`crates/common/src/receipt_scan.rs` + `program-receipt-scan/`): contiguous
+  header-chain verification, **exhaustive** receipts-trie enumeration (a
+  withheld node aborts — no Transfer can be hidden), legacy + EIP-2718 typed
+  receipt parsing, Transfer participant extraction, `participants_root`
+  committed with the same construction as the derivation proof's
+  `candidates_root`. On-chain composition (root equality check) and
+  witness-building ops tooling remain future work.
+- [x] **12.4** Production vkeys: `print-vkeys` covers all three programs;
+  generated values persisted in `config/vkeys.env` for Deploy.s.sol.
+- [x] **12.5** Wallet-side PLUME: `@zk-proof-of-funds/sdk/plume` — a JS port
+  of the nullifier + DLEQ crypto on audited @noble libraries, locked
+  byte-for-byte to the Rust reference by shared test vectors (generated via
+  `cargo test -p zk-pof-common emit_test_vectors -- --ignored`); ships
+  `buildEnrollV2Request()` for any raw-key signer context (snap, embedded
+  wallet). Core SDK stays dependency-free (separate subpath entry).
+- [x] **12.6** Legacy `/submit_proof` privacy: accepts `trie_key`
+  (keccak256(address), computed client-side — the plaintext address never
+  transits); web app switched over; `wallet_address` retained as a
+  deprecated fallback.
+
+### Remaining (tracked in PRIVACY_V2.md §7)
+
+- [ ] On-chain composition: require `scan.participants_root ==
+  derivation.candidates_root` for completeness-proven publications
+- [ ] Receipt-scan witness tooling (fetch raw receipts, rebuild tries)
+- [ ] MetaMask snap packaging around `sdk/plume`
+- [ ] Browser-native membership prover (dedicated circuit + trusted setup)

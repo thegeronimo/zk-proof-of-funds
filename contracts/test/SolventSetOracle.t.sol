@@ -88,6 +88,7 @@ contract SolventSetOracleTest is Test {
 
     /// @dev ABI-encode derivation public values exactly as the SP1 program
     ///      commits them (crates/common/src/solvent_derivation.rs::abi_encode).
+    ///      Native-ETH shape: zero token, zero slot.
     function _derivationValues(
         bytes32 stateRoot,
         bytes32 prevRoot,
@@ -97,9 +98,28 @@ contract SolventSetOracleTest is Test {
         uint64 chainId,
         uint256 thresholdWei
     ) internal pure returns (bytes memory) {
+        return _derivationValuesFor(
+            POLICY_ID, stateRoot, prevRoot, newRoot, epoch, blockNumber, chainId,
+            thresholdWei, address(0), 0
+        );
+    }
+
+    function _derivationValuesFor(
+        bytes32 policyId,
+        bytes32 stateRoot,
+        bytes32 prevRoot,
+        bytes32 newRoot,
+        uint64 epoch,
+        uint64 blockNumber,
+        uint64 chainId,
+        uint256 thresholdWei,
+        address token,
+        uint64 balanceSlot
+    ) internal pure returns (bytes memory) {
         return abi.encode(
-            stateRoot, prevRoot, newRoot, POLICY_ID, epoch, blockNumber, chainId,
-            thresholdWei, uint32(3), uint32(5)
+            stateRoot, prevRoot, newRoot, policyId, epoch, blockNumber, chainId,
+            thresholdWei, uint32(3), uint32(5), token, balanceSlot,
+            bytes32(uint256(0xCA4D)) // candidatesRoot (unchecked on-chain)
         );
     }
 
@@ -367,6 +387,104 @@ contract SolventSetOracleTest is Test {
             )
         );
         oracle.publishRootProven(POLICY_ID, headerRlp, truncated, hex"");
+    }
+
+    // --- publishRootProven: ERC-20 mode ---
+
+    bytes32 constant ERC20_POLICY_ID = bytes32(uint256(0x03));
+    address constant TOKEN = address(0xBEEF);
+
+    function _createErc20Policy() internal {
+        PolicyRegistry.Policy memory policy = PolicyRegistry.Policy({
+            thresholdWei: THRESHOLD,
+            tokenAddress: TOKEN,
+            chainId: uint64(block.chainid),
+            epochLengthBlocks: 100,
+            maxBlockAge: 256,
+            rootTTLBlocks: ROOT_TTL,
+            operator: operatorAddr,
+            scope: "erc20-scope",
+            trustedMode: false,
+            active: true
+        });
+        registry.createPolicy(ERC20_POLICY_ID, policy);
+    }
+
+    function test_PublishRootProven_Erc20() public {
+        _createErc20Policy();
+        vm.prank(operatorAddr);
+        oracle.setBalanceSlot(ERC20_POLICY_ID, 9);
+
+        (uint64 refBlock, bytes memory headerRlp) = _prepareProvenBlock(STATE_ROOT);
+        bytes memory pv = _derivationValuesFor(
+            ERC20_POLICY_ID, STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock,
+            uint64(block.chainid), THRESHOLD, TOKEN, 9
+        );
+
+        vm.prank(stranger); // still permissionless
+        oracle.publishRootProven(ERC20_POLICY_ID, headerRlp, pv, hex"");
+        assertTrue(oracle.getSetEntry(ERC20_POLICY_ID, 0).proven);
+    }
+
+    function test_PublishRootProven_RevertsOnTokenMismatch() public {
+        _createErc20Policy();
+        vm.prank(operatorAddr);
+        oracle.setBalanceSlot(ERC20_POLICY_ID, 9);
+
+        (uint64 refBlock, bytes memory headerRlp) = _prepareProvenBlock(STATE_ROOT);
+        address wrongToken = address(0xD00D);
+        bytes memory pv = _derivationValuesFor(
+            ERC20_POLICY_ID, STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock,
+            uint64(block.chainid), THRESHOLD, wrongToken, 9
+        );
+
+        vm.expectRevert(
+            abi.encodeWithSelector(SolventSetOracle.TokenMismatch.selector, TOKEN, wrongToken)
+        );
+        oracle.publishRootProven(ERC20_POLICY_ID, headerRlp, pv, hex"");
+    }
+
+    function test_PublishRootProven_RevertsOnBalanceSlotMismatch() public {
+        _createErc20Policy();
+        vm.prank(operatorAddr);
+        oracle.setBalanceSlot(ERC20_POLICY_ID, 9);
+
+        (uint64 refBlock, bytes memory headerRlp) = _prepareProvenBlock(STATE_ROOT);
+        bytes memory pv = _derivationValuesFor(
+            ERC20_POLICY_ID, STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock,
+            uint64(block.chainid), THRESHOLD, TOKEN, 3 // proof against the wrong slot
+        );
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SolventSetOracle.BalanceSlotMismatch.selector, uint64(9), uint64(3)
+            )
+        );
+        oracle.publishRootProven(ERC20_POLICY_ID, headerRlp, pv, hex"");
+    }
+
+    function test_PublishRootProven_NativeRejectsNonzeroSlot() public {
+        (uint64 refBlock, bytes memory headerRlp) = _prepareProvenBlock(STATE_ROOT);
+        bytes memory pv = _derivationValuesFor(
+            POLICY_ID, STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock,
+            uint64(block.chainid), THRESHOLD, address(0), 7
+        );
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SolventSetOracle.BalanceSlotMismatch.selector, uint64(0), uint64(7)
+            )
+        );
+        oracle.publishRootProven(POLICY_ID, headerRlp, pv, hex"");
+    }
+
+    function test_SetBalanceSlot_OperatorOnly() public {
+        _createErc20Policy();
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(SolventSetOracle.NotOperator.selector, stranger, operatorAddr)
+        );
+        oracle.setBalanceSlot(ERC20_POLICY_ID, 9);
     }
 
     // --- verifyMembership ---

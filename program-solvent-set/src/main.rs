@@ -30,7 +30,7 @@
 sp1_zkvm::entrypoint!(main);
 
 use zk_pof_common::solvent_derivation::{
-    execute_derivation_statement, CandidateProof, DerivationWitness,
+    execute_derivation_statement, CandidateProof, DerivationWitness, TokenConfig,
 };
 use zk_pof_common::solvent_set::SolventEntry;
 
@@ -42,10 +42,14 @@ pub fn main() {
     let block_number: u64 = sp1_zkvm::io::read();
     let chain_id: u64 = sp1_zkvm::io::read();
     let threshold_wei: u128 = sp1_zkvm::io::read();
+    // ERC-20 mode: (token address, balanceOf mapping slot); None = native ETH.
+    let token_config: Option<([u8; 20], u64)> = sp1_zkvm::io::read();
 
     // ── 2. Read the witness ────────────────────────────────────────────
     // Previous set entries as (address, streak) pairs.
     let prev_raw: Vec<([u8; 20], u32)> = sp1_zkvm::io::read();
+    // ERC-20 mode: the token contract's account proof (empty for native).
+    let token_account_proof: Vec<Vec<u8>> = sp1_zkvm::io::read();
     // Candidates as (address, proof_nodes) pairs.
     let candidate_count: u32 = sp1_zkvm::io::read();
     let mut candidates = Vec::with_capacity(candidate_count as usize);
@@ -61,7 +65,9 @@ pub fn main() {
             .into_iter()
             .map(|(address, streak)| SolventEntry { address, streak })
             .collect(),
+        token_account_proof,
     };
+    let token = token_config.map(|(address, balance_slot)| TokenConfig { address, balance_slot });
 
     // ── 3. Execute the statement (panics abort the proof) ──────────────
     let public_values = execute_derivation_statement(
@@ -72,6 +78,7 @@ pub fn main() {
         block_number,
         chain_id,
         threshold_wei,
+        token.as_ref(),
     )
     .expect("derivation statement not satisfied");
 

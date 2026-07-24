@@ -48,6 +48,15 @@ fn main() -> Result<()> {
             Err(e) => eprintln!("[derivation] skipped: {e}"),
         }
     }
+    if want("receipt-scan") {
+        match zk_pof_agent::scan_prover::load_scan_elf() {
+            Ok(elf) => {
+                vkey_for("receipt-scan", elf)?;
+                printed = true;
+            }
+            Err(e) => eprintln!("[receipt-scan] skipped: {e}"),
+        }
+    }
 
     if !printed {
         anyhow::bail!(

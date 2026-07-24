@@ -36,8 +36,17 @@ export interface EnrollmentResponse {
 
 /** Request body for POST /submit_proof/{policyId}/{memberId}. */
 export interface ProofSubmissionRequest {
-  /** Hex-encoded Ethereum address (used transiently for MPT verification, NOT stored). */
-  wallet_address: string;
+  /**
+   * Preferred: the state-trie key (keccak256 of the address), computed
+   * client-side — the plaintext address then never transits the agent.
+   * Compute with `computeTrieKey()` from `@zk-proof-of-funds/sdk/plume`.
+   */
+  trie_key?: string;
+  /**
+   * Legacy alternative to `trie_key`: the plaintext address (used transiently
+   * for key computation by the agent, NOT stored). Provide one of the two.
+   */
+  wallet_address?: string;
   /** Hex-encoded RLP-encoded MPT proof nodes from eth_getProof. */
   proof_nodes: string[];
   /** Block number the proof references. */

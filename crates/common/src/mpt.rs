@@ -16,7 +16,7 @@ use alloy_rlp::Header;
 use tiny_keccak::{Hasher, Keccak};
 
 /// Compute keccak256 hash of the input data.
-fn keccak256(data: &[u8]) -> [u8; 32] {
+pub(crate) fn keccak256(data: &[u8]) -> [u8; 32] {
     let mut output = [0u8; 32];
     let mut hasher = Keccak::v256();
     hasher.update(data);
@@ -25,7 +25,7 @@ fn keccak256(data: &[u8]) -> [u8; 32] {
 }
 
 /// Convert a 32-byte key into a 64-nibble path.
-fn to_nibbles(key: &[u8; 32]) -> [u8; 64] {
+pub(crate) fn to_nibbles(key: &[u8; 32]) -> [u8; 64] {
     let mut nibbles = [0u8; 64];
     for (i, byte) in key.iter().enumerate() {
         nibbles[i * 2] = byte >> 4;
@@ -42,7 +42,7 @@ fn to_nibbles(key: &[u8; 32]) -> [u8; 64] {
 ///   1 → extension, odd length (next nibble is first path nibble)
 ///   2 → leaf, even length (next nibble is padding 0)
 ///   3 → leaf, odd length (next nibble is first path nibble)
-fn decode_hp(encoded: &[u8]) -> Result<(Vec<u8>, bool)> {
+pub(crate) fn decode_hp(encoded: &[u8]) -> Result<(Vec<u8>, bool)> {
     ensure!(!encoded.is_empty(), "Empty HP-encoded path");
     let first_nibble = encoded[0] >> 4;
     let is_leaf = first_nibble >= 2;
@@ -61,7 +61,7 @@ fn decode_hp(encoded: &[u8]) -> Result<(Vec<u8>, bool)> {
 }
 
 /// Decode an RLP list, returning the payload slice (after the list header).
-fn decode_rlp_list(data: &[u8]) -> Result<&[u8]> {
+pub(crate) fn decode_rlp_list(data: &[u8]) -> Result<&[u8]> {
     let mut buf = data;
     let header = Header::decode(&mut buf).map_err(|e| anyhow::anyhow!("Invalid RLP list header: {}", e))?;
     ensure!(header.list, "Expected RLP list");
@@ -69,7 +69,7 @@ fn decode_rlp_list(data: &[u8]) -> Result<&[u8]> {
 }
 
 /// Decode a single RLP string/bytes item from `buf`, advancing the reference.
-fn decode_rlp_bytes<'a>(buf: &mut &'a [u8]) -> Result<&'a [u8]> {
+pub(crate) fn decode_rlp_bytes<'a>(buf: &mut &'a [u8]) -> Result<&'a [u8]> {
     let header = Header::decode(buf).map_err(|e| anyhow::anyhow!("Invalid RLP item header: {}", e))?;
     ensure!(!header.list, "Expected RLP string, got list");
     let payload = &buf[..header.payload_length];
@@ -78,14 +78,14 @@ fn decode_rlp_bytes<'a>(buf: &mut &'a [u8]) -> Result<&'a [u8]> {
 }
 
 /// Skip one RLP item (string or list) in `buf`, advancing the reference.
-fn skip_rlp_item(buf: &mut &[u8]) -> Result<()> {
+pub(crate) fn skip_rlp_item(buf: &mut &[u8]) -> Result<()> {
     let header = Header::decode(buf).map_err(|e| anyhow::anyhow!("Invalid RLP header in skip: {}", e))?;
     *buf = &buf[header.payload_length..];
     Ok(())
 }
 
 /// Count the number of items in an RLP list payload.
-fn count_rlp_items(mut payload: &[u8]) -> Result<usize> {
+pub(crate) fn count_rlp_items(mut payload: &[u8]) -> Result<usize> {
     let mut count = 0;
     while !payload.is_empty() {
         let header = Header::decode(&mut payload).map_err(|e| anyhow::anyhow!("Invalid RLP in count: {}", e))?;
@@ -96,12 +96,28 @@ fn count_rlp_items(mut payload: &[u8]) -> Result<usize> {
 }
 
 /// Read one RLP item (full encoded bytes including header) from `buf`, advancing the reference.
-fn read_rlp_item_raw<'a>(buf: &mut &'a [u8]) -> Result<&'a [u8]> {
+pub(crate) fn read_rlp_item_raw<'a>(buf: &mut &'a [u8]) -> Result<&'a [u8]> {
     let start = *buf;
     let header = Header::decode(buf).map_err(|e| anyhow::anyhow!("Invalid RLP header: {}", e))?;
     let header_len = start.len() - buf.len();
     *buf = &buf[header.payload_length..];
     Ok(&start[..header_len + header.payload_length])
+}
+
+/// Root hash of the empty trie: `keccak256(rlp(""))`.
+pub const EMPTY_TRIE_ROOT: [u8; 32] = [
+    0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6, 0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0, 0xf8,
+    0x6e, 0x5b, 0x48, 0xe0, 0x1b, 0x99, 0x6c, 0xad, 0xc0, 0x01, 0x62, 0x2f, 0xb5, 0xe3, 0x63,
+    0xb4, 0x21,
+];
+
+/// Verified state of an Ethereum account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountState {
+    /// Balance as a 32-byte big-endian U256.
+    pub balance: [u8; 32],
+    /// Root of the account's storage trie ([`EMPTY_TRIE_ROOT`] when absent).
+    pub storage_root: [u8; 32],
 }
 
 /// Verify an EIP-1186 account proof against the state root and extract the balance.
@@ -122,17 +138,103 @@ pub fn verify_account_balance(
     address: &[u8; 20],
     proof_nodes: &[Vec<u8>],
 ) -> Result<[u8; 32]> {
-    // Handle empty proof (account does not exist)
-    if proof_nodes.is_empty() {
+    Ok(verify_account_state(state_root, address, proof_nodes)?.balance)
+}
+
+/// Verify an account proof with a precomputed trie key (`keccak256(address)`).
+///
+/// Lets clients avoid sending their plaintext address: the key suffices for
+/// verification. (Note this is linkability-equivalent — anyone can dictionary
+/// the keccak of known addresses — but the address itself never transits.)
+pub fn verify_account_balance_with_key(
+    state_root: &[u8; 32],
+    account_key: &[u8; 32],
+    proof_nodes: &[Vec<u8>],
+) -> Result<[u8; 32]> {
+    let account_rlp = walk_trie(state_root, account_key, proof_nodes)?;
+    match account_rlp {
+        Some(rlp) => Ok(decode_account_state(&rlp)?.balance),
+        None => Ok([0u8; 32]),
+    }
+}
+
+/// Verify an account proof and return balance **and** storage root — needed
+/// for ERC-20 balance verification (the token's storage trie hangs off its
+/// account's storage root).
+pub fn verify_account_state(
+    state_root: &[u8; 32],
+    address: &[u8; 20],
+    proof_nodes: &[Vec<u8>],
+) -> Result<AccountState> {
+    let account_key = keccak256(address);
+    match walk_trie(state_root, &account_key, proof_nodes)? {
+        Some(rlp) => decode_account_state(&rlp),
+        None => Ok(AccountState {
+            balance: [0u8; 32],
+            storage_root: EMPTY_TRIE_ROOT,
+        }),
+    }
+}
+
+/// The state-trie key of an account: `keccak256(address)`.
+///
+/// Clients can compute this locally and submit it instead of the plaintext
+/// address (see `verify_account_balance_with_key`).
+pub fn account_trie_key(address: &[u8; 20]) -> [u8; 32] {
+    keccak256(address)
+}
+
+/// Compute the storage slot of `balanceOf[holder]` for a Solidity mapping at
+/// `slot_index`: `keccak256(pad32(holder) || pad32(slot_index))`.
+pub fn erc20_balance_slot(holder: &[u8; 20], slot_index: u64) -> [u8; 32] {
+    let mut input = [0u8; 64];
+    input[12..32].copy_from_slice(holder);
+    input[56..64].copy_from_slice(&slot_index.to_be_bytes());
+    keccak256(&input)
+}
+
+/// Verify a storage proof against an account's storage root and extract the
+/// slot value as a 32-byte big-endian U256.
+///
+/// `slot` is the storage slot (e.g. from [`erc20_balance_slot`]); the trie
+/// key is `keccak256(slot)`. An absent slot (empty proof against the empty
+/// trie root, or a proven-absent path) is zero.
+pub fn verify_storage_value(
+    storage_root: &[u8; 32],
+    slot: &[u8; 32],
+    proof_nodes: &[Vec<u8>],
+) -> Result<[u8; 32]> {
+    if *storage_root == EMPTY_TRIE_ROOT {
+        ensure!(
+            proof_nodes.is_empty(),
+            "Nonempty storage proof against the empty trie root"
+        );
         return Ok([0u8; 32]);
     }
+    let storage_key = keccak256(slot);
+    match walk_trie(storage_root, &storage_key, proof_nodes)? {
+        Some(value_rlp) => decode_storage_word(&value_rlp),
+        None => Ok([0u8; 32]),
+    }
+}
 
-    // 1. Compute the trie key: keccak256(address)
-    let account_key = keccak256(address);
-    let nibbles = to_nibbles(&account_key);
+/// Walk an MPT proof for `trie_key` from `root`, returning the leaf value's
+/// inner payload, or `None` when the path is proven absent.
+///
+/// An empty node list is treated as "absent" (matches `eth_getProof` for
+/// nonexistent keys in an empty trie).
+fn walk_trie(
+    root: &[u8; 32],
+    trie_key: &[u8; 32],
+    proof_nodes: &[Vec<u8>],
+) -> Result<Option<Vec<u8>>> {
+    if proof_nodes.is_empty() {
+        return Ok(None);
+    }
 
-    // 2. Walk the proof nodes
-    let mut expected_hash = *state_root;
+    let nibbles = to_nibbles(trie_key);
+
+    let mut expected_hash = *root;
     let mut key_offset: usize = 0;
     let mut account_rlp: Option<Vec<u8>> = None;
 
@@ -178,7 +280,7 @@ pub fn verify_account_balance(
                     i == proof_nodes.len() - 1,
                     "Empty branch child not at end of proof"
                 );
-                return Ok([0u8; 32]);
+                return Ok(None);
             } else {
                 bail!("Unexpected branch child length: {}", child_header.payload_length);
             }
@@ -233,18 +335,11 @@ pub fn verify_account_balance(
         }
     }
 
-    // 3. Decode the account RLP to extract balance
-    match account_rlp {
-        Some(rlp) => decode_account_balance(&rlp),
-        None => Ok([0u8; 32]),
-    }
+    Ok(account_rlp)
 }
 
-/// Decode an Ethereum account from RLP and extract the balance.
-///
-/// Account encoding: RLP([nonce, balance, storageRoot, codeHash])
-/// Returns the balance as a 32-byte big-endian U256.
-fn decode_account_balance(account_rlp: &[u8]) -> Result<[u8; 32]> {
+/// Decode an Ethereum account from RLP: RLP([nonce, balance, storageRoot, codeHash]).
+fn decode_account_state(account_rlp: &[u8]) -> Result<AccountState> {
     let payload = decode_rlp_list(account_rlp)?;
     let mut buf = payload;
 
@@ -253,19 +348,37 @@ fn decode_account_balance(account_rlp: &[u8]) -> Result<[u8; 32]> {
 
     // Read balance (second item) — RLP-encoded integer (big-endian, no leading zeros)
     let balance_bytes = decode_rlp_bytes(&mut buf)?;
+    let balance = left_pad_u256(balance_bytes)?;
 
-    // Left-pad to 32 bytes (big-endian U256)
+    // Read storageRoot (third item) — 32-byte hash
+    let storage_root_bytes = decode_rlp_bytes(&mut buf)?;
+    ensure!(
+        storage_root_bytes.len() == 32,
+        "Invalid storageRoot length: {}",
+        storage_root_bytes.len()
+    );
+    let mut storage_root = [0u8; 32];
+    storage_root.copy_from_slice(storage_root_bytes);
+
+    Ok(AccountState { balance, storage_root })
+}
+
+/// Decode a storage leaf value: the leaf payload is itself an RLP-encoded
+/// integer (big-endian, no leading zeros).
+fn decode_storage_word(value_rlp: &[u8]) -> Result<[u8; 32]> {
+    let mut buf = value_rlp;
+    let value_bytes = decode_rlp_bytes(&mut buf)?;
+    left_pad_u256(value_bytes)
+}
+
+/// Left-pad big-endian integer bytes into a 32-byte U256 word.
+fn left_pad_u256(bytes: &[u8]) -> Result<[u8; 32]> {
     let mut result = [0u8; 32];
-    if !balance_bytes.is_empty() {
-        ensure!(
-            balance_bytes.len() <= 32,
-            "Balance too large: {} bytes",
-            balance_bytes.len()
-        );
-        let offset = 32 - balance_bytes.len();
-        result[offset..].copy_from_slice(balance_bytes);
+    if !bytes.is_empty() {
+        ensure!(bytes.len() <= 32, "Integer too large: {} bytes", bytes.len());
+        let offset = 32 - bytes.len();
+        result[offset..].copy_from_slice(bytes);
     }
-
     Ok(result)
 }
 
@@ -325,6 +438,46 @@ mod tests {
         let address = [0xBB; 20];
         let result = verify_account_balance(&state_root, &address, &[]).unwrap();
         assert_eq!(result, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_absent_account_has_empty_storage_root() {
+        let state = verify_account_state(&[0xAA; 32], &[0xBB; 20], &[]).unwrap();
+        assert_eq!(state.balance, [0u8; 32]);
+        assert_eq!(state.storage_root, EMPTY_TRIE_ROOT);
+    }
+
+    #[test]
+    fn test_storage_value_empty_root_is_zero() {
+        let slot = erc20_balance_slot(&[0xBB; 20], 0);
+        let value = verify_storage_value(&EMPTY_TRIE_ROOT, &slot, &[]).unwrap();
+        assert_eq!(value, [0u8; 32]);
+        // A nonempty proof against the empty root is malformed.
+        assert!(verify_storage_value(&EMPTY_TRIE_ROOT, &slot, &[vec![0xC0]]).is_err());
+    }
+
+    #[test]
+    fn test_erc20_balance_slot_derivation() {
+        // keccak256(pad32(holder) || pad32(slot)) — spot-check structure by
+        // asserting distinctness across holders and slots.
+        let a = erc20_balance_slot(&[0x01; 20], 0);
+        let b = erc20_balance_slot(&[0x02; 20], 0);
+        let c = erc20_balance_slot(&[0x01; 20], 1);
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(a, erc20_balance_slot(&[0x01; 20], 0), "deterministic");
+    }
+
+    #[test]
+    fn test_account_balance_with_key_matches_address_path() {
+        // Equivalent verification through the precomputed trie key.
+        let state_root = [0xAA; 32];
+        let address = [0xBB; 20];
+        let key = keccak256(&address);
+        assert_eq!(
+            verify_account_balance(&state_root, &address, &[]).unwrap(),
+            verify_account_balance_with_key(&state_root, &key, &[]).unwrap()
+        );
     }
 
     #[test]

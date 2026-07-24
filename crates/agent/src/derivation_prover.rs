@@ -14,7 +14,7 @@ use sp1_sdk::blocking::{Elf, Prover, ProveRequest, ProverClient, SP1Stdin};
 use std::path::PathBuf;
 use tracing::info;
 
-use zk_pof_common::solvent_derivation::{DerivationPublicValues, DerivationWitness};
+use zk_pof_common::solvent_derivation::{DerivationPublicValues, DerivationWitness, TokenConfig};
 
 /// Location of the built derivation ELF, relative to this crate.
 pub const DERIVATION_ELF_RELATIVE_PATH: &str =
@@ -48,6 +48,7 @@ pub fn build_derivation_stdin(
     block_number: u64,
     chain_id: u64,
     threshold_wei: u128,
+    token: Option<&TokenConfig>,
 ) -> SP1Stdin {
     let mut stdin = SP1Stdin::new();
     // Public inputs
@@ -57,6 +58,8 @@ pub fn build_derivation_stdin(
     stdin.write(&block_number);
     stdin.write(&chain_id);
     stdin.write(&threshold_wei);
+    let token_raw: Option<([u8; 20], u64)> = token.map(|c| (c.address, c.balance_slot));
+    stdin.write(&token_raw);
     // Witness
     let prev_raw: Vec<([u8; 20], u32)> = witness
         .prev_entries
@@ -64,6 +67,7 @@ pub fn build_derivation_stdin(
         .map(|e| (e.address, e.streak))
         .collect();
     stdin.write(&prev_raw);
+    stdin.write(&witness.token_account_proof);
     stdin.write(&(witness.candidates.len() as u32));
     for candidate in &witness.candidates {
         stdin.write(&candidate.address);
@@ -83,11 +87,12 @@ pub fn execute_derivation_program(
     block_number: u64,
     chain_id: u64,
     threshold_wei: u128,
+    token: Option<&TokenConfig>,
 ) -> Result<DerivationPublicValues> {
     let client = ProverClient::builder().cpu().build();
     let elf = Elf::Static(Box::leak(elf_bytes.into_boxed_slice()));
     let stdin = build_derivation_stdin(
-        witness, state_root, policy_id, epoch, block_number, chain_id, threshold_wei,
+        witness, state_root, policy_id, epoch, block_number, chain_id, threshold_wei, token,
     );
 
     let (public_values, report) = client
@@ -117,11 +122,12 @@ pub fn prove_derivation(
     block_number: u64,
     chain_id: u64,
     threshold_wei: u128,
+    token: Option<&TokenConfig>,
 ) -> Result<(Vec<u8>, DerivationPublicValues)> {
     let client = ProverClient::builder().cpu().build();
     let elf = Elf::Static(Box::leak(elf_bytes.into_boxed_slice()));
     let stdin = build_derivation_stdin(
-        witness, state_root, policy_id, epoch, block_number, chain_id, threshold_wei,
+        witness, state_root, policy_id, epoch, block_number, chain_id, threshold_wei, token,
     );
 
     let pk = client

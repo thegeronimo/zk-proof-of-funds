@@ -215,7 +215,7 @@ fn test_proven_build_from_account_proofs() {
         CandidateProof { address: addr_b, proof_nodes: proof_b },
     ];
     let proven = service
-        .build_proven_from_proofs(POLICY_HEX, 2, 19_000_100, CHAIN_ID, ONE_ETH, &state_root, proofs)
+        .build_proven_from_proofs(POLICY_HEX, 2, 19_000_100, CHAIN_ID, ONE_ETH, &state_root, proofs, None, vec![])
         .unwrap();
 
     assert_eq!(proven.result.member_count, 1);
@@ -237,7 +237,7 @@ fn test_proven_build_from_account_proofs() {
     // program will commit for permissionless publication).
     let policy_id = parse_policy_id(POLICY_HEX).unwrap();
     let reexecuted = execute_derivation_statement(
-        &proven.witness, &state_root, &policy_id, 2, 19_000_100, CHAIN_ID, ONE_ETH,
+        &proven.witness, &state_root, &policy_id, 2, 19_000_100, CHAIN_ID, ONE_ETH, None,
     )
     .unwrap();
     assert_eq!(reexecuted, proven.public_values);
@@ -315,14 +315,15 @@ fn test_sp1_derivation_guest_matches_native_mirror() {
             CandidateProof { address: addr_b, proof_nodes: proof_b },
         ],
         prev_entries: vec![SolventEntry { address: addr_a, streak: 4 }],
+        token_account_proof: vec![],
     };
 
     let native = execute_derivation_statement(
-        &witness, &state_root, &policy_id, 5, 19_000_100, CHAIN_ID, ONE_ETH,
+        &witness, &state_root, &policy_id, 5, 19_000_100, CHAIN_ID, ONE_ETH, None,
     )
     .unwrap();
     let guest = zk_pof_agent::derivation_prover::execute_derivation_program(
-        elf, &witness, &state_root, &policy_id, 5, 19_000_100, CHAIN_ID, ONE_ETH,
+        elf, &witness, &state_root, &policy_id, 5, 19_000_100, CHAIN_ID, ONE_ETH, None,
     )
     .unwrap();
 
@@ -331,4 +332,101 @@ fn test_sp1_derivation_guest_matches_native_mirror() {
         "SP1 derivation guest and native mirror must commit identical public values"
     );
     assert_eq!(guest.abi_encode(), native.abi_encode());
+}
+
+/// ERC-20 mode of the derivation guest: token account + storage proofs.
+/// `#[ignore]`: needs the built ELF and minutes of emulation.
+#[test]
+#[ignore]
+fn test_sp1_derivation_guest_erc20_matches_native_mirror() {
+    use zk_pof_common::solvent_derivation::TokenConfig;
+
+    let elf = match zk_pof_agent::derivation_prover::load_derivation_elf() {
+        Ok(elf) => elf,
+        Err(e) => {
+            eprintln!("Skipping ERC-20 derivation guest test: {e}");
+            return;
+        }
+    };
+
+    let policy_id = parse_policy_id(POLICY_HEX).unwrap();
+    let token = [0xEE; 20];
+    let config = TokenConfig { address: token, balance_slot: 0 };
+    let holder = [0x42; 20];
+    let (state_root, token_account_proof, storage_proofs) =
+        fixtures::erc20_state_fixture(token, 0, &[(holder, 5 * ONE_ETH)]);
+
+    let witness = DerivationWitness {
+        candidates: vec![CandidateProof {
+            address: holder,
+            proof_nodes: storage_proofs[0].clone(),
+        }],
+        prev_entries: vec![SolventEntry { address: holder, streak: 1 }],
+        token_account_proof,
+    };
+
+    let native = execute_derivation_statement(
+        &witness, &state_root, &policy_id, 2, 19_000_100, CHAIN_ID, ONE_ETH, Some(&config),
+    )
+    .unwrap();
+    let guest = zk_pof_agent::derivation_prover::execute_derivation_program(
+        elf, &witness, &state_root, &policy_id, 2, 19_000_100, CHAIN_ID, ONE_ETH, Some(&config),
+    )
+    .unwrap();
+
+    assert_eq!(guest, native);
+    assert_eq!(guest.abi_encode(), native.abi_encode());
+    assert_eq!(guest.token, token);
+}
+
+/// Run the *actual* SP1 receipt-scan guest (program-receipt-scan/) in the
+/// emulator and check it commits byte-identical public values to the native
+/// mirror. `#[ignore]`: needs the built ELF and minutes of emulation.
+#[test]
+#[ignore]
+fn test_sp1_scan_guest_matches_native_mirror() {
+    use zk_pof_common::receipt_scan::{
+        execute_scan_statement, fixtures as scan_fixtures, ScanWitness,
+    };
+
+    let elf = match zk_pof_agent::scan_prover::load_scan_elf() {
+        Ok(elf) => elf,
+        Err(e) => {
+            eprintln!("Skipping scan guest-vs-mirror test: {e}");
+            return;
+        }
+    };
+
+    let token = [0xEE; 20];
+    let r0 = scan_fixtures::legacy_receipt(&[scan_fixtures::transfer_log(
+        token, [0xA1; 20], [0xB2; 20],
+    )]);
+    let r1 = scan_fixtures::typed_receipt(
+        0x02,
+        &[scan_fixtures::transfer_log([0xDD; 20], [0xC3; 20], [0xA1; 20])],
+    );
+    let r2 = scan_fixtures::legacy_receipt(&[]);
+    let (receipts_root, nodes) = scan_fixtures::three_receipt_trie(&r0, &r1, &r2);
+    let header0 = scan_fixtures::build_header([0x00; 32], [0x02; 32], receipts_root);
+    let header1 = scan_fixtures::build_header(
+        zk_pof_common::solvent_derivation::fixtures::keccak256(&header0),
+        [0x03; 32],
+        zk_pof_common::mpt::EMPTY_TRIE_ROOT,
+    );
+
+    let witness = ScanWitness {
+        headers: vec![header0, header1],
+        receipt_nodes: vec![nodes, vec![]],
+    };
+
+    let native = execute_scan_statement(&witness, &token).unwrap();
+    let guest =
+        zk_pof_agent::scan_prover::execute_scan_program(elf, &witness, &token).unwrap();
+
+    assert_eq!(
+        guest, native,
+        "SP1 scan guest and native mirror must commit identical public values"
+    );
+    assert_eq!(guest.abi_encode(), native.abi_encode());
+    assert_eq!(guest.participant_count, 2);
 }

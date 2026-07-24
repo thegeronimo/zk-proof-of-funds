@@ -7,6 +7,13 @@
 > (`"zkpof-solvent-leaf-v2"`, §4.1), membership public values carry
 > `minStreak` (192 bytes, §4.2), and Stage B — SP1-proven set derivation with
 > permissionless publication — is implemented (§4.4).
+>
+> **Phase 12 amendments** (normative): derivation public values are 416 bytes
+> (adds `token`, `balanceSlot`, `candidatesRoot`); proven builds support
+> ERC-20 policies via storage proofs; the Stage B.2 completeness statement
+> (receipt_scan, 160-byte public values) is implemented; wallet-side nullifier
+> crypto ships as `@zk-proof-of-funds/sdk/plume`; production vkeys live in
+> `config/vkeys.env`.
 
 ---
 
@@ -160,6 +167,12 @@ proposals, MetaMask snaps, or embedded/local signers). Consequences:
   subcommands compute everything key-touching on the user's machine. The React
   app keeps the legacy signature flow for enrollment (plus a read-only
   solvent-set panel with local membership checks) until wallet support exists.
+- Phase 12 adds the JavaScript port: `@zk-proof-of-funds/sdk/plume`
+  (@noble/curves + @noble/hashes, locked byte-for-byte to the Rust reference
+  by shared test vectors). `buildEnrollV2Request(sk, policyId)` gives any
+  raw-key JS context — a MetaMask snap, an embedded wallet, a Node script —
+  everything `POST /v2/enroll` needs. Snap *packaging* remains open; the
+  crypto no longer is.
 - The legacy `SHA256(signature)` path is **retained but hardened**: low-`s`
   signatures are now enforced (EIP-2 half-order check), which closes the
   third-party malleability attack. The owner-multiplicity attack is inherent to
@@ -280,19 +293,28 @@ The derivation is the only part of V2 where trust is staged rather than immediat
   - *Native ETH*: candidate lists (config or discovery heuristics) checked via
     `eth_getBalance` at block B. Full-state enumeration needs node-level access
     (`debug_accountRange`/snapshots) and is out of scope here.
-- **Stage B (implemented, Phase 11)**: prove the derivation in SP1
-  (`program-solvent-set/`, mirror in `crates/common/src/solvent_derivation.rs`).
-  The proof shows every entry's balance was verified via **EIP-1186 against the
-  block's state root** and every streak chains from the previously published
-  set (`prevRoot` recommitted inside the proof and matched against on-chain
-  history). `SolventSetOracle.publishRootProven` binds the state root to the
-  chain through the block header and accepts the root from **anyone** —
-  publication itself is permissionless. Native ETH; ERC-20 needs storage
-  proofs (future). This removes the operator *safety* failure (smuggling an
+- **Stage B (implemented, Phase 11; ERC-20 in Phase 12)**: prove the
+  derivation in SP1 (`program-solvent-set/`, mirror in
+  `crates/common/src/solvent_derivation.rs`). The proof shows every entry's
+  balance was verified against the block's state root — native ETH via
+  EIP-1186 account proofs, ERC-20 via the token account's storage root plus a
+  storage proof of `balanceOf[candidate]` at the policy-pinned mapping slot —
+  and every streak chains from the previously published set (`prevRoot`
+  recommitted inside the proof and matched against on-chain history).
+  `SolventSetOracle.publishRootProven` binds the state root to the chain
+  through the block header, cross-checks the policy's token and pinned
+  `balanceSlot`, and accepts the root from **anyone** — publication itself is
+  permissionless. This removes the operator *safety* failure (smuggling an
   insolvent address or inflated streak is impossible).
-- **Stage B.2 (future)**: prove candidate *completeness* for ERC-20s by
-  exhaustively enumerating Transfer logs against per-block receipt roots — a
-  rolling proof, far cheaper than state-trie iteration. Caveats: nonstandard
+- **Stage B.2 (statement implemented, Phase 12)**: candidate *completeness*
+  for ERC-20s (`crates/common/src/receipt_scan.rs`, `program-receipt-scan/`):
+  verify a contiguous header chain, exhaustively enumerate **every receipt of
+  every block** (a withheld trie node aborts — no Transfer can be hidden),
+  and commit the participant set as `participants_root` — the same
+  construction the derivation proof commits as `candidates_root`. Equality of
+  the two roots shows the derivation missed no holder active in the scanned
+  window. Remaining: the on-chain composition check and operator tooling to
+  build the witness (fetch raw receipts, rebuild tries). Caveats: nonstandard
   tokens (rebasing, fee-on-transfer) break log accounting and must be flagged
   per policy.
 - **Stage C (research)**: multi-party or light-client-verified candidate
@@ -338,8 +360,12 @@ epoch-increasing rules bound the damage window on-chain.
 | Client tooling | `crates/agent/src/bin/{zkpof-client,print-vkeys}.rs` | Local signer/prover CLI; vkey generation for deployment |
 | DB | `crates/agent/src/db.rs` | `nullifiers`, `solvent_sets` (entries + streaks) tables |
 | API | `crates/backend/src/main.rs` | `POST /v2/enroll`, `GET /v2/solvent_set/:policy_id[/leaves]`, `POST /v2/admin/build_solvent_set/:policy_id` (`proven` flag) |
-| Oracle | `contracts/src/SolventSetOracle.sol` | publishRoot + publishRootProven (header binding) + verifyMembership/verifyAndConsume |
-| SDK | `sdk/src/` | Streak-aware set fetch + local tree/path computation (still zero-dep) |
+| Oracle | `contracts/src/SolventSetOracle.sol` | publishRoot + publishRootProven (header binding, token/slot pinning) + verifyMembership/verifyAndConsume |
+| Storage proofs | `crates/common/src/mpt.rs` | Account-state + storage-slot verification, `erc20_balance_slot`, trie-key API |
+| Completeness (B.2) | `crates/common/src/receipt_scan.rs` + `program-receipt-scan/` | Header chain, exhaustive receipts-trie enumeration, Transfer extraction |
+| SDK | `sdk/src/` | Streak-aware set fetch + local tree/path computation (core still zero-dep) |
+| Wallet crypto | `sdk/src/plume.ts` (`@zk-proof-of-funds/sdk/plume`) | JS nullifier + DLEQ on @noble, cross-language vectors in `plume.test.ts` |
+| Vkeys | `config/vkeys.env` | Generated by `print-vkeys`; consumed by Deploy.s.sol |
 | Web | `web/src/components/SolventSetPanel.tsx` | Client-side set explorer + local membership check |
 
 **No server-side path endpoint exists by design** — asking the agent for "the path
@@ -359,11 +385,16 @@ entry list (SDK, `crates/common`, and `zkpof-client` all implement it).
 
 ## 7. Open items
 
-- Committed `scope_hash` if cross-policy shared identity is wanted.
+- On-chain composition: require `scan.participants_root ==
+  derivation.candidates_root` when a policy demands completeness-proven
+  publication (both commitment surfaces exist; the equality check does not yet).
+- Receipt-scan witness tooling: fetch raw receipts and rebuild the tries
+  (any full node can produce the witness; the proof does not trust it).
+- MetaMask snap packaging around `sdk/plume` (the crypto is done; the snap
+  shell, permissions, and distribution are not).
 - Browser proving target: SP1 is not browser-feasible today; either delegate
   proving with TEE privacy, or compile the membership statement to a small
   dedicated circuit (circom/noir) with the same public-values ABI.
-- Stage B.2: prove ERC-20 candidate completeness from receipt-trie enumeration;
-  ERC-20 storage proofs for proven builds.
-- Purge `wallet_address` from the legacy `/submit_proof` request path once V2
-  covers its use cases.
+- Committed `scope_hash` if cross-policy shared identity is wanted.
+- Remove the deprecated `wallet_address` fallback from `/submit_proof` once
+  all clients send `trie_key`.

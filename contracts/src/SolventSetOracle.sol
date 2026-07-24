@@ -47,8 +47,9 @@ contract SolventSetOracle is Ownable {
 
     /// @dev abi.encode(bytes32 stateRoot, bytes32 prevRoot, bytes32 newRoot,
     ///      bytes32 policyId, uint64 epoch, uint64 blockNumber, uint64 chainId,
-    ///      uint256 thresholdWei, uint32 memberCount, uint32 candidateCount).
-    uint256 private constant DERIVATION_PUBLIC_VALUES_LEN = 320;
+    ///      uint256 thresholdWei, uint32 memberCount, uint32 candidateCount,
+    ///      address token, uint64 balanceSlot, bytes32 candidatesRoot).
+    uint256 private constant DERIVATION_PUBLIC_VALUES_LEN = 416;
 
     // --- State ---
 
@@ -73,6 +74,11 @@ contract SolventSetOracle is Ownable {
     ///      view verifyMembership() and track nullifiers themselves.
     mapping(bytes32 => mapping(bytes32 => bool)) public usedNullifiers;
 
+    /// @notice ERC-20 policies: the pinned Solidity mapping slot of
+    ///         `balanceOf` for the policy's token. A proven publication must
+    ///         match it — a proof against the wrong slot proves nothing.
+    mapping(bytes32 => uint64) public balanceSlotOf;
+
     // --- Events ---
 
     event SolventSetRootPublished(
@@ -89,6 +95,7 @@ contract SolventSetOracle is Ownable {
 
     event MembershipVKeyUpdated(bytes32 oldVKey, bytes32 newVKey);
     event DerivationVKeyUpdated(bytes32 oldVKey, bytes32 newVKey);
+    event BalanceSlotSet(bytes32 indexed policyId, uint64 balanceSlot);
 
     // --- Custom Errors ---
 
@@ -105,6 +112,8 @@ contract SolventSetOracle is Ownable {
     error PrevRootMismatch(bytes32 expected, bytes32 actual);
     error ThresholdMismatch(uint256 policyThreshold, uint256 provenThreshold);
     error ChainIdMismatch(uint64 expected, uint64 actual);
+    error TokenMismatch(address policyToken, address provenToken);
+    error BalanceSlotMismatch(uint64 pinnedSlot, uint64 provenSlot);
     error StaleReferenceBlock(uint256 currentBlock, uint64 blockNumber, uint64 maxBlockAge);
     error BlockhashUnavailable(uint64 blockNumber);
     error HeaderHashMismatch(bytes32 expected, bytes32 actual);
@@ -145,6 +154,16 @@ contract SolventSetOracle is Ownable {
         bytes32 oldVKey = derivationVKey;
         derivationVKey = _vkey;
         emit DerivationVKeyUpdated(oldVKey, _vkey);
+    }
+
+    /// @notice Pin the `balanceOf` mapping slot for an ERC-20 policy's token.
+    /// @dev Policy-operator only — the slot is part of what makes a proven
+    ///      publication sound for the token.
+    function setBalanceSlot(bytes32 policyId, uint64 slot) external {
+        PolicyRegistry.Policy memory policy = policyRegistry.getPolicy(policyId);
+        if (msg.sender != policy.operator) revert NotOperator(msg.sender, policy.operator);
+        balanceSlotOf[policyId] = slot;
+        emit BalanceSlotSet(policyId, slot);
     }
 
     // --- Root Publication: Stage A (operator-trusted) ---
@@ -203,10 +222,17 @@ contract SolventSetOracle is Ownable {
             uint64 chainId,
             uint256 thresholdWei,
             uint32 memberCount,
-            /* uint32 candidateCount */
+            , // candidateCount
+            address provenToken,
+            uint64 provenBalanceSlot,
+            // bytes32 candidatesRoot — the Stage B.2 completeness binding
+            // surface; unchecked on-chain until composition lands.
         ) = abi.decode(
             publicValues,
-            (bytes32, bytes32, bytes32, bytes32, uint64, uint64, uint64, uint256, uint32, uint32)
+            (
+                bytes32, bytes32, bytes32, bytes32, uint64, uint64, uint64, uint256,
+                uint32, uint32, address, uint64, bytes32
+            )
         );
 
         if (provenPolicyId != policyId) revert PublicValuesMismatch();
@@ -214,6 +240,14 @@ contract SolventSetOracle is Ownable {
         if (chainId != uint64(block.chainid)) revert ChainIdMismatch(uint64(block.chainid), chainId);
         if (thresholdWei != policy.thresholdWei) {
             revert ThresholdMismatch(policy.thresholdWei, thresholdWei);
+        }
+        // Asset binding: the proof's token/slot must match the policy's.
+        if (provenToken != policy.tokenAddress) {
+            revert TokenMismatch(policy.tokenAddress, provenToken);
+        }
+        uint64 pinnedSlot = provenToken == address(0) ? 0 : balanceSlotOf[policyId];
+        if (provenBalanceSlot != pinnedSlot) {
+            revert BalanceSlotMismatch(pinnedSlot, provenBalanceSlot);
         }
 
         // Epoch strictly increasing; streak continuity binds to our history.

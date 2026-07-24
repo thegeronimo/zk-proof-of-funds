@@ -375,4 +375,24 @@ mod tests {
         let expected = format!("zkpof-nullifier-v2:{}", "aa".repeat(32));
         assert_eq!(msg, expected.as_bytes());
     }
+
+    /// Emit cross-language test vectors (consumed by sdk/src/plume.test.ts).
+    /// Run with: cargo test -p zk-pof-common emit_test_vectors -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn emit_test_vectors() {
+        for (sk_byte, policy) in [(1u8, POLICY_A), (2, POLICY_A), (42, POLICY_A), (42, POLICY_B)] {
+            let secret = sk(sk_byte);
+            let pk = derive_public_key(&secret).unwrap();
+            let (nullifier, proof) = prove_nullifier(&secret, &policy).unwrap();
+            println!("--- sk={sk_byte} policy={}", hex::encode(policy));
+            println!("pk: {}", hex::encode(pk));
+            println!("address: {}", hex::encode(derive_address(&pk).unwrap()));
+            println!("nullifier: {}", hex::encode(nullifier));
+            println!("member_id: {}", hex::encode(nullifier_hash(&nullifier)));
+            println!("dleq_a: {}", hex::encode(proof.a));
+            println!("dleq_b: {}", hex::encode(proof.b));
+            println!("dleq_s: {}", hex::encode(proof.s));
+        }
+    }
 }

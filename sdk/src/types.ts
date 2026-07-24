@@ -162,6 +162,71 @@ export interface HealthResponse {
   version: string;
 }
 
+// ─── Privacy V2 (PRIVACY_V2.md) ─────────────────────────────────────────────
+
+/**
+ * Request body for POST /v2/enroll — nullifier enrollment.
+ *
+ * Requires raw key access to compute (wallets cannot produce PLUME-style
+ * nullifiers yet); see PRIVACY_V2.md §3.3. All fields hex-encoded, 0x optional.
+ */
+export interface EnrollV2Request {
+  /** 32-byte policy ID. */
+  policy_id: string;
+  /** 33-byte compressed secp256k1 public key. */
+  public_key: string;
+  /** 33-byte compressed nullifier point. */
+  nullifier: string;
+  /** DLEQ commitment A (33 bytes). */
+  dleq_a: string;
+  /** DLEQ commitment B (33 bytes). */
+  dleq_b: string;
+  /** DLEQ response s (32 bytes). */
+  dleq_s: string;
+}
+
+/** Response from POST /v2/enroll. */
+export interface EnrollV2Response {
+  /** memberId = SHA256(nullifier) — unique per (key, policy). */
+  member_id: string;
+  /** Enrollment status ("enrolled"). */
+  status: string;
+  /** First epoch this member appears in. */
+  effective_epoch: number;
+  /** Enrollment mode ("nullifier"). */
+  mode: string;
+}
+
+/** Response from GET /v2/solvent_set/:policy_id. */
+export interface SolventSetInfo {
+  /** Canonical policy ID (lowercase hex). */
+  policy_id: string;
+  /** Solvent-set epoch number. */
+  epoch: number;
+  /** Reference block balances were sampled at. */
+  block_number: number;
+  /** Solvent-set Merkle root (0x-prefixed hex). */
+  root: string;
+  /** Number of addresses in the set. */
+  member_count: number;
+}
+
+/** Response from GET /v2/solvent_set/:policy_id/leaves. */
+export interface SolventSetLeavesPage {
+  policy_id: string;
+  epoch: number;
+  block_number: number;
+  root: string;
+  /** Total addresses in the set. */
+  total: number;
+  /** Page offset. */
+  offset: number;
+  /** Page size limit. */
+  limit: number;
+  /** Addresses in this page (lowercase hex, no 0x, canonical order). */
+  addresses: string[];
+}
+
 // ─── Errors ─────────────────────────────────────────────────────────────────
 
 /** Error codes returned by the SDK. */

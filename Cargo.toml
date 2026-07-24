@@ -5,8 +5,8 @@ members = [
     "crates/backend",
     # "crates/wasm",  # Enable when WASM bindings are ready
 ]
-# Exclude the SP1 program — it compiles to RISC-V with its own toolchain
-exclude = ["program"]
+# Exclude the SP1 programs — they compile to RISC-V with their own toolchain
+exclude = ["program", "program-membership"]
 resolver = "2"
 
 [workspace.package]
@@ -26,6 +26,9 @@ serde_json = "1"
 # Hashing
 sha2 = "0.10"
 tiny-keccak = { version = "2", features = ["keccak"] }
+
+# secp256k1 arithmetic + RFC 9380 hash-to-curve (PLUME-style nullifiers)
+k256 = { version = "0.13", features = ["hash2curve"] }
 
 # Async
 tokio = { version = "1", features = ["full"] }

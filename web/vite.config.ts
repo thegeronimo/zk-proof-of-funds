@@ -6,6 +6,7 @@ export default defineConfig({
   plugins: [react()],
   resolve: {
     alias: {
+      "@zk-proof-of-funds/sdk/plume": path.resolve(__dirname, "../sdk/src/plume.ts"),
       "@zk-proof-of-funds/sdk": path.resolve(__dirname, "../sdk/src/index.ts"),
     },
   },

@@ -25,7 +25,7 @@ use tracing::{info, warn};
 
 use zk_pof_common::solvent_derivation::{
     derive_entries, execute_derivation_statement, CandidateProof, DerivationPublicValues,
-    DerivationWitness,
+    DerivationWitness, TokenConfig,
 };
 use zk_pof_common::solvent_set::{SolventEntry, SolventSet};
 
@@ -148,13 +148,19 @@ impl<'a> SolventSetService<'a> {
         self.build_from_balances(policy_id, epoch, block_number, threshold_wei, &balances)
     }
 
-    /// Stage B: build a solvent set from already-fetched EIP-1186 account
-    /// proofs, validated by the shared derivation statement (native
-    /// execution). Sync — safe to call under the backend's DB mutex after
-    /// all RPC awaits are done.
+    /// Stage B: build a solvent set from already-fetched EIP-1186 proofs,
+    /// validated by the shared derivation statement (native execution).
+    /// Sync — safe to call under the backend's DB mutex after all RPC awaits
+    /// are done.
+    ///
+    /// Native mode: `token = None`, candidate proofs are account proofs, and
+    /// `token_account_proof` must be empty. ERC-20 mode: candidate proofs are
+    /// storage proofs of the balance slot, verified under the token account's
+    /// storage root.
     ///
     /// Unlike the Stage A path, an *invalid* proof aborts the build: the same
     /// witness must satisfy the SP1 program, which panics on any bad proof.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_proven_from_proofs(
         &self,
         policy_id: &str,
@@ -164,19 +170,22 @@ impl<'a> SolventSetService<'a> {
         threshold_wei: u128,
         state_root: &[u8; 32],
         proofs: Vec<CandidateProof>,
+        token: Option<&TokenConfig>,
+        token_account_proof: Vec<Vec<u8>>,
     ) -> Result<ProvenBuildResult> {
         let witness = DerivationWitness {
             candidates: proofs,
             prev_entries: self.previous_entries(policy_id, epoch)?,
+            token_account_proof,
         };
 
         // Native pre-check: exactly what the SP1 program will prove.
         let public_values = execute_derivation_statement(
             &witness, state_root, &parse_policy_bytes(policy_id)?, epoch, block_number,
-            chain_id, threshold_wei,
+            chain_id, threshold_wei, token,
         )?;
 
-        let entries = derive_entries(&witness, state_root, threshold_wei)?;
+        let entries = derive_entries(&witness, state_root, threshold_wei, token)?;
         let result = self.store_set(
             policy_id,
             epoch,
@@ -191,10 +200,10 @@ impl<'a> SolventSetService<'a> {
         Ok(ProvenBuildResult { result, witness, public_values })
     }
 
-    /// Stage B convenience: fetch proofs then build (native-ETH policies only —
-    /// ERC-20 requires storage proofs, future work). For contexts free to hold
-    /// `&Database` across awaits (CLI, tests); the backend uses
-    /// [`fetch_candidate_proofs`] + [`Self::build_proven_from_proofs`] instead.
+    /// Stage B convenience: fetch proofs then build. For contexts free to hold
+    /// `&Database` across awaits (CLI, tests); the backend uses the fetch
+    /// helpers + [`Self::build_proven_from_proofs`] instead.
+    #[allow(clippy::too_many_arguments)]
     pub async fn build_proven_from_candidates(
         &self,
         rpc: &RpcFetcher,
@@ -204,11 +213,26 @@ impl<'a> SolventSetService<'a> {
         chain_id: u64,
         threshold_wei: u128,
         candidates: &[String],
+        token: Option<&TokenConfig>,
     ) -> Result<ProvenBuildResult> {
-        let (state_root, proofs) = fetch_candidate_proofs(rpc, candidates, block_number).await?;
-        self.build_proven_from_proofs(
-            policy_id, epoch, block_number, chain_id, threshold_wei, &state_root, proofs,
-        )
+        match token {
+            None => {
+                let (state_root, proofs) =
+                    fetch_candidate_proofs(rpc, candidates, block_number).await?;
+                self.build_proven_from_proofs(
+                    policy_id, epoch, block_number, chain_id, threshold_wei, &state_root, proofs,
+                    None, vec![],
+                )
+            }
+            Some(config) => {
+                let (state_root, token_account_proof, proofs) =
+                    fetch_erc20_candidate_proofs(rpc, config, candidates, block_number).await?;
+                self.build_proven_from_proofs(
+                    policy_id, epoch, block_number, chain_id, threshold_wei, &state_root, proofs,
+                    Some(config), token_account_proof,
+                )
+            }
+        }
     }
 
     /// Persist a built set and return the build result.
@@ -270,6 +294,44 @@ impl<'a> SolventSetService<'a> {
             .map(|e| hex::encode(e.address))
             .collect())
     }
+}
+
+/// Fetch everything an ERC-20 Stage B build needs: the state root, the token
+/// contract's account proof, and one balance-slot storage proof per candidate
+/// — all from a single `eth_getProof` call against the token.
+pub async fn fetch_erc20_candidate_proofs(
+    rpc: &RpcFetcher,
+    token: &TokenConfig,
+    candidates: &[String],
+    block_number: u64,
+) -> Result<([u8; 32], Vec<Vec<u8>>, Vec<CandidateProof>)> {
+    let state_root = rpc
+        .get_state_root(block_number)
+        .await
+        .context("Failed to fetch state root for reference block")?;
+
+    let addresses: Vec<[u8; 20]> = candidates
+        .iter()
+        .map(|c| parse_address_hex(c))
+        .collect::<Result<_>>()?;
+    let slots: Vec<[u8; 32]> = addresses
+        .iter()
+        .map(|a| zk_pof_common::mpt::erc20_balance_slot(a, token.balance_slot))
+        .collect();
+
+    let token_hex = format!("0x{}", hex::encode(token.address));
+    let (token_account_proof, storage_proofs) = rpc
+        .get_proof_with_storage(&token_hex, &slots, block_number)
+        .await
+        .context("Failed to fetch token storage proofs")?;
+
+    let proofs = addresses
+        .into_iter()
+        .zip(storage_proofs)
+        .map(|(address, proof_nodes)| CandidateProof { address, proof_nodes })
+        .collect();
+
+    Ok((state_root, token_account_proof, proofs))
 }
 
 /// Fetch the state root and per-candidate EIP-1186 proofs for a Stage B

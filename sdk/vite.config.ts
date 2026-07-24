@@ -4,13 +4,17 @@ import { resolve } from "path";
 export default defineConfig({
   build: {
     lib: {
-      entry: resolve(__dirname, "src/index.ts"),
-      name: "ZkProofOfFundsSDK",
+      // "index" is the zero-dependency core; "plume" is the wallet-side
+      // nullifier module and pulls in @noble/curves + @noble/hashes.
+      entry: {
+        index: resolve(__dirname, "src/index.ts"),
+        plume: resolve(__dirname, "src/plume.ts"),
+      },
       formats: ["es"],
-      fileName: "index",
     },
     rollupOptions: {
-      // No external dependencies — zero-dep library
+      // Keep the audited crypto libraries external (declared dependencies).
+      external: [/^@noble\//],
     },
     sourcemap: true,
     minify: false,

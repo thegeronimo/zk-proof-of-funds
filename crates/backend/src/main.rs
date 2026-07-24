@@ -76,10 +76,17 @@ struct EnrollRequest {
 }
 
 /// Request body for submitting an MPT proof.
-/// The wallet_address is used transiently for MPT verification but is NOT stored.
+///
+/// Prefer `trie_key` (= keccak256(address), computed client-side): the
+/// plaintext address then never transits the agent at all. `wallet_address`
+/// is the legacy alternative, used transiently for key computation and NOT
+/// stored. Exactly one of the two must be provided.
 #[derive(Debug, Deserialize)]
 struct SubmitProofRequest {
-    wallet_address: String,         // used transiently for MPT verification, NOT stored
+    #[serde(default)]
+    wallet_address: Option<String>, // legacy: used transiently, NOT stored
+    #[serde(default)]
+    trie_key: Option<String>,       // preferred: keccak256(address), hex 32 bytes
     proof_nodes: Vec<String>,       // hex-encoded RLP proof nodes from eth_getProof
     block_number: u64,              // block the proof references
 }
@@ -126,9 +133,14 @@ struct BuildSolventSetRequest {
     #[serde(default)]
     discover_to_block: Option<u64>,
     /// Stage B: verify per-candidate EIP-1186 proofs via the derivation
-    /// statement (native pre-check of the SP1 program). Native ETH only.
+    /// statement (native pre-check of the SP1 program). With `token_address`,
+    /// candidate balances are proven via storage proofs and `balance_slot`
+    /// is required.
     #[serde(default)]
     proven: bool,
+    /// ERC-20 proven mode: the Solidity mapping slot of `balanceOf`.
+    #[serde(default)]
+    balance_slot: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -303,17 +315,41 @@ async fn submit_proof_handler(
         ),
     };
 
-    // 3. Parse wallet address (used transiently for MPT verification, NOT stored)
-    let addr_hex = req.wallet_address.strip_prefix("0x").unwrap_or(&req.wallet_address);
-    let addr_bytes: [u8; 20] = match hex::decode(addr_hex) {
-        Ok(b) if b.len() == 20 => {
-            let mut arr = [0u8; 20];
-            arr.copy_from_slice(&b);
-            arr
+    // 3. Resolve the trie key — preferably supplied directly (the plaintext
+    //    address then never transits the agent); legacy callers still send
+    //    the address, which is used transiently and NOT stored.
+    let trie_key: [u8; 32] = match (&req.trie_key, &req.wallet_address) {
+        (Some(key_hex), _) => {
+            let clean = key_hex.strip_prefix("0x").unwrap_or(key_hex);
+            match hex::decode(clean) {
+                Ok(b) if b.len() == 32 => {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&b);
+                    arr
+                }
+                _ => return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Invalid trie_key (must be 32 bytes hex)"})),
+                ),
+            }
         }
-        _ => return (
+        (None, Some(address_hex)) => {
+            let clean = address_hex.strip_prefix("0x").unwrap_or(address_hex);
+            match hex::decode(clean) {
+                Ok(b) if b.len() == 20 => {
+                    let mut arr = [0u8; 20];
+                    arr.copy_from_slice(&b);
+                    zk_pof_common::mpt::account_trie_key(&arr)
+                }
+                _ => return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Invalid wallet_address (must be 20 bytes hex)"})),
+                ),
+            }
+        }
+        (None, None) => return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Invalid wallet_address (must be 20 bytes hex)"})),
+            Json(serde_json::json!({"error": "Provide trie_key (preferred) or wallet_address"})),
         ),
     };
 
@@ -332,10 +368,10 @@ async fn submit_proof_handler(
         ),
     };
 
-    // 5. Verify MPT proof — address is used here but NOT stored
-    let balance_bytes = match zk_pof_agent::mpt_verifier::verify_account_balance(
+    // 5. Verify MPT proof by trie key — no address needed for verification.
+    let balance_bytes = match zk_pof_common::mpt::verify_account_balance_with_key(
         &state_root,
-        &addr_bytes,
+        &trie_key,
         &proof_nodes,
     ) {
         Ok(b) => b,
@@ -344,7 +380,7 @@ async fn submit_proof_handler(
             Json(serde_json::json!({"error": format!("MPT proof verification failed: {}", e)})),
         ),
     };
-    // addr_bytes is now dropped and never stored
+    // Neither the trie key nor any address is stored
 
     // 6. Convert balance to u128 and check threshold
     let threshold_wei: u128 = 1_000_000_000_000_000_000; // 1 ETH (TODO: read from policy)
@@ -1167,14 +1203,37 @@ async fn admin_build_solvent_set_handler(
     }
     let candidates: Vec<String> = candidates.into_iter().collect();
 
-    // ── Stage B: EIP-1186-proven build (native ETH only) ────────────────
+    // ── Stage B: EIP-1186-proven build (native ETH or ERC-20) ───────────
     if req.proven {
-        if req.token_address.is_some() {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "proven mode supports native ETH only (ERC-20 needs storage proofs)"})),
-            );
-        }
+        // ERC-20 proven mode needs the pinned balanceOf mapping slot.
+        let token_config = match (&req.token_address, req.balance_slot) {
+            (Some(token_hex), Some(slot)) => {
+                let clean = token_hex.strip_prefix("0x").unwrap_or(token_hex);
+                let bytes = match hex::decode(clean) {
+                    Ok(b) if b.len() == 20 => b,
+                    _ => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"error": "Invalid token_address (must be 20 bytes hex)"})),
+                        );
+                    }
+                };
+                let mut address = [0u8; 20];
+                address.copy_from_slice(&bytes);
+                Some(zk_pof_common::solvent_derivation::TokenConfig {
+                    address,
+                    balance_slot: slot,
+                })
+            }
+            (Some(_), None) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "ERC-20 proven mode requires balance_slot (the balanceOf mapping slot)"})),
+                );
+            }
+            (None, _) => None,
+        };
+
         let chain_id = match rpc.get_chain_id().await {
             Ok(c) => c,
             Err(e) => {
@@ -1185,12 +1244,19 @@ async fn admin_build_solvent_set_handler(
             }
         };
         // All RPC awaits happen before the DB lock.
-        let (state_root, proofs) = match zk_pof_agent::solvent_set_service::fetch_candidate_proofs(
-            rpc, &candidates, block_number,
-        )
-        .await
-        {
-            Ok(pair) => pair,
+        let fetched = match &token_config {
+            None => zk_pof_agent::solvent_set_service::fetch_candidate_proofs(
+                rpc, &candidates, block_number,
+            )
+            .await
+            .map(|(state_root, proofs)| (state_root, Vec::new(), proofs)),
+            Some(config) => zk_pof_agent::solvent_set_service::fetch_erc20_candidate_proofs(
+                rpc, config, &candidates, block_number,
+            )
+            .await,
+        };
+        let (state_root, token_account_proof, proofs) = match fetched {
+            Ok(triple) => triple,
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1212,6 +1278,7 @@ async fn admin_build_solvent_set_handler(
         };
         return match service.build_proven_from_proofs(
             &policy_id_hex, epoch, block_number, chain_id, threshold_wei, &state_root, proofs,
+            token_config.as_ref(), token_account_proof,
         ) {
             Ok(proven) => (
                 StatusCode::OK,

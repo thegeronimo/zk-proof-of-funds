@@ -28,5 +28,6 @@ pub mod epoch_processor;
 pub mod solvent_set_service;
 pub mod membership_prover;
 pub mod derivation_prover;
+pub mod scan_prover;
 pub mod webhook;
 pub mod db;

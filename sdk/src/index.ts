@@ -16,6 +16,10 @@ export type {
   AdminEpochsResponse,
   HealthResponse,
   SolvencyErrorCode,
+  EnrollV2Request,
+  EnrollV2Response,
+  SolventSetInfo,
+  SolventSetLeavesPage,
 } from "./types";
 
 // ─── Crypto Utilities ────────────────────────────────────────────────────────
@@ -27,6 +31,15 @@ export {
 
 // ─── Merkle Utilities ────────────────────────────────────────────────────────
 export { computeLeaf, verifyProof } from "./utils/merkle";
+
+// ─── Solvent-Set Utilities (Privacy V2) ──────────────────────────────────────
+export {
+  computeSolventLeaf,
+  computeSolventSetRoot,
+  computeSolventSetPath,
+  verifySolventMembership,
+} from "./utils/solventSet";
+export type { SolventSetPath } from "./utils/solventSet";
 
 // ─── Formatting Utilities ────────────────────────────────────────────────────
 export {

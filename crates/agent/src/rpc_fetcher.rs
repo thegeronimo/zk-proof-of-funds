@@ -200,6 +200,102 @@ impl RpcFetcher {
     pub fn rpc_url(&self) -> &str {
         &self.rpc_url
     }
+
+    // --- Privacy V2: solvent-set derivation helpers ---
+
+    /// Get an ERC-20 balance at a specific block via `eth_call` of
+    /// `balanceOf(address)` (selector `0x70a08231`).
+    pub async fn get_erc20_balance_at_block(
+        &self,
+        token_hex: &str,
+        holder_hex: &str,
+        block_number: u64,
+    ) -> Result<u128> {
+        use alloy::primitives::{Bytes, TxKind, U256};
+        use alloy::rpc::types::{TransactionInput, TransactionRequest};
+
+        let token = Address::from_str(token_hex).context("Invalid token address")?;
+        let holder = Address::from_str(holder_hex).context("Invalid holder address")?;
+
+        let mut calldata = Vec::with_capacity(36);
+        calldata.extend_from_slice(&[0x70, 0xa0, 0x82, 0x31]); // balanceOf(address)
+        calldata.extend_from_slice(&[0u8; 12]);
+        calldata.extend_from_slice(holder.as_slice());
+
+        let tx = TransactionRequest {
+            to: Some(TxKind::Call(token)),
+            input: TransactionInput::new(Bytes::from(calldata)),
+            ..Default::default()
+        };
+
+        let output = self.provider
+            .call(tx)
+            .block(alloy::eips::BlockNumberOrTag::Number(block_number).into())
+            .await
+            .context("eth_call balanceOf failed")?;
+
+        if output.len() < 32 {
+            anyhow::bail!("balanceOf returned {} bytes, expected 32", output.len());
+        }
+        let balance = U256::from_be_slice(&output[..32]);
+        Ok(balance.try_into().unwrap_or(u128::MAX))
+    }
+
+    /// Fetch ERC-20 `Transfer` event logs for a token over a block range.
+    ///
+    /// Used for solvent-set candidate discovery: every address that has sent
+    /// or received the token in the range is a candidate whose balance is then
+    /// checked at the reference block.
+    pub async fn get_transfer_logs(
+        &self,
+        token_hex: &str,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<alloy::rpc::types::Log>> {
+        use alloy::primitives::B256;
+        use alloy::rpc::types::Filter;
+
+        let token = Address::from_str(token_hex).context("Invalid token address")?;
+        let filter = Filter::new()
+            .address(token)
+            .event_signature(B256::from(TRANSFER_EVENT_TOPIC))
+            .from_block(from_block)
+            .to_block(to_block);
+
+        self.provider
+            .get_logs(&filter)
+            .await
+            .context("eth_getLogs RPC call failed")
+    }
+}
+
+/// `keccak256("Transfer(address,address,uint256)")` — topic0 of ERC-20 transfers.
+pub const TRANSFER_EVENT_TOPIC: [u8; 32] = [
+    0xdd, 0xf2, 0x52, 0xad, 0x1b, 0xe2, 0xc8, 0x9b, 0x69, 0xc2, 0xb0, 0x68, 0xfc, 0x37, 0x8d,
+    0xaa, 0x95, 0x2b, 0xa7, 0xf1, 0x63, 0xc4, 0xa1, 0x16, 0x28, 0xf5, 0x5a, 0x4d, 0xf5, 0x23,
+    0xb3, 0xef,
+];
+
+/// Extract the unique `from`/`to` participants from ERC-20 Transfer logs.
+///
+/// Returns lowercase hex addresses (no 0x prefix), sorted and deduplicated.
+/// Logs that are not standard indexed Transfers (fewer than 3 topics) are
+/// skipped.
+pub fn parse_transfer_participants(logs: &[alloy::rpc::types::Log]) -> Vec<String> {
+    use std::collections::BTreeSet;
+
+    let mut participants = BTreeSet::new();
+    for log in logs {
+        let topics = log.topics();
+        if topics.len() >= 3 && topics[0].as_slice() == TRANSFER_EVENT_TOPIC {
+            for topic in &topics[1..3] {
+                let mut addr = [0u8; 20];
+                addr.copy_from_slice(&topic.as_slice()[12..]);
+                participants.insert(hex::encode(addr));
+            }
+        }
+    }
+    participants.into_iter().collect()
 }
 
 // ─── Mock RPC Fetcher ────────────────────────────────────────────────────────
@@ -337,5 +433,53 @@ mod tests {
         let mock = MockRpcFetcher::new();
         mock.set_block_number(20_000_000);
         assert_eq!(mock.get_block_number_async().await, 20_000_000);
+    }
+
+    #[test]
+    fn test_parse_transfer_participants() {
+        use super::{parse_transfer_participants, TRANSFER_EVENT_TOPIC};
+        use alloy::primitives::{Address, B256, Log as PrimitiveLog, LogData};
+
+        fn topic_for(addr_byte: u8) -> B256 {
+            let mut bytes = [0u8; 32];
+            bytes[12..].copy_from_slice(&[addr_byte; 20]);
+            B256::from(bytes)
+        }
+
+        fn transfer_log(from: u8, to: u8) -> alloy::rpc::types::Log {
+            let inner = PrimitiveLog {
+                address: Address::ZERO,
+                data: LogData::new_unchecked(
+                    vec![B256::from(TRANSFER_EVENT_TOPIC), topic_for(from), topic_for(to)],
+                    Default::default(),
+                ),
+            };
+            alloy::rpc::types::Log { inner, ..Default::default() }
+        }
+
+        // Two transfers sharing a participant, plus a non-Transfer log (2 topics).
+        let mut logs = vec![transfer_log(0x01, 0x02), transfer_log(0x02, 0x03)];
+        let unrelated = alloy::rpc::types::Log {
+            inner: PrimitiveLog {
+                address: Address::ZERO,
+                data: LogData::new_unchecked(
+                    vec![B256::ZERO, topic_for(0x09)],
+                    Default::default(),
+                ),
+            },
+            ..Default::default()
+        };
+        logs.push(unrelated);
+
+        let participants = parse_transfer_participants(&logs);
+        assert_eq!(
+            participants,
+            vec![
+                hex::encode([0x01; 20]),
+                hex::encode([0x02; 20]),
+                hex::encode([0x03; 20]),
+            ],
+            "Participants must be deduped, sorted, and skip non-Transfer logs"
+        );
     }
 }

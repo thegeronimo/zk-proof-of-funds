@@ -10,6 +10,10 @@ import type {
   AdminEpochsResponse,
   HealthResponse,
   SolvencyErrorCode,
+  EnrollV2Request,
+  EnrollV2Response,
+  SolventSetInfo,
+  SolventSetLeavesPage,
 } from "./types";
 
 /** Error thrown by SDK methods with a typed error code. */
@@ -102,6 +106,91 @@ export class SolvencyClient {
       `/submit_proof/${policyId}/${memberId}`,
       req
     );
+  }
+
+  // ─── Privacy V2 Methods (PRIVACY_V2.md) ─────────────────────────────────
+
+  /**
+   * Enroll with a deterministic nullifier + DLEQ proof (Privacy V2).
+   *
+   * memberId = SHA256(nullifier), cryptographically unique per (key, policy) —
+   * unlike legacy enrollment, a wallet cannot mint multiple identities for
+   * one policy. Requires raw key access to compute the nullifier
+   * (PRIVACY_V2.md §3.3).
+   *
+   * @throws {SolvencyError} INVALID_REQUEST (400), CONFLICT (409)
+   */
+  async enrollV2(req: EnrollV2Request): Promise<EnrollV2Response> {
+    return this.post<EnrollV2Response>("/v2/enroll", req);
+  }
+
+  /**
+   * Get the latest solvent-set root metadata for a policy.
+   *
+   * @throws {SolvencyError} NOT_FOUND (404), INVALID_REQUEST (400)
+   */
+  async getSolventSet(policyId: string): Promise<SolventSetInfo> {
+    return this.get<SolventSetInfo>(`/v2/solvent_set/${policyId}`);
+  }
+
+  /**
+   * Get one page of the solvent set's public address list.
+   *
+   * @throws {SolvencyError} NOT_FOUND (404), INVALID_REQUEST (400)
+   */
+  async getSolventSetLeaves(
+    policyId: string,
+    opts: { epoch?: number; offset?: number; limit?: number } = {}
+  ): Promise<SolventSetLeavesPage> {
+    const params = new URLSearchParams();
+    if (opts.epoch !== undefined) params.set("epoch", String(opts.epoch));
+    if (opts.offset !== undefined) params.set("offset", String(opts.offset));
+    if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+    const query = params.toString();
+    return this.get<SolventSetLeavesPage>(
+      `/v2/solvent_set/${policyId}/leaves${query ? `?${query}` : ""}`
+    );
+  }
+
+  /**
+   * Download the complete solvent-set address list (all pages).
+   *
+   * Downloading the full set — rather than querying for a specific address —
+   * is what keeps the lookup oblivious: use it with
+   * `computeSolventSetPath()` to build a membership path locally.
+   *
+   * @throws {SolvencyError} NOT_FOUND (404), INVALID_REQUEST (400)
+   */
+  async fetchAllSolventSetAddresses(
+    policyId: string,
+    epoch?: number
+  ): Promise<{ info: SolventSetInfo; addresses: string[] }> {
+    const pageSize = 10_000;
+    const first = await this.getSolventSetLeaves(policyId, {
+      epoch,
+      offset: 0,
+      limit: pageSize,
+    });
+    const addresses = [...first.addresses];
+    while (addresses.length < first.total) {
+      const page = await this.getSolventSetLeaves(policyId, {
+        epoch: first.epoch,
+        offset: addresses.length,
+        limit: pageSize,
+      });
+      if (page.addresses.length === 0) break; // defensive: avoid infinite loop
+      addresses.push(...page.addresses);
+    }
+    return {
+      info: {
+        policy_id: first.policy_id,
+        epoch: first.epoch,
+        block_number: first.block_number,
+        root: first.root,
+        member_count: first.total,
+      },
+      addresses,
+    };
   }
 
   /**

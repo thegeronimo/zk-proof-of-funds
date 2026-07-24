@@ -14,6 +14,7 @@
 | 7 | ERC-20 + L2 Support | Token balance proofs, multi-chain | 3-5 days | |
 | 8 | Frontend & SDK | React UI, JavaScript SDK for integrators | 3-5 days | |
 | 9 | Production Hardening | Monitoring, CI/CD, audit prep, documentation | 3-5 days | |
+| 10 | Privacy V2 | Solvent-set membership + deterministic nullifiers (see PRIVACY_V2.md) | 3-5 days | ✅ DONE (initial) |
 
 **Total estimated effort: 28-46 days**
 
@@ -611,3 +612,42 @@ Phase 0 (Foundation)
 4. **Start with Phase 0**: Restructure workspace and define types.
 
 5. **Start Phase 1 immediately**: Trusted mode MVP gives you a working system fast.
+
+---
+
+## Phase 10: Privacy V2 — Solvent-Set Membership & Deterministic Nullifiers ✅ (initial)
+
+**Goal**: Cryptographic (not policy-based) privacy from the agent, and sound
+one-identity-per-key identifiers. Full design: **PRIVACY_V2.md**.
+
+### Delivered
+
+- [x] **10.1** PLUME-style deterministic nullifiers (`crates/common/src/plume.rs`):
+  RFC 9380 hash-to-curve on secp256k1, Chaum-Pedersen DLEQ proofs, deterministic
+  nonces. `memberId = SHA256(nullifier)` — unique per (key, policy).
+- [x] **10.2** Legacy enrollment hardened: EIP-2 low-s enforcement closes the
+  `(r, n-s, v^1)` malleability route to duplicate memberIds.
+- [x] **10.3** Solvent-set trees (`crates/common/src/solvent_set.rs`) + membership
+  statement with ABI-encoded public values (`crates/common/src/membership.rs`).
+- [x] **10.4** SP1 membership program (`program-membership/`) — shares the
+  statement code with the host mirror via `zk-pof-common`; builds with
+  `cargo prove build`.
+- [x] **10.5** Agent: `solvent_set_service.rs` (build from candidates, ERC-20
+  Transfer-log discovery, ERC-20 `balanceOf` at block), `membership_prover.rs`
+  (runtime-loaded ELF, execute + Groth16 prove), nullifier + solvent-set DB tables.
+- [x] **10.6** Backend: `POST /v2/enroll`, `GET /v2/solvent_set/:policy_id`,
+  `GET /v2/solvent_set/:policy_id/leaves`, `POST /v2/admin/build_solvent_set/:policy_id`.
+- [x] **10.7** Contracts: `SolventSetOracle.sol` (publishRoot, verifyMembership,
+  verifyAndConsume nullifier tracking) + 23 Foundry tests with MockSP1Verifier.
+- [x] **10.8** SDK: solvent-set fetch + local tree/path computation (zero-dep),
+  `enrollV2`, V2 types.
+- [x] **10.9** Integration tests: full agent→client flow, stolen-path rejection,
+  identity unification (enrollment memberId == membership-proof nullifier hash),
+  and an `--ignored` SP1 emulator test proving guest ≡ native mirror.
+
+### Remaining (tracked in PRIVACY_V2.md §6-7)
+
+- [ ] Membership vkey generation + deployment wiring (`cargo prove vkey`)
+- [ ] Wallet-side nullifier support (snap / local signer) + React app V2 flow
+- [ ] Stage B: SP1-proven solvent-set derivation from receipt logs (ERC-20)
+- [ ] Streak/time-weighted solvency leaf extension (anti-flash-loan)

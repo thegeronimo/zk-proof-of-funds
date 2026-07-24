@@ -25,5 +25,7 @@ pub mod chain_publisher;
 pub mod merkle_service;
 pub mod enrollment;
 pub mod epoch_processor;
+pub mod solvent_set_service;
+pub mod membership_prover;
 pub mod webhook;
 pub mod db;

@@ -16,6 +16,13 @@
 //!   GET  /proof/:policy_id/:member_id             — get Merkle membership proof
 //!   GET  /status/:policy_id/:member_id            — get member status
 //!
+//! Privacy V2 (PRIVACY_V2.md):
+//!   POST /v2/enroll                               — enroll with a deterministic nullifier + DLEQ proof
+//!   GET  /v2/solvent_set/:policy_id               — latest solvent-set root metadata
+//!   GET  /v2/solvent_set/:policy_id/leaves        — the public address list (paginated);
+//!                                                   clients compute membership paths locally
+//!   POST /v2/admin/build_solvent_set/:policy_id   — build a solvent set for the next epoch
+//!
 //! Admin:
 //!   GET  /admin/members/:policy_id                — list members for a policy
 //!   GET  /admin/epochs/:policy_id                 — list epoch history
@@ -26,7 +33,7 @@
 
 use axum::{
     Router,
-    extract::{Path, State, Json},
+    extract::{Path, Query, State, Json},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -41,6 +48,8 @@ use zk_pof_agent::merkle_service::{LeafInput, MerkleService};
 use zk_pof_agent::rpc_fetcher::RpcFetcher;
 use zk_pof_agent::proof_worker::ProofWorker;
 use zk_pof_agent::chain_publisher::OnChainPublisher;
+use zk_pof_agent::enrollment::{parse_policy_id, register_nullifier_member, NullifierEnrollment};
+use zk_pof_agent::solvent_set_service::SolventSetService;
 
 // ─── Application State ──────────────────────────────────────────────────────
 
@@ -73,6 +82,48 @@ struct SubmitProofRequest {
     wallet_address: String,         // used transiently for MPT verification, NOT stored
     proof_nodes: Vec<String>,       // hex-encoded RLP proof nodes from eth_getProof
     block_number: u64,              // block the proof references
+}
+
+/// Request body for V2 (nullifier) enrollment. See PRIVACY_V2.md §3.
+#[derive(Debug, Deserialize)]
+struct EnrollV2Request {
+    policy_id: String,   // 32-byte hex (0x optional)
+    public_key: String,  // 33-byte compressed secp256k1 point, hex
+    nullifier: String,   // 33-byte compressed nullifier point, hex
+    dleq_a: String,      // DLEQ commitment A, 33-byte hex
+    dleq_b: String,      // DLEQ commitment B, 33-byte hex
+    dleq_s: String,      // DLEQ response s, 32-byte hex
+}
+
+/// Query parameters for the solvent-set leaves endpoint.
+#[derive(Debug, Deserialize)]
+struct SolventSetLeavesQuery {
+    epoch: Option<u64>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+/// Request body for building a solvent set (admin).
+#[derive(Debug, Deserialize)]
+struct BuildSolventSetRequest {
+    /// Explicit candidate addresses to consider.
+    #[serde(default)]
+    candidates: Vec<String>,
+    /// Reference block for balance sampling (defaults to the latest block).
+    #[serde(default)]
+    block_number: Option<u64>,
+    /// Threshold in wei as a decimal string (defaults to 1 ETH).
+    #[serde(default)]
+    threshold_wei: Option<String>,
+    /// ERC-20 token to check (native ETH when omitted).
+    #[serde(default)]
+    token_address: Option<String>,
+    /// With `token_address`: also discover candidates from Transfer logs in
+    /// this inclusive block range.
+    #[serde(default)]
+    discover_from_block: Option<u64>,
+    #[serde(default)]
+    discover_to_block: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -771,6 +822,371 @@ async fn admin_trigger_epoch(
     )
 }
 
+// ─── Privacy V2 Handlers ────────────────────────────────────────────────────
+
+/// Decode a fixed-length hex field (0x prefix optional).
+fn decode_hex_array<const N: usize>(field: &str, value: &str) -> Result<[u8; N], String> {
+    let clean = value.strip_prefix("0x").unwrap_or(value);
+    let bytes = hex::decode(clean).map_err(|e| format!("Invalid hex in {field}: {e}"))?;
+    if bytes.len() != N {
+        return Err(format!(
+            "Invalid {field} length: expected {N} bytes, got {}",
+            bytes.len()
+        ));
+    }
+    let mut out = [0u8; N];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+/// POST /v2/enroll — enroll with a deterministic nullifier + DLEQ proof.
+///
+/// memberId = SHA256(nullifier), which is cryptographically unique per
+/// (key, policy) — unlike the legacy SHA256(signature) identifier, a wallet
+/// cannot mint multiple identities for one policy. The public key is used
+/// transiently for DLEQ verification and the balance gate; no address is
+/// stored.
+async fn enroll_v2_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<EnrollV2Request>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // 1. Decode and canonicalize inputs.
+    let policy_id_bytes = match parse_policy_id(&req.policy_id) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid policy_id: {}", e)})),
+            );
+        }
+    };
+    let policy_id_hex = hex::encode(policy_id_bytes);
+
+    let parsed = (|| -> Result<([u8; 33], [u8; 33], zk_pof_common::plume::DleqProof), String> {
+        let public_key = decode_hex_array::<33>("public_key", &req.public_key)?;
+        let nullifier = decode_hex_array::<33>("nullifier", &req.nullifier)?;
+        let proof = zk_pof_common::plume::DleqProof {
+            a: decode_hex_array::<33>("dleq_a", &req.dleq_a)?,
+            b: decode_hex_array::<33>("dleq_b", &req.dleq_b)?,
+            s: decode_hex_array::<32>("dleq_s", &req.dleq_s)?,
+        };
+        Ok((public_key, nullifier, proof))
+    })();
+    let (public_key, nullifier, proof) = match parsed {
+        Ok(p) => p,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e})));
+        }
+    };
+
+    // 2. Balance gate when RPC is configured. The address is derived
+    //    transiently from the public key and discarded — never stored.
+    if let Some(rpc) = &state.rpc_fetcher {
+        let address = match zk_pof_common::plume::derive_address(&public_key) {
+            Ok(a) => a,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Invalid public key: {}", e)})),
+                );
+            }
+        };
+        let address_hex = format!("0x{}", hex::encode(address));
+        let threshold_wei: u128 = 1_000_000_000_000_000_000; // 1 ETH (TODO: read from policy)
+
+        match rpc.get_balance(&address_hex).await {
+            Ok(balance) if balance < threshold_wei => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("Insufficient balance: {} < threshold {}", balance, threshold_wei)
+                    })),
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Failed to fetch balance: {}", e)})),
+                );
+            }
+        }
+    }
+
+    // 3. Verify + register (DB lock only after all awaits).
+    let db = state.db.lock().unwrap();
+    let current_epoch = db
+        .get_latest_epoch(&policy_id_hex)
+        .ok()
+        .flatten()
+        .map(|e| e.epoch)
+        .unwrap_or(0);
+
+    let enrollment = NullifierEnrollment {
+        policy_id_hex: &policy_id_hex,
+        public_key,
+        nullifier,
+        proof,
+    };
+    match register_nullifier_member(&db, &enrollment, current_epoch) {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "member_id": hex::encode(result.member_id),
+                "status": "enrolled",
+                "effective_epoch": result.effective_epoch,
+                "mode": "nullifier"
+            })),
+        ),
+        Err(e) if e.to_string().contains("already") => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("{}", e)})),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("{}", e)})),
+        ),
+    }
+}
+
+/// GET /v2/solvent_set/:policy_id — latest solvent-set root metadata.
+async fn get_solvent_set_handler(
+    State(state): State<Arc<AppState>>,
+    Path(policy_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let policy_id_hex = match parse_policy_id(&policy_id) {
+        Ok(p) => hex::encode(p),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid policy_id: {}", e)})),
+            );
+        }
+    };
+
+    let db = state.db.lock().unwrap();
+    let service = SolventSetService::new(&db);
+    match service.get(&policy_id_hex, None) {
+        Ok(Some(row)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "policy_id": row.policy_id,
+                "epoch": row.epoch,
+                "block_number": row.block_number,
+                "root": format!("0x{}", row.root),
+                "member_count": row.member_count
+            })),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "No solvent set built for this policy"})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Database error: {}", e)})),
+        ),
+    }
+}
+
+/// GET /v2/solvent_set/:policy_id/leaves — the public address list, paginated.
+///
+/// Serving the *entire* set to any caller is what keeps lookups oblivious:
+/// clients download it and compute their own Merkle path locally. There is
+/// deliberately no "path for address X" endpoint — that query would reveal X.
+async fn get_solvent_set_leaves_handler(
+    State(state): State<Arc<AppState>>,
+    Path(policy_id): Path<String>,
+    Query(query): Query<SolventSetLeavesQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let policy_id_hex = match parse_policy_id(&policy_id) {
+        Ok(p) => hex::encode(p),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid policy_id: {}", e)})),
+            );
+        }
+    };
+
+    let db = state.db.lock().unwrap();
+    let service = SolventSetService::new(&db);
+    let row = match service.get(&policy_id_hex, query.epoch) {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "No solvent set found"})),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Database error: {}", e)})),
+            );
+        }
+    };
+
+    let addresses = match SolventSetService::decode_addresses(&row) {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("{}", e)})),
+            );
+        }
+    };
+
+    let total = addresses.len();
+    let offset = query.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(1000).min(10_000);
+    let page: Vec<String> = addresses.into_iter().skip(offset).take(limit).collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "policy_id": row.policy_id,
+            "epoch": row.epoch,
+            "block_number": row.block_number,
+            "root": format!("0x{}", row.root),
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "addresses": page
+        })),
+    )
+}
+
+/// POST /v2/admin/build_solvent_set/:policy_id — build the next-epoch solvent set.
+///
+/// Candidates = explicit list ∪ (optional) Transfer-log discovery; each
+/// candidate's balance is sampled at the reference block and addresses at or
+/// above the threshold form the set. The set contains *all* qualifying
+/// addresses, member or not — the agent never learns who the members are.
+async fn admin_build_solvent_set_handler(
+    State(state): State<Arc<AppState>>,
+    Path(policy_id): Path<String>,
+    Json(req): Json<BuildSolventSetRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use std::collections::BTreeSet;
+
+    let policy_id_hex = match parse_policy_id(&policy_id) {
+        Ok(p) => hex::encode(p),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid policy_id: {}", e)})),
+            );
+        }
+    };
+
+    let rpc = match &state.rpc_fetcher {
+        Some(r) => r,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "RPC not configured"})),
+            );
+        }
+    };
+
+    let threshold_wei: u128 = match &req.threshold_wei {
+        Some(t) => match t.parse() {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Invalid threshold_wei: {}", e)})),
+                );
+            }
+        },
+        None => 1_000_000_000_000_000_000, // 1 ETH (TODO: read from policy)
+    };
+
+    let block_number = match req.block_number {
+        Some(b) => b,
+        None => match rpc.get_block_number().await {
+            Ok(b) => b,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to fetch block number: {}", e)})),
+                );
+            }
+        },
+    };
+
+    // Candidate union: explicit + optional Transfer-log discovery.
+    let mut candidates: BTreeSet<String> = req
+        .candidates
+        .iter()
+        .map(|c| c.strip_prefix("0x").unwrap_or(c).to_lowercase())
+        .collect();
+
+    if let (Some(token), Some(from), Some(to)) =
+        (&req.token_address, req.discover_from_block, req.discover_to_block)
+    {
+        match rpc.get_transfer_logs(token, from, to).await {
+            Ok(logs) => {
+                for participant in zk_pof_agent::rpc_fetcher::parse_transfer_participants(&logs) {
+                    candidates.insert(participant);
+                }
+            }
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Transfer-log discovery failed: {}", e)})),
+                );
+            }
+        }
+    }
+    let candidates: Vec<String> = candidates.into_iter().collect();
+
+    // Fetch all balances before touching the DB (no lock across awaits).
+    let mut balances: Vec<(String, u128)> = Vec::with_capacity(candidates.len());
+    for candidate in &candidates {
+        let fetched = match &req.token_address {
+            Some(token) => rpc.get_erc20_balance_at_block(token, candidate, block_number).await,
+            None => rpc.get_balance_at_block(candidate, block_number).await,
+        };
+        match fetched {
+            Ok(balance) => balances.push((candidate.clone(), balance)),
+            Err(e) => {
+                tracing::warn!(address = %candidate, error = %e, "Balance fetch failed — excluding candidate");
+            }
+        }
+    }
+
+    let db = state.db.lock().unwrap();
+    let service = SolventSetService::new(&db);
+    let epoch = match service.next_epoch(&policy_id_hex) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Database error: {}", e)})),
+            );
+        }
+    };
+
+    match service.build_from_balances(&policy_id_hex, epoch, block_number, threshold_wei, &balances) {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "policy_id": result.policy_id,
+                "epoch": result.epoch,
+                "block_number": result.block_number,
+                "root": format!("0x{}", hex::encode(result.root)),
+                "member_count": result.member_count,
+                "candidate_count": candidates.len()
+            })),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("{}", e)})),
+        ),
+    }
+}
+
 // ─── App Setup ───────────────────────────────────────────────────────────────
 
 /// Build the Axum router with all routes.
@@ -783,6 +1199,11 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/submit_proof/:policy_id/:member_id", post(submit_proof_handler))
         .route("/proof/:policy_id/:member_id", get(get_proof))
         .route("/status/:policy_id/:member_id", get(get_status))
+        // Privacy V2 endpoints (PRIVACY_V2.md)
+        .route("/v2/enroll", post(enroll_v2_handler))
+        .route("/v2/solvent_set/:policy_id", get(get_solvent_set_handler))
+        .route("/v2/solvent_set/:policy_id/leaves", get(get_solvent_set_leaves_handler))
+        .route("/v2/admin/build_solvent_set/:policy_id", post(admin_build_solvent_set_handler))
         // Admin endpoints
         .route("/admin/members/:policy_id", get(admin_list_members))
         .route("/admin/epochs/:policy_id", get(admin_list_epochs))

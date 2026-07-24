@@ -2,6 +2,7 @@ import { Routes, Route, Link, useLocation } from "react-router-dom";
 import EnrollmentFlow from "./components/EnrollmentFlow";
 import Dashboard from "./components/Dashboard";
 import ProofViewer from "./components/ProofViewer";
+import SolventSetPanel from "./components/SolventSetPanel";
 
 function NavLink({ to, children }: { to: string; children: React.ReactNode }) {
   const { pathname } = useLocation();
@@ -35,6 +36,7 @@ export default function App() {
             <NavLink to="/">Enroll</NavLink>
             <NavLink to="/dashboard">Dashboard</NavLink>
             <NavLink to="/proof">Proof Viewer</NavLink>
+            <NavLink to="/solvent-set">Solvent Set</NavLink>
           </div>
         </div>
       </nav>
@@ -45,6 +47,7 @@ export default function App() {
           <Route path="/" element={<EnrollmentFlow />} />
           <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/proof" element={<ProofViewer />} />
+          <Route path="/solvent-set" element={<SolventSetPanel />} />
         </Routes>
       </main>
     </div>

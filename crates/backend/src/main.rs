@@ -109,7 +109,8 @@ struct BuildSolventSetRequest {
     /// Explicit candidate addresses to consider.
     #[serde(default)]
     candidates: Vec<String>,
-    /// Reference block for balance sampling (defaults to the latest block).
+    /// Reference block for balance sampling. Defaults to a blockhash-derived
+    /// unpredictable block within the last `maxBlockAge / 2` blocks.
     #[serde(default)]
     block_number: Option<u64>,
     /// Threshold in wei as a decimal string (defaults to 1 ETH).
@@ -124,6 +125,10 @@ struct BuildSolventSetRequest {
     discover_from_block: Option<u64>,
     #[serde(default)]
     discover_to_block: Option<u64>,
+    /// Stage B: verify per-candidate EIP-1186 proofs via the derivation
+    /// statement (native pre-check of the SP1 program). Native ETH only.
+    #[serde(default)]
+    proven: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1026,8 +1031,8 @@ async fn get_solvent_set_leaves_handler(
         }
     };
 
-    let addresses = match SolventSetService::decode_addresses(&row) {
-        Ok(a) => a,
+    let entries = match SolventSetService::decode_entries(&row) {
+        Ok(e) => e,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1036,10 +1041,15 @@ async fn get_solvent_set_leaves_handler(
         }
     };
 
-    let total = addresses.len();
+    let total = entries.len();
     let offset = query.offset.unwrap_or(0);
     let limit = query.limit.unwrap_or(1000).min(10_000);
-    let page: Vec<String> = addresses.into_iter().skip(offset).take(limit).collect();
+    let page: Vec<_> = entries.into_iter().skip(offset).take(limit).collect();
+    let addresses: Vec<String> = page.iter().map(|e| hex::encode(e.address)).collect();
+    let entries_json: Vec<serde_json::Value> = page
+        .iter()
+        .map(|e| serde_json::json!([hex::encode(e.address), e.streak]))
+        .collect();
 
     (
         StatusCode::OK,
@@ -1051,7 +1061,8 @@ async fn get_solvent_set_leaves_handler(
             "total": total,
             "offset": offset,
             "limit": limit,
-            "addresses": page
+            "addresses": addresses,
+            "entries": entries_json
         })),
     )
 }
@@ -1102,17 +1113,32 @@ async fn admin_build_solvent_set_handler(
         None => 1_000_000_000_000_000_000, // 1 ETH (TODO: read from policy)
     };
 
+    // Reference block: explicit, or an unpredictable blockhash-derived sample
+    // within the freshness window (anti-rented-solvency; PRIVACY_V2.md §4.5).
     let block_number = match req.block_number {
         Some(b) => b,
-        None => match rpc.get_block_number().await {
-            Ok(b) => b,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("Failed to fetch block number: {}", e)})),
-                );
+        None => {
+            let latest = match rpc.get_block_number().await {
+                Ok(b) => b,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("Failed to fetch block number: {}", e)})),
+                    );
+                }
+            };
+            match rpc.get_block_hash(latest).await {
+                Ok(entropy) => zk_pof_agent::solvent_set_service::select_reference_block(
+                    latest, &entropy, 256,
+                ),
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("Failed to fetch block hash: {}", e)})),
+                    );
+                }
             }
-        },
+        }
     };
 
     // Candidate union: explicit + optional Transfer-log discovery.
@@ -1141,6 +1167,75 @@ async fn admin_build_solvent_set_handler(
     }
     let candidates: Vec<String> = candidates.into_iter().collect();
 
+    // ── Stage B: EIP-1186-proven build (native ETH only) ────────────────
+    if req.proven {
+        if req.token_address.is_some() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "proven mode supports native ETH only (ERC-20 needs storage proofs)"})),
+            );
+        }
+        let chain_id = match rpc.get_chain_id().await {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to fetch chain id: {}", e)})),
+                );
+            }
+        };
+        // All RPC awaits happen before the DB lock.
+        let (state_root, proofs) = match zk_pof_agent::solvent_set_service::fetch_candidate_proofs(
+            rpc, &candidates, block_number,
+        )
+        .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("{}", e)})),
+                );
+            }
+        };
+
+        let db = state.db.lock().unwrap();
+        let service = SolventSetService::new(&db);
+        let epoch = match service.next_epoch(&policy_id_hex) {
+            Ok(e) => e,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Database error: {}", e)})),
+                );
+            }
+        };
+        return match service.build_proven_from_proofs(
+            &policy_id_hex, epoch, block_number, chain_id, threshold_wei, &state_root, proofs,
+        ) {
+            Ok(proven) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "policy_id": proven.result.policy_id,
+                    "epoch": proven.result.epoch,
+                    "block_number": proven.result.block_number,
+                    "root": format!("0x{}", hex::encode(proven.result.root)),
+                    "member_count": proven.result.member_count,
+                    "candidate_count": proven.public_values.candidate_count,
+                    "proven": true,
+                    "state_root": format!("0x{}", hex::encode(proven.public_values.state_root)),
+                    "prev_root": format!("0x{}", hex::encode(proven.public_values.prev_root)),
+                    "note": "Derivation validated natively; generate the on-chain proof with `zkpof-client` / derivation_prover using the same inputs."
+                })),
+            ),
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("{}", e)})),
+            ),
+        };
+    }
+
+    // ── Stage A: balance-checked build (operator-trusted) ───────────────
     // Fetch all balances before touching the DB (no lock across awaits).
     let mut balances: Vec<(String, u128)> = Vec::with_capacity(candidates.len());
     for candidate in &candidates {
@@ -1177,7 +1272,8 @@ async fn admin_build_solvent_set_handler(
                 "block_number": result.block_number,
                 "root": format!("0x{}", hex::encode(result.root)),
                 "member_count": result.member_count,
-                "candidate_count": candidates.len()
+                "candidate_count": candidates.len(),
+                "proven": false
             })),
         ),
         Err(e) => (

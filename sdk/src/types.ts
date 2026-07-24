@@ -217,7 +217,7 @@ export interface SolventSetLeavesPage {
   epoch: number;
   block_number: number;
   root: string;
-  /** Total addresses in the set. */
+  /** Total entries in the set. */
   total: number;
   /** Page offset. */
   offset: number;
@@ -225,6 +225,8 @@ export interface SolventSetLeavesPage {
   limit: number;
   /** Addresses in this page (lowercase hex, no 0x, canonical order). */
   addresses: string[];
+  /** Entries in this page as [address, streak] pairs (canonical order). */
+  entries: [string, number][];
 }
 
 // ─── Errors ─────────────────────────────────────────────────────────────────

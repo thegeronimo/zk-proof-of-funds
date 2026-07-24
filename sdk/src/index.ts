@@ -39,7 +39,7 @@ export {
   computeSolventSetPath,
   verifySolventMembership,
 } from "./utils/solventSet";
-export type { SolventSetPath } from "./utils/solventSet";
+export type { SolventSetPath, SolventSetEntryTuple } from "./utils/solventSet";
 
 // ─── Formatting Utilities ────────────────────────────────────────────────────
 export {

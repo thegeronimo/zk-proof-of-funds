@@ -446,6 +446,26 @@ impl Database {
         }
     }
 
+    /// Get the most recent solvent set strictly before the given epoch.
+    ///
+    /// Used for streak continuity: rebuilding epoch N must chain from N-1's
+    /// streaks even when N itself was already (partially) built.
+    pub fn get_latest_solvent_set_before(
+        &self,
+        policy_id: &str,
+        epoch: u64,
+    ) -> Result<Option<SolventSetRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT policy_id, epoch, block_number, root, member_count, addresses_json
+             FROM solvent_sets WHERE policy_id = ?1 AND epoch < ?2 ORDER BY epoch DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![policy_id, epoch], Self::map_solvent_set_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
     fn map_solvent_set_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SolventSetRow> {
         Ok(SolventSetRow {
             policy_id: row.get(0)?,

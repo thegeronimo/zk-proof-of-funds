@@ -43,8 +43,10 @@ export interface ProofSubmissionRequest {
    */
   trie_key?: string;
   /**
-   * Legacy alternative to `trie_key`: the plaintext address (used transiently
-   * for key computation by the agent, NOT stored). Provide one of the two.
+   * @deprecated Send `trie_key` instead. Agents reject this field unless
+   * explicitly configured to accept it (ZKPOF_ALLOW_PLAINTEXT_ADDRESS=1),
+   * because a plaintext address makes privacy a retention promise rather than
+   * a property.
    */
   wallet_address?: string;
   /** Hex-encoded RLP-encoded MPT proof nodes from eth_getProof. */
@@ -176,12 +178,20 @@ export interface HealthResponse {
 /**
  * Request body for POST /v2/enroll — nullifier enrollment.
  *
- * Requires raw key access to compute (wallets cannot produce PLUME-style
- * nullifiers yet); see PRIVACY_V2.md §3.3. All fields hex-encoded, 0x optional.
+ * Requires raw key access (or a wallet implementing ERC-7524
+ * `eth_getPlumeSignature`, whose nullifier construction this matches); see
+ * PRIVACY_V2.md §3.3. Build it with `buildEnrollV2Request()` from
+ * `@zk-proof-of-funds/sdk/plume`. All fields hex-encoded, 0x optional.
  */
 export interface EnrollV2Request {
   /** 32-byte policy ID. */
   policy_id: string;
+  /**
+   * Optional 32-byte scope the nullifier is bound to. Omit to use the
+   * policy's default scope; set it to share one identity namespace across
+   * policies (both must configure the same scope on-chain).
+   */
+  scope_hash?: string;
   /** 33-byte compressed secp256k1 public key. */
   public_key: string;
   /** 33-byte compressed nullifier point. */

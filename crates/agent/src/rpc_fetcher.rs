@@ -267,6 +267,91 @@ impl RpcFetcher {
         Ok(hash)
     }
 
+    // --- Stage B.2: receipt-scan witness building ---
+
+    /// Reconstruct a block's RLP header and return `(header_rlp, block_hash)`.
+    ///
+    /// Standard JSON-RPC exposes header *fields*, not the canonical encoding,
+    /// so we re-encode them. Post-merge and post-Cancun/Prague headers carry
+    /// optional trailing fields (withdrawalsRoot, blobGasUsed, excessBlobGas,
+    /// parentBeaconBlockRoot, requestsHash); each is appended only when the
+    /// node reports it, which keeps the encoding correct across forks. The
+    /// caller verifies `keccak256(header_rlp) == block_hash`, so a wrong
+    /// reconstruction can never pass silently.
+    pub async fn get_raw_header(&self, block_number: u64) -> Result<(Vec<u8>, [u8; 32])> {
+        use alloy::rpc::types::BlockTransactionsKind;
+
+        let block = self.provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Number(block_number))
+            .kind(BlockTransactionsKind::Hashes)
+            .await
+            .context("Failed to fetch block")?
+            .context("Block not found")?;
+
+        let h = &block.header.inner;
+        let mut items: Vec<Vec<u8>> = vec![
+            rlp_bytes(h.parent_hash.as_slice()),
+            rlp_bytes(h.ommers_hash.as_slice()),
+            rlp_bytes(h.beneficiary.as_slice()),
+            rlp_bytes(h.state_root.as_slice()),
+            rlp_bytes(h.transactions_root.as_slice()),
+            rlp_bytes(h.receipts_root.as_slice()),
+            rlp_bytes(h.logs_bloom.as_slice()),
+            rlp_uint_u256(h.difficulty),
+            rlp_uint(h.number as u128),
+            rlp_uint(h.gas_limit as u128),
+            rlp_uint(h.gas_used as u128),
+            rlp_uint(h.timestamp as u128),
+            rlp_bytes(&h.extra_data),
+            rlp_bytes(h.mix_hash.as_slice()),
+            rlp_bytes(&h.nonce.0),
+        ];
+        // Optional trailing fields, in canonical order.
+        if let Some(base_fee) = h.base_fee_per_gas {
+            items.push(rlp_uint(base_fee as u128));
+        }
+        if let Some(withdrawals_root) = h.withdrawals_root {
+            items.push(rlp_bytes(withdrawals_root.as_slice()));
+        }
+        if let Some(blob_gas_used) = h.blob_gas_used {
+            items.push(rlp_uint(blob_gas_used as u128));
+        }
+        if let Some(excess_blob_gas) = h.excess_blob_gas {
+            items.push(rlp_uint(excess_blob_gas as u128));
+        }
+        if let Some(parent_beacon_root) = h.parent_beacon_block_root {
+            items.push(rlp_bytes(parent_beacon_root.as_slice()));
+        }
+        if let Some(requests_hash) = h.requests_hash {
+            items.push(rlp_bytes(requests_hash.as_slice()));
+        }
+
+        let header_rlp = rlp_list(&items);
+        let mut block_hash = [0u8; 32];
+        block_hash.copy_from_slice(block.header.hash.as_slice());
+        Ok((header_rlp, block_hash))
+    }
+
+    /// Fetch every receipt of a block, already EIP-2718 encoded and ordered by
+    /// transaction index — the values of that block's receipts trie.
+    pub async fn get_block_receipts_encoded(&self, block_number: u64) -> Result<Vec<Vec<u8>>> {
+        use alloy::eips::eip2718::Encodable2718;
+
+        let receipts = self.provider
+            .get_block_receipts(alloy::eips::BlockNumberOrTag::Number(block_number).into())
+            .await
+            .context("eth_getBlockReceipts RPC call failed")?
+            .context("Block not found")?;
+
+        let mut encoded = Vec::with_capacity(receipts.len());
+        for receipt in receipts {
+            // EIP-2718: typed receipts are `type || rlp(body)`, legacy is bare.
+            let envelope = receipt.inner.map_logs(|l| l.inner);
+            encoded.push(envelope.encoded_2718());
+        }
+        Ok(encoded)
+    }
+
     // --- Privacy V2: solvent-set derivation helpers ---
 
     /// Get an ERC-20 balance at a specific block via `eth_call` of
@@ -333,6 +418,50 @@ impl RpcFetcher {
             .await
             .context("eth_getLogs RPC call failed")
     }
+}
+
+/// RLP helpers for header reconstruction.
+fn rlp_bytes(data: &[u8]) -> Vec<u8> {
+    if data.len() == 1 && data[0] < 0x80 {
+        return data.to_vec();
+    }
+    let mut out = Vec::with_capacity(data.len() + 5);
+    if data.len() < 56 {
+        out.push(0x80 + data.len() as u8);
+    } else {
+        let len_bytes: Vec<u8> =
+            data.len().to_be_bytes().into_iter().skip_while(|b| *b == 0).collect();
+        out.push(0xB7 + len_bytes.len() as u8);
+        out.extend_from_slice(&len_bytes);
+    }
+    out.extend_from_slice(data);
+    out
+}
+
+fn rlp_list(items: &[Vec<u8>]) -> Vec<u8> {
+    let payload: Vec<u8> = items.concat();
+    let mut out = Vec::with_capacity(payload.len() + 9);
+    if payload.len() < 56 {
+        out.push(0xC0 + payload.len() as u8);
+    } else {
+        let len_bytes: Vec<u8> =
+            payload.len().to_be_bytes().into_iter().skip_while(|b| *b == 0).collect();
+        out.push(0xF7 + len_bytes.len() as u8);
+        out.extend_from_slice(&len_bytes);
+    }
+    out.extend_from_slice(&payload);
+    out
+}
+
+fn rlp_uint(value: u128) -> Vec<u8> {
+    let trimmed: Vec<u8> = value.to_be_bytes().into_iter().skip_while(|b| *b == 0).collect();
+    rlp_bytes(&trimmed)
+}
+
+fn rlp_uint_u256(value: alloy::primitives::U256) -> Vec<u8> {
+    let be = value.to_be_bytes::<32>();
+    let trimmed: Vec<u8> = be.into_iter().skip_while(|b| *b == 0).collect();
+    rlp_bytes(&trimmed)
 }
 
 /// `keccak256("Transfer(address,address,uint256)")` — topic0 of ERC-20 transfers.

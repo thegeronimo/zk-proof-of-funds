@@ -44,6 +44,10 @@ fn address_hex_for(sk: &[u8; 32]) -> String {
     hex::encode(address_of(sk))
 }
 
+fn scope_for(policy_id: &[u8; 32]) -> [u8; 32] {
+    plume::default_scope_hash(policy_id)
+}
+
 fn client_rebuild_set(service: &SolventSetService<'_>, epoch: u64) -> SolventSet {
     let row = service.get(POLICY_HEX, Some(epoch)).unwrap().unwrap();
     let entries = SolventSetService::decode_entries(&row).unwrap();
@@ -100,7 +104,7 @@ fn test_full_solvent_set_membership_flow_with_streaks() {
         siblings: siblings.clone(),
     };
     let public_values =
-        execute_membership_statement(&witness, &build2.root, &policy_id, 2, CHAIN_ID, 2).unwrap();
+        execute_membership_statement(&witness, &build2.root, &policy_id, 2, CHAIN_ID, 2, &scope_for(&policy_id)).unwrap();
 
     assert_eq!(public_values.solvent_set_root, build2.root);
     assert_eq!(public_values.epoch, 2);
@@ -110,7 +114,7 @@ fn test_full_solvent_set_membership_flow_with_streaks() {
     // A stricter policy (min streak 3) rejects the same witness — rented
     // solvency cannot fake holding duration.
     assert!(
-        execute_membership_statement(&witness, &build2.root, &policy_id, 2, CHAIN_ID, 3).is_err()
+        execute_membership_statement(&witness, &build2.root, &policy_id, 2, CHAIN_ID, 3, &scope_for(&policy_id)).is_err()
     );
 
     // The whale that joined this epoch has streak 1 and fails min-streak 2.
@@ -124,7 +128,7 @@ fn test_full_solvent_set_membership_flow_with_streaks() {
         siblings: w_siblings,
     };
     assert!(
-        execute_membership_statement(&whale_witness, &build2.root, &policy_id, 2, CHAIN_ID, 2)
+        execute_membership_statement(&whale_witness, &build2.root, &policy_id, 2, CHAIN_ID, 2, &scope_for(&policy_id))
             .is_err()
     );
 
@@ -135,9 +139,10 @@ fn test_full_solvent_set_membership_flow_with_streaks() {
 
     // ── Identity unification: the membership proof's nullifier hash equals
     // the memberId from nullifier enrollment for the same (key, policy).
-    let (nullifier, proof) = plume::prove_nullifier(&user_sk, &policy_id).unwrap();
+    let (nullifier, proof) = plume::prove_nullifier(&user_sk, &scope_for(&policy_id)).unwrap();
     let enrollment = NullifierEnrollment {
         policy_id_hex: POLICY_HEX,
+        scope_hash: None,
         public_key: plume::derive_public_key(&user_sk).unwrap(),
         nullifier,
         proof,
@@ -187,7 +192,7 @@ fn test_non_member_cannot_prove_membership() {
         leaf_index: leaf_index as u64,
         siblings,
     };
-    assert!(execute_membership_statement(&stolen, &build.root, &policy_id, 1, CHAIN_ID, 1).is_err());
+    assert!(execute_membership_statement(&stolen, &build.root, &policy_id, 1, CHAIN_ID, 1, &scope_for(&policy_id)).is_err());
 }
 
 /// Stage B: the proven build path — synthetic EIP-1186 proofs through the
@@ -276,10 +281,11 @@ fn test_sp1_membership_guest_matches_native_mirror() {
         siblings,
     };
 
+    let scope = scope_for(&policy_id);
     let native =
-        execute_membership_statement(&witness, &root, &policy_id, 1, CHAIN_ID, 2).unwrap();
+        execute_membership_statement(&witness, &root, &policy_id, 1, CHAIN_ID, 2, &scope).unwrap();
     let guest = zk_pof_agent::membership_prover::execute_membership_program(
-        elf, &witness, &root, &policy_id, 1, CHAIN_ID, 2,
+        elf, &witness, &root, &policy_id, 1, CHAIN_ID, 2, &scope,
     )
     .unwrap();
 

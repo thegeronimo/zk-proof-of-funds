@@ -77,10 +77,11 @@ struct EnrollRequest {
 
 /// Request body for submitting an MPT proof.
 ///
-/// Prefer `trie_key` (= keccak256(address), computed client-side): the
-/// plaintext address then never transits the agent at all. `wallet_address`
-/// is the legacy alternative, used transiently for key computation and NOT
-/// stored. Exactly one of the two must be provided.
+/// `trie_key` (= keccak256(address), computed client-side) is the supported
+/// field: the plaintext address never transits the agent. `wallet_address` is
+/// **deprecated and rejected by default** — set
+/// `ZKPOF_ALLOW_PLAINTEXT_ADDRESS=1` to re-enable it for un-migrated
+/// integrators (PRIVACY_V2.md §7).
 #[derive(Debug, Deserialize)]
 struct SubmitProofRequest {
     #[serde(default)]
@@ -95,6 +96,8 @@ struct SubmitProofRequest {
 #[derive(Debug, Deserialize)]
 struct EnrollV2Request {
     policy_id: String,   // 32-byte hex (0x optional)
+    #[serde(default)]
+    scope_hash: Option<String>, // 32-byte hex; defaults to the policy's own scope
     public_key: String,  // 33-byte compressed secp256k1 point, hex
     nullifier: String,   // 33-byte compressed nullifier point, hex
     dleq_a: String,      // DLEQ commitment A, 33-byte hex
@@ -213,8 +216,8 @@ async fn enroll_handler(
     let db = state.db.lock().unwrap();
 
     // Check if already enrolled
-    if let Ok(Some(existing)) = db.get_member(&member_id_hex) {
-        if existing.policy_id == req.policy_id {
+    if let Ok(Some(_existing)) = db.get_member_for_policy(&member_id_hex, &req.policy_id) {
+        {
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
@@ -334,6 +337,17 @@ async fn submit_proof_handler(
             }
         }
         (None, Some(address_hex)) => {
+            // Deprecated path: accepting a plaintext address makes privacy a
+            // retention promise again, so it is opt-in per deployment.
+            if std::env::var("ZKPOF_ALLOW_PLAINTEXT_ADDRESS").ok().as_deref() != Some("1") {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "wallet_address is deprecated — send trie_key (keccak256 of the address, computed client-side). Set ZKPOF_ALLOW_PLAINTEXT_ADDRESS=1 to re-enable the legacy field."
+                    })),
+                );
+            }
+            tracing::warn!("Deprecated wallet_address used in /submit_proof — migrate to trie_key");
             let clean = address_hex.strip_prefix("0x").unwrap_or(address_hex);
             match hex::decode(clean) {
                 Ok(b) if b.len() == 20 => {
@@ -349,7 +363,7 @@ async fn submit_proof_handler(
         }
         (None, None) => return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Provide trie_key (preferred) or wallet_address"})),
+            Json(serde_json::json!({"error": "Provide trie_key (keccak256 of the address, computed client-side)"})),
         ),
     };
 
@@ -963,8 +977,17 @@ async fn enroll_v2_handler(
         .map(|e| e.epoch)
         .unwrap_or(0);
 
+    let scope_hash = match &req.scope_hash {
+        Some(hex_str) => match decode_hex_array::<32>("scope_hash", hex_str) {
+            Ok(s) => Some(s),
+            Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))),
+        },
+        None => None,
+    };
+
     let enrollment = NullifierEnrollment {
         policy_id_hex: &policy_id_hex,
+        scope_hash,
         public_key,
         nullifier,
         proof,

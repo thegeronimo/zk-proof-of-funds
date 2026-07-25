@@ -1,20 +1,25 @@
 //! The V2 membership statement — host-side mirror of `program-membership/`.
 //!
-//! Statement (PRIVACY_V2.md §4.2, extended with streaks in Phase 11):
+//! Statement (PRIVACY_V2.md §4.2; streaks in Phase 11, scopes in Phase 13):
 //!
 //! ```text
 //! Private:  sk, streak, merkle siblings, leaf index
-//! Public:   solvent_set_root, policy_id, epoch, chain_id, min_streak
+//! Public:   solvent_set_root, policy_id, epoch, chain_id, min_streak, scope_hash
 //!
 //! 1. pk = g * sk                       (sk valid, nonzero)
 //! 2. address = keccak256(pk_uncompressed[1..65])[12..32]
 //! 3. assert streak >= min_streak       (time-dimension gate)
 //! 4. leaf = SHA256("zkpof-solvent-leaf-v2" || address || streak_be)
 //! 5. MerkleVerify(leaf, index, siblings, solvent_set_root)
-//! 6. N = hash_to_curve(msg_pol || pk, DST) * sk
-//! 7. nullifier_hash = SHA256(N_compressed)
-//! 8. commit abi.encode(root, policy_id, epoch, nullifier_hash, chain_id, min_streak)
+//! 6. N = hash_to_curve(scope_hash || sec1(pk), DST) * sk    (ERC-7524 form)
+//! 7. nullifier_hash = SHA256(sec1(N))
+//! 8. commit abi.encode(root, policy_id, epoch, nullifier_hash, chain_id,
+//!                      min_streak, scope_hash)
 //! ```
+//!
+//! `scope_hash` is a public input so the verifying contract can pin it to the
+//! policy's configured scope (default: `SHA256("zkpof-scope-v1:" || policy_id)`).
+//! Policies sharing a scope share member identities by design.
 //!
 //! The exact streak is a *private* input: the proof reveals only that the
 //! streak meets the policy's minimum, not how long the member has actually
@@ -23,8 +28,8 @@
 //! This module executes the statement natively (witness generation + testing)
 //! and defines the ABI encoding of the public values. The SP1 guest program
 //! must match this byte-for-byte; `SolventSetOracle.sol` decodes the same
-//! 192-byte blob with
-//! `abi.decode(..., (bytes32, bytes32, uint64, bytes32, uint64, uint64))`.
+//! 224-byte blob with
+//! `abi.decode(..., (bytes32, bytes32, uint64, bytes32, uint64, uint64, bytes32))`.
 
 use crate::{plume, solvent_set};
 use anyhow::{bail, Result};
@@ -53,13 +58,16 @@ pub struct MembershipPublicValues {
     pub chain_id: u64,
     /// The minimum streak this proof attests to (`witness.streak >= min_streak`).
     pub min_streak: u64,
+    /// The scope the nullifier is bound to (policy default, or a shared scope).
+    pub scope_hash: [u8; 32],
 }
 
-/// ABI-encoded size: six 32-byte words.
-pub const PUBLIC_VALUES_LEN: usize = 192;
+/// ABI-encoded size: seven 32-byte words.
+pub const PUBLIC_VALUES_LEN: usize = 224;
 
 impl MembershipPublicValues {
-    /// `abi.encode(bytes32, bytes32, uint64, bytes32, uint64, uint64)` — 192 bytes.
+    /// `abi.encode(bytes32, bytes32, uint64, bytes32, uint64, uint64, bytes32)`
+    /// — 224 bytes.
     pub fn abi_encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(PUBLIC_VALUES_LEN);
         out.extend_from_slice(&self.solvent_set_root);
@@ -71,10 +79,11 @@ impl MembershipPublicValues {
         out.extend_from_slice(&self.chain_id.to_be_bytes());
         out.extend_from_slice(&[0u8; 24]);
         out.extend_from_slice(&self.min_streak.to_be_bytes());
+        out.extend_from_slice(&self.scope_hash);
         out
     }
 
-    /// Decode and validate a 192-byte public-values blob.
+    /// Decode and validate a 224-byte public-values blob.
     pub fn abi_decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != PUBLIC_VALUES_LEN {
             bail!(
@@ -99,6 +108,8 @@ impl MembershipPublicValues {
         nullifier_hash.copy_from_slice(&bytes[96..128]);
         let chain_id = u64::from_be_bytes(bytes[152..160].try_into().unwrap());
         let min_streak = u64::from_be_bytes(bytes[184..192].try_into().unwrap());
+        let mut scope_hash = [0u8; 32];
+        scope_hash.copy_from_slice(&bytes[192..224]);
         Ok(Self {
             solvent_set_root,
             policy_id,
@@ -106,6 +117,7 @@ impl MembershipPublicValues {
             nullifier_hash,
             chain_id,
             min_streak,
+            scope_hash,
         })
     }
 }
@@ -122,6 +134,7 @@ pub fn execute_membership_statement(
     epoch: u64,
     chain_id: u64,
     min_streak: u64,
+    scope_hash: &[u8; 32],
 ) -> Result<MembershipPublicValues> {
     // 1-2. Key and address derivation (rejects zero/non-canonical sk).
     let pk = plume::derive_public_key(&witness.sk)?;
@@ -147,8 +160,8 @@ pub fn execute_membership_statement(
         bail!("Membership path does not verify against the solvent-set root");
     }
 
-    // 6-7. Deterministic nullifier bound to this policy.
-    let nullifier = plume::compute_nullifier(&witness.sk, policy_id)?;
+    // 6-7. Deterministic nullifier bound to this scope.
+    let nullifier = plume::compute_nullifier(&witness.sk, scope_hash)?;
     let nullifier_hash = plume::nullifier_hash(&nullifier);
 
     Ok(MembershipPublicValues {
@@ -158,6 +171,7 @@ pub fn execute_membership_statement(
         nullifier_hash,
         chain_id,
         min_streak,
+        scope_hash: *scope_hash,
     })
 }
 
@@ -167,6 +181,10 @@ mod tests {
     use crate::solvent_set::{SolventEntry, SolventSet};
 
     const POLICY: [u8; 32] = [0xCD; 32];
+
+    fn scope() -> [u8; 32] {
+        plume::default_scope_hash(&POLICY)
+    }
 
     fn sk(n: u8) -> [u8; 32] {
         let mut out = [0u8; 32];
@@ -210,14 +228,14 @@ mod tests {
         let witness = witness_for(&set, secret);
 
         let public =
-            execute_membership_statement(&witness, &root, &POLICY, 42, 1, 2).unwrap();
+            execute_membership_statement(&witness, &root, &POLICY, 42, 1, 2, &scope()).unwrap();
 
         assert_eq!(public.solvent_set_root, root);
         assert_eq!(public.epoch, 42);
         assert_eq!(public.chain_id, 1);
         assert_eq!(public.min_streak, 2);
         // Identity unification: nullifier_hash == memberId from the enrollment path.
-        let expected_nullifier = plume::compute_nullifier(&secret, &POLICY).unwrap();
+        let expected_nullifier = plume::compute_nullifier(&secret, &scope()).unwrap();
         assert_eq!(public.nullifier_hash, plume::nullifier_hash(&expected_nullifier));
     }
 
@@ -230,9 +248,9 @@ mod tests {
         let root = set.root();
         let witness = witness_for(&set, secret);
 
-        assert!(execute_membership_statement(&witness, &root, &POLICY, 42, 1, 3).is_ok());
+        assert!(execute_membership_statement(&witness, &root, &POLICY, 42, 1, 3, &scope()).is_ok());
         let err =
-            execute_membership_statement(&witness, &root, &POLICY, 42, 1, 4).unwrap_err();
+            execute_membership_statement(&witness, &root, &POLICY, 42, 1, 4, &scope()).unwrap_err();
         assert!(err.to_string().contains("Streak"), "got: {err}");
     }
 
@@ -245,7 +263,7 @@ mod tests {
         let mut witness = witness_for(&set, secret);
         witness.streak = 5;
 
-        assert!(execute_membership_statement(&witness, &root, &POLICY, 42, 1, 5).is_err());
+        assert!(execute_membership_statement(&witness, &root, &POLICY, 42, 1, 5, &scope()).is_err());
     }
 
     #[test]
@@ -263,7 +281,7 @@ mod tests {
             leaf_index: member_witness.leaf_index,
             siblings: member_witness.siblings,
         };
-        assert!(execute_membership_statement(&stolen, &root, &POLICY, 42, 1, 1).is_err());
+        assert!(execute_membership_statement(&stolen, &root, &POLICY, 42, 1, 1, &scope()).is_err());
     }
 
     #[test]
@@ -272,7 +290,7 @@ mod tests {
         let set = set_with_keys(&[(secret, 1)]);
         let witness = witness_for(&set, secret);
         let wrong_root = [0xEE; 32];
-        assert!(execute_membership_statement(&witness, &wrong_root, &POLICY, 42, 1, 1).is_err());
+        assert!(execute_membership_statement(&witness, &wrong_root, &POLICY, 42, 1, 1, &scope()).is_err());
     }
 
     #[test]
@@ -284,6 +302,7 @@ mod tests {
             nullifier_hash: [0x03; 32],
             chain_id: 11155111,
             min_streak: 12,
+            scope_hash: [0x07; 32],
         };
         let encoded = public.abi_encode();
         assert_eq!(encoded.len(), PUBLIC_VALUES_LEN);
@@ -302,6 +321,7 @@ mod tests {
             nullifier_hash: [0xCC; 32],
             chain_id: 5,
             min_streak: 9,
+            scope_hash: [0xDD; 32],
         };
         let encoded = public.abi_encode();
         assert_eq!(&encoded[0..32], &[0xAA; 32]);
@@ -312,6 +332,7 @@ mod tests {
         assert_eq!(encoded[159], 5);
         assert_eq!(&encoded[160..191], &[0u8; 31]);
         assert_eq!(encoded[191], 9);
+        assert_eq!(&encoded[192..224], &[0xDD; 32]);
     }
 
     #[test]
@@ -323,9 +344,10 @@ mod tests {
             nullifier_hash: [0x03; 32],
             chain_id: 1,
             min_streak: 1,
+            scope_hash: [0x02; 32],
         };
         let mut encoded = public.abi_encode();
-        assert!(MembershipPublicValues::abi_decode(&encoded[..191]).is_err());
+        assert!(MembershipPublicValues::abi_decode(&encoded[..223]).is_err());
         encoded[64] = 0xFF; // dirty padding
         assert!(MembershipPublicValues::abi_decode(&encoded).is_err());
     }

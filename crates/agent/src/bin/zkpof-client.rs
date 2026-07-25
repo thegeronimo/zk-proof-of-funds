@@ -7,6 +7,9 @@
 //! solvent-set flow).
 //!
 //! Subcommands:
+//!   (every subcommand accepts an optional --scope <hex32> to bind the
+//!    nullifier to a shared scope instead of the policy's default)
+//!
 //!   nullifier --sk <hex32> --policy <hex32>
 //!       Compute the deterministic nullifier + DLEQ proof; prints the JSON
 //!       body for POST /v2/enroll.
@@ -16,6 +19,11 @@
 //!       Download the public solvent set, locate the caller's address
 //!       locally, and print the membership witness (leaf index, streak,
 //!       siblings) plus the set metadata.
+//!   scan-witness --rpc <url> --token <hex20> --from <block> --to <block>
+//!             [--execute-only]
+//!       Stage B.2: rebuild the receipts tries for a block range (self-
+//!       verified against each header's receiptsRoot), then run the
+//!       receipt-scan program to produce the completeness commitment.
 //!   prove     --sk <hex32> --policy <hex32> --agent <url>
 //!             [--min-streak <n>] [--chain-id <n>] [--execute-only]
 //!       Build the witness and run the SP1 membership program: with
@@ -56,6 +64,9 @@ struct Common {
     sk: [u8; 32],
     policy_id: [u8; 32],
     policy_hex: String,
+    /// Scope the nullifier binds to — the policy default unless `--scope`
+    /// selects a shared one.
+    scope_hash: [u8; 32],
 }
 
 fn common_args(args: &[String]) -> Result<Common> {
@@ -65,20 +76,26 @@ fn common_args(args: &[String]) -> Result<Common> {
     )?;
     let policy_arg = arg_value(args, "--policy").context("--policy <hex32> is required")?;
     let policy_id = parse_policy_id(&policy_arg)?;
+    let scope_hash = match arg_value(args, "--scope") {
+        Some(scope) => parse_hex32(&scope, "--scope")?,
+        None => plume::default_scope_hash(&policy_id),
+    };
     Ok(Common {
         sk,
         policy_id,
         policy_hex: hex::encode(policy_id),
+        scope_hash,
     })
 }
 
 /// The JSON body for POST /v2/enroll.
 fn enrollment_body(common: &Common) -> Result<serde_json::Value> {
     let public_key = plume::derive_public_key(&common.sk)?;
-    let (nullifier, proof) = plume::prove_nullifier(&common.sk, &common.policy_id)?;
+    let (nullifier, proof) = plume::prove_nullifier(&common.sk, &common.scope_hash)?;
     let member_id = plume::nullifier_hash(&nullifier);
     Ok(serde_json::json!({
         "policy_id": common.policy_hex,
+        "scope_hash": hex::encode(common.scope_hash),
         "public_key": hex::encode(public_key),
         "nullifier": hex::encode(nullifier),
         "dleq_a": hex::encode(proof.a),
@@ -235,6 +252,7 @@ async fn main() -> Result<()> {
             if has_flag(&args, "--execute-only") {
                 let public_values = membership_prover::execute_membership_program(
                     elf, &witness, &root, &common.policy_id, epoch, chain_id, min_streak,
+                    &common.scope_hash,
                 )?;
                 println!(
                     "{}",
@@ -249,6 +267,7 @@ async fn main() -> Result<()> {
             } else {
                 let (proof_bytes, public_values) = membership_prover::prove_membership(
                     elf, &witness, &root, &common.policy_id, epoch, chain_id, min_streak,
+                    &common.scope_hash,
                 )?;
                 println!(
                     "{}",
@@ -263,7 +282,57 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        other => bail!("Unknown command: {other} (expected nullifier|enroll|witness|prove)"),
+        "scan-witness" => {
+            let rpc_url = arg_value(&args, "--rpc").context("--rpc <url> is required")?;
+            let token_hex = arg_value(&args, "--token").context("--token <hex20> is required")?;
+            let from_block: u64 = arg_value(&args, "--from")
+                .context("--from <block> is required")?
+                .parse()
+                .context("Invalid --from")?;
+            let to_block: u64 = arg_value(&args, "--to")
+                .context("--to <block> is required")?
+                .parse()
+                .context("Invalid --to")?;
+
+            let clean = token_hex.strip_prefix("0x").unwrap_or(&token_hex);
+            let token_bytes = hex::decode(clean).context("Invalid --token hex")?;
+            if token_bytes.len() != 20 {
+                bail!("--token must be 20 bytes");
+            }
+            let mut token = [0u8; 20];
+            token.copy_from_slice(&token_bytes);
+
+            let rpc = zk_pof_agent::rpc_fetcher::RpcFetcher::new(&rpc_url)?;
+            // Each block is self-verified: header hash and receipts root must
+            // reproduce, so a bad reconstruction fails here, not in the prover.
+            let witness =
+                zk_pof_agent::scan_witness::build_scan_witness(&rpc, from_block, to_block).await?;
+
+            let elf = zk_pof_agent::scan_prover::load_scan_elf()?;
+            let public_values = if has_flag(&args, "--execute-only") {
+                zk_pof_agent::scan_prover::execute_scan_program(elf, &witness, &token)?
+            } else {
+                let (proof_bytes, pv) =
+                    zk_pof_agent::scan_prover::prove_scan(elf, &witness, &token)?;
+                println!("proof_bytes: {}", hex::encode(proof_bytes));
+                pv
+            };
+
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "blocks": witness.headers.len(),
+                    "token": hex::encode(public_values.token),
+                    "end_block_hash": hex::encode(public_values.end_block_hash),
+                    "participants_root": hex::encode(public_values.participants_root),
+                    "participant_count": public_values.participant_count,
+                    "public_values_abi": hex::encode(public_values.abi_encode()),
+                }))?
+            );
+        }
+        other => bail!(
+            "Unknown command: {other} (expected nullifier|enroll|witness|prove|scan-witness)"
+        ),
     }
     Ok(())
 }

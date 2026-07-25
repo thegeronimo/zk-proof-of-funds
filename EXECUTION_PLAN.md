@@ -17,6 +17,7 @@
 | 10 | Privacy V2 | Solvent-set membership + deterministic nullifiers (see PRIVACY_V2.md) | 3-5 days | ✅ DONE (initial) |
 | 11 | Privacy V2 Completion | Proven set derivation (Stage B), streak solvency, client tooling | 3-5 days | ✅ DONE |
 | 12 | Privacy V2 Follow-ups | ERC-20 proven builds, Stage B.2 completeness, wallet crypto, vkeys | 3-5 days | ✅ DONE |
+| 13 | Privacy V2 Closeout | ERC-7524 nullifiers + scopes, on-chain completeness, witness tooling | 3-5 days | ✅ DONE |
 
 **Total estimated effort: 28-46 days**
 
@@ -790,3 +791,58 @@ transit from the legacy path.
 - [ ] Receipt-scan witness tooling (fetch raw receipts, rebuild tries)
 - [ ] MetaMask snap packaging around `sdk/plume`
 - [ ] Browser-native membership prover (dedicated circuit + trusted setup)
+
+
+---
+
+## Phase 13: Privacy V2 Closeout — ERC-7524 Alignment, Composition, Witness Tooling
+
+**Goal**: Resolve every item PRIVACY_V2.md §7 still listed, either by
+implementing it or by establishing (with evidence) that it is the wrong
+solution shape and recording what replaces it.
+
+### Research finding that reshaped the plan
+
+MetaMask snaps **cannot** derive coin type 60 (it is reserved for MetaMask's
+own EOAs), so a snap can never compute a PLUME nullifier for the user's
+address — snap packaging was not a missing sprint, it was the wrong shape.
+The path that works is wallet-native PLUME via **ERC-7524**
+(`eth_getPlumeSignature`), which motivated 13.1.
+
+### Delivered
+
+- [x] **13.1** Nullifier realigned to ERC-7524: `N = htc(m ‖ sec1(pk))^sk`
+  with the standard `secp256k1_XMD:SHA-256_SSWU_RO_` suite over a 32-byte
+  message. A wallet implementing the ERC now derives the *same* member
+  identity — wallet support becomes an integration, not a redesign.
+- [x] **13.2** Scopes: `m` is a `scope_hash`, defaulting to
+  `SHA256("zkpof-scope-v1:" ‖ policy_id)` (so policies stay mutually
+  unlinkable) and configurable per policy for deliberate cross-policy shared
+  identity. Membership publics carry `scopeHash` (224 bytes) and
+  `SolventSetOracle` pins it via `effectiveScopeHash` / `setScopeHash`.
+  Surfaced end-to-end: enrollment, `/v2/enroll`, `zkpof-client --scope`, JS.
+- [x] **13.3** Schema fix found by the new shared-scope test: `members` was
+  keyed by `member_id` alone, which made a shared identity unable to enroll in
+  two policies. Key is now `(member_id, policy_id)`, with policy-scoped
+  read/update helpers so one policy's epoch cannot clobber another's row.
+- [x] **13.4** On-chain Stage B.2 composition:
+  `publishRootProvenComplete` verifies the scan proof, enforces
+  `participantsRoot == candidatesRoot`, requires the scan to cover the
+  policy's token and end at the chain tip, and `requiresCompleteness` makes it
+  mandatory per policy.
+- [x] **13.5** Receipt-scan witness tooling: an ordered MPT **builder** in
+  `crates/common/src/mpt.rs` (cross-checked byte-for-byte against the
+  independent fixture constructions), plus `agent::scan_witness` +
+  `zkpof-client scan-witness`, which rebuild headers and receipts tries and
+  self-verify against `block.hash` / `receiptsRoot` before proving.
+- [x] **13.6** `wallet_address` in `/submit_proof` now rejected by default
+  (`ZKPOF_ALLOW_PLAINTEXT_ADDRESS=1` re-enables for un-migrated integrators).
+- [x] **13.7** Vkeys regenerated for all three guests; docs rewritten so §7
+  distinguishes *closed*, *genuinely remaining*, and *not planned*.
+
+### Remaining (PRIVACY_V2.md §7)
+
+- [ ] Native-ETH completeness (needs proven state enumeration — Stage C)
+- [ ] Scan-range provenance (pin deployment block or a proven checkpoint)
+- [ ] ERC-7524 proof-format adapter (against reference vectors)
+- [ ] Browser-native prover (dedicated circuit + trusted setup ceremony)

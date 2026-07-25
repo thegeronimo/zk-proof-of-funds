@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildEnrollV2Request,
   computeNullifier,
+  defaultScopeHash,
   deriveAddress,
   derivePublicKey,
   nullifierHash,
@@ -24,46 +25,50 @@ const VECTORS = [
   {
     sk: sk(1),
     policy: POLICY_A,
+    scope: "f2f663bc1f127fb5d6768d326ecda701316060876b4d0338e5f003d19d7e002a",
     pk: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
     address: "7e5f4552091a69125d5dfcb7b8c2659029395bdf",
-    nullifier: "031abe84e28937be502538e990eadbda53c379cb71ba0d2f6ea162161106413041",
-    memberId: "9a826ff9a89fa9947a093bbb99787a52eab4e78e8797c1a2ceb73595649422c9",
-    dleqA: "024a6a79688d0e53a682f44d0d60686cb2352788e218fc830d348128ef647a0b14",
-    dleqB: "027b18836921385a21ba60ac74db9ff22beeb4b8ef0a591b919882cf6b8f66dd4a",
-    dleqS: "4b86e1a4fd3d41c02220303e9ebb40d8fe9cf3690181fb5d2386c46b4f271a4b",
+    nullifier: "0208800be4188ee769e3f402ebff746b22b5bf6a76f276e4f7ba576fa9270c6078",
+    memberId: "1e770599c45f2a26dff2df97ed61100088bbdd4808dfc3db0fb9f7b27bc7ebf9",
+    dleqA: "02739797ad13cb8407a861b25c6204768c4e8a61b5891984ca1ef1e3cc890f2d27",
+    dleqB: "0305dddfce25778bed2d8b648be242b2891cdd2932f72ff47d99f3e6bed6ea0e87",
+    dleqS: "e64c12e2a4fcce1523c4bc731fd8f3d133723301d457e85e48982f75e59c514c",
   },
   {
     sk: sk(2),
     policy: POLICY_A,
+    scope: "f2f663bc1f127fb5d6768d326ecda701316060876b4d0338e5f003d19d7e002a",
     pk: "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
     address: "2b5ad5c4795c026514f8317c7a215e218dccd6cf",
-    nullifier: "03011469c56fc10d3958b5e9a7119abe801384b72fe2597d1cfc873729925bc5c9",
-    memberId: "131955d85fd70c39c74f5e28c58d92f61f67030e6afdf98bb08d518468074565",
-    dleqA: "03fee03ead2cc0e53c7b82d0947ebb813f52a3aca73de344e0eea79015f53d25ab",
-    dleqB: "03a1cf8189a7a73f758b0860a2cfc74ee89ed03795f00adc8c51e12d4b4fed7bb7",
-    dleqS: "da3396e6f9c5aa353a4b641d3b750e7aa79a58f64db38fa84e81445abe401ede",
+    nullifier: "0355f2537af7a23a3975d38fdafe77c5a3e2ccd08e62081ab9d53ce860ba322613",
+    memberId: "34139843031d7b9c1b53a423ac9cd47f9a4a617b84fac140b71ca79785d8edc0",
+    dleqA: "0246eeada1e56143fbd5a515806fec31248dd540bb7c15d6ffee6f01a6e3bb09c4",
+    dleqB: "03ddb68ebe5781d2470e1deb0260055bf750ea24bf55fb2d5db216e4de03c12e71",
+    dleqS: "a5fcbfa759421c100c756aa512bee372db9219eb8ede0fcc019f61df2e724730",
   },
   {
     sk: sk(42),
     policy: POLICY_A,
+    scope: "f2f663bc1f127fb5d6768d326ecda701316060876b4d0338e5f003d19d7e002a",
     pk: "02fe8d1eb1bcb3432b1db5833ff5f2226d9cb5e65cee430558c18ed3a3c86ce1af",
     address: "ae3dffee97f92db0201d11cb8877c89738353bce",
-    nullifier: "027e35dc7e9853f959ced254168dd9177b4d6b45158ffe39876ef1df3d78c4c37e",
-    memberId: "4b97c95e5737f97f90b8cbc187fae0f2b13b9100eb07bd5143eebf19e80bd5dd",
-    dleqA: "03f963c418dcbdac28578be3e6a16fa03eef0ca9b2c39fdd653ccfc59f29d6ee11",
-    dleqB: "030c58a53ba2381def8c17a7c39f7bae07931158df9b58bde00b2519de9c545775",
-    dleqS: "d7988f47f41be9b9c0efc423f03d32e83e164661823380546eab8a5585b2ce53",
+    nullifier: "02987f292dd60d4e148e61b73ce38d73f73918997bbbd89f7a9aab0aea620e2ca0",
+    memberId: "f0e888e7a9ae70f3d7aec2f75bda8b67531c4c25a5cd70428a645b9fbdc7d42e",
+    dleqA: "02db1042ec04bb35ca5e3c978e7a71cb36064ab688d2c314789c9365f502f3e31d",
+    dleqB: "03cece2dd899baf05b1dc8a61d0aee13b80cf4f2c23eb0cbb343e4e64ecf944041",
+    dleqS: "5ad32c4a50ce2f38ccefbf36f82d1780cbb1203b0a0a5b7dbe7db9b53aea7245",
   },
   {
     sk: sk(42),
     policy: POLICY_B,
+    scope: "0417eac0bbbdc0f07c6245beb11b8ae735726402c10ebcfd7d007d63a3bc0965",
     pk: "02fe8d1eb1bcb3432b1db5833ff5f2226d9cb5e65cee430558c18ed3a3c86ce1af",
     address: "ae3dffee97f92db0201d11cb8877c89738353bce",
-    nullifier: "021746fde3a15f887eada1b75b84c7e2523ffc1a8a6709230e2d1123f5050fca92",
-    memberId: "f7eeb0b9cbdaa4b9223b92a37e66c2182f83e5a6a72fb7ae1bce5d79134f51ac",
-    dleqA: "020b6a379a8c9ec0ba318fb225c5b2f01cb6d940e857c487918fc72e004e7d0a78",
-    dleqB: "0240565e7f63f4b0dc9fd71a443340dfac19d4e8499b0d6566cf1805f0e54a28c8",
-    dleqS: "92bdfe9d2a28abaaf690116bb942dbeba7cb27bc48723cb98377c05b35241907",
+    nullifier: "02e79574f347b3a600aa7baad64e2af69a152d32e64441cd0978a11523a6f72b45",
+    memberId: "8fbfede7bf6383ec94089ef16f0064ba65910451cb2591765a9f43b10b154843",
+    dleqA: "030d174fd12a9335db2afaacaf0c7dfe29a597aac44a0c9a8e7c974e10f0835265",
+    dleqB: "020e6b05441090f47144a021390d3114d2e56cd51a424914e7ff7df95bc017afc0",
+    dleqS: "a5d83c10f550d5b1f59859312dad5bcedd9723acf7b2564194b347a44d762103",
   },
 ];
 
@@ -71,10 +76,11 @@ describe("plume (cross-language vectors)", () => {
   it.each(VECTORS)("matches the Rust reference for sk=$sk", (vector) => {
     expect(derivePublicKey(vector.sk)).toBe(vector.pk);
     expect(deriveAddress(vector.pk)).toBe(vector.address);
-    expect(computeNullifier(vector.sk, vector.policy)).toBe(vector.nullifier);
+    expect(defaultScopeHash(vector.policy)).toBe(vector.scope);
+    expect(computeNullifier(vector.sk, vector.scope)).toBe(vector.nullifier);
     expect(nullifierHash(vector.nullifier)).toBe(vector.memberId);
 
-    const bundle = proveNullifier(vector.sk, vector.policy);
+    const bundle = proveNullifier(vector.sk, vector.scope);
     expect(bundle.publicKey).toBe(vector.pk);
     expect(bundle.nullifier).toBe(vector.nullifier);
     expect(bundle.memberId).toBe(vector.memberId);
@@ -84,25 +90,35 @@ describe("plume (cross-language vectors)", () => {
   });
 
   it("verifies its own proofs and rejects tampering", () => {
-    const bundle = proveNullifier(sk(7), POLICY_A);
-    expect(verifyNullifier(bundle.publicKey, bundle.nullifier, POLICY_A, bundle.dleq)).toBe(true);
+    const scopeA = defaultScopeHash(POLICY_A);
+    const scopeB = defaultScopeHash(POLICY_B);
+    const bundle = proveNullifier(sk(7), scopeA);
+    expect(verifyNullifier(bundle.publicKey, bundle.nullifier, scopeA, bundle.dleq)).toBe(true);
 
-    // Wrong policy → different base point → fails.
-    expect(verifyNullifier(bundle.publicKey, bundle.nullifier, POLICY_B, bundle.dleq)).toBe(false);
+    // Wrong scope → different base point → fails.
+    expect(verifyNullifier(bundle.publicKey, bundle.nullifier, scopeB, bundle.dleq)).toBe(false);
 
     // Someone else's nullifier under our key → fails.
-    const other = proveNullifier(sk(8), POLICY_A);
-    expect(verifyNullifier(bundle.publicKey, other.nullifier, POLICY_A, other.dleq)).toBe(false);
+    const other = proveNullifier(sk(8), scopeA);
+    expect(verifyNullifier(bundle.publicKey, other.nullifier, scopeA, other.dleq)).toBe(false);
 
     // Tampered response → fails.
     const tampered = { ...bundle.dleq, s: bundle.dleq.s.slice(0, -2) + "00" };
-    expect(verifyNullifier(bundle.publicKey, bundle.nullifier, POLICY_A, tampered)).toBe(false);
+    expect(verifyNullifier(bundle.publicKey, bundle.nullifier, scopeA, tampered)).toBe(false);
+  });
+
+  it("gives one identity across policies that share a scope", () => {
+    const shared = "5c".repeat(32);
+    const a = proveNullifier(sk(7), shared);
+    const b = proveNullifier(sk(7), shared);
+    expect(a.memberId).toBe(b.memberId);
+    expect(a.memberId).not.toBe(proveNullifier(sk(7), defaultScopeHash(POLICY_A)).memberId);
   });
 
   it("verifies the Rust-generated proofs directly", () => {
     for (const vector of VECTORS) {
       expect(
-        verifyNullifier(vector.pk, vector.nullifier, vector.policy, {
+        verifyNullifier(vector.pk, vector.nullifier, vector.scope, {
           a: vector.dleqA,
           b: vector.dleqB,
           s: vector.dleqS,
@@ -114,8 +130,13 @@ describe("plume (cross-language vectors)", () => {
   it("builds a complete /v2/enroll request body", () => {
     const body = buildEnrollV2Request(sk(42), `0x${POLICY_A}`);
     expect(body.policy_id).toBe(POLICY_A);
+    expect(body.scope_hash).toBe(VECTORS[2].scope);
     expect(body.public_key).toBe(VECTORS[2].pk);
     expect(body.nullifier).toBe(VECTORS[2].nullifier);
+
+    // An explicit shared scope overrides the policy default.
+    const shared = "5c".repeat(32);
+    expect(buildEnrollV2Request(sk(42), POLICY_A, shared).scope_hash).toBe(shared);
   });
 
   it("rejects invalid secret keys", () => {

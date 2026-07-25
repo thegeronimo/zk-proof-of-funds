@@ -1,0 +1,21 @@
+[package]
+name = "zk-pof-membership-program"
+version = "0.1.0"
+edition = "2021"
+
+# This crate compiles to RISC-V for SP1 execution.
+# Build with: cd program-membership && cargo prove build
+
+[dependencies]
+# SP1 zkVM guest library — provides io::read/commit and entrypoint macro
+sp1-zkvm = "6"
+
+# The membership statement itself lives in the shared crate so the guest and
+# the host-side mirror (crates/common/src/membership.rs) are the same code —
+# no duplication drift on the security-critical logic.
+zk-pof-common = { path = "../crates/common" }
+
+# Standalone: not part of the root workspace (also listed in its `exclude`).
+# The explicit empty table keeps `cargo prove build` working even when the
+# checkout is nested inside another workspace (e.g. git worktrees).
+[workspace]

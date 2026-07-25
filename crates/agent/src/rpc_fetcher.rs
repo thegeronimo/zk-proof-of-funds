@@ -180,6 +180,50 @@ impl RpcFetcher {
         Ok((balance_u128, proof_nodes))
     }
 
+    /// Fetch an EIP-1186 proof with storage keys: the account proof plus one
+    /// storage proof per requested slot (aligned with `storage_slots` order).
+    ///
+    /// Used for ERC-20 proven builds: one call against the token contract
+    /// yields its account proof and every candidate's balance-slot proof.
+    pub async fn get_proof_with_storage(
+        &self,
+        address_hex: &str,
+        storage_slots: &[[u8; 32]],
+        block_number: u64,
+    ) -> Result<(Vec<Vec<u8>>, Vec<Vec<Vec<u8>>>)> {
+        use alloy::primitives::B256;
+
+        let addr = Address::from_str(address_hex)
+            .context("Invalid address")?;
+        let keys: Vec<B256> = storage_slots.iter().map(|s| B256::from(*s)).collect();
+
+        let response = self.provider
+            .get_proof(addr, keys)
+            .block_id(alloy::eips::BlockNumberOrTag::Number(block_number).into())
+            .await
+            .context("eth_getProof RPC call failed")?;
+
+        let account_proof: Vec<Vec<u8>> = response
+            .account_proof
+            .iter()
+            .map(|node| node.to_vec())
+            .collect();
+
+        anyhow::ensure!(
+            response.storage_proof.len() == storage_slots.len(),
+            "eth_getProof returned {} storage proofs for {} keys",
+            response.storage_proof.len(),
+            storage_slots.len()
+        );
+        let storage_proofs: Vec<Vec<Vec<u8>>> = response
+            .storage_proof
+            .iter()
+            .map(|sp| sp.proof.iter().map(|node| node.to_vec()).collect())
+            .collect();
+
+        Ok((account_proof, storage_proofs))
+    }
+
     /// Get the state root for a specific block.
     ///
     /// The state root is needed as input to the SP1 program for MPT verification.
@@ -200,6 +244,253 @@ impl RpcFetcher {
     pub fn rpc_url(&self) -> &str {
         &self.rpc_url
     }
+
+    /// Get the chain ID of the connected node.
+    pub async fn get_chain_id(&self) -> Result<u64> {
+        self.provider
+            .get_chain_id()
+            .await
+            .context("eth_chainId RPC call failed")
+    }
+
+    /// Get the hash of a specific block (entropy for reference-block selection).
+    pub async fn get_block_hash(&self, block_number: u64) -> Result<[u8; 32]> {
+        let block = self.provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Number(block_number))
+            .hashes()
+            .await
+            .context("Failed to fetch block")?
+            .context("Block not found")?;
+
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(block.header.hash.as_slice());
+        Ok(hash)
+    }
+
+    // --- Stage B.2: receipt-scan witness building ---
+
+    /// Reconstruct a block's RLP header and return `(header_rlp, block_hash)`.
+    ///
+    /// Standard JSON-RPC exposes header *fields*, not the canonical encoding,
+    /// so we re-encode them. Post-merge and post-Cancun/Prague headers carry
+    /// optional trailing fields (withdrawalsRoot, blobGasUsed, excessBlobGas,
+    /// parentBeaconBlockRoot, requestsHash); each is appended only when the
+    /// node reports it, which keeps the encoding correct across forks. The
+    /// caller verifies `keccak256(header_rlp) == block_hash`, so a wrong
+    /// reconstruction can never pass silently.
+    pub async fn get_raw_header(&self, block_number: u64) -> Result<(Vec<u8>, [u8; 32])> {
+        use alloy::rpc::types::BlockTransactionsKind;
+
+        let block = self.provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Number(block_number))
+            .kind(BlockTransactionsKind::Hashes)
+            .await
+            .context("Failed to fetch block")?
+            .context("Block not found")?;
+
+        let h = &block.header.inner;
+        let mut items: Vec<Vec<u8>> = vec![
+            rlp_bytes(h.parent_hash.as_slice()),
+            rlp_bytes(h.ommers_hash.as_slice()),
+            rlp_bytes(h.beneficiary.as_slice()),
+            rlp_bytes(h.state_root.as_slice()),
+            rlp_bytes(h.transactions_root.as_slice()),
+            rlp_bytes(h.receipts_root.as_slice()),
+            rlp_bytes(h.logs_bloom.as_slice()),
+            rlp_uint_u256(h.difficulty),
+            rlp_uint(h.number as u128),
+            rlp_uint(h.gas_limit as u128),
+            rlp_uint(h.gas_used as u128),
+            rlp_uint(h.timestamp as u128),
+            rlp_bytes(&h.extra_data),
+            rlp_bytes(h.mix_hash.as_slice()),
+            rlp_bytes(&h.nonce.0),
+        ];
+        // Optional trailing fields, in canonical order.
+        if let Some(base_fee) = h.base_fee_per_gas {
+            items.push(rlp_uint(base_fee as u128));
+        }
+        if let Some(withdrawals_root) = h.withdrawals_root {
+            items.push(rlp_bytes(withdrawals_root.as_slice()));
+        }
+        if let Some(blob_gas_used) = h.blob_gas_used {
+            items.push(rlp_uint(blob_gas_used as u128));
+        }
+        if let Some(excess_blob_gas) = h.excess_blob_gas {
+            items.push(rlp_uint(excess_blob_gas as u128));
+        }
+        if let Some(parent_beacon_root) = h.parent_beacon_block_root {
+            items.push(rlp_bytes(parent_beacon_root.as_slice()));
+        }
+        if let Some(requests_hash) = h.requests_hash {
+            items.push(rlp_bytes(requests_hash.as_slice()));
+        }
+
+        let header_rlp = rlp_list(&items);
+        let mut block_hash = [0u8; 32];
+        block_hash.copy_from_slice(block.header.hash.as_slice());
+        Ok((header_rlp, block_hash))
+    }
+
+    /// Fetch every receipt of a block, already EIP-2718 encoded and ordered by
+    /// transaction index — the values of that block's receipts trie.
+    pub async fn get_block_receipts_encoded(&self, block_number: u64) -> Result<Vec<Vec<u8>>> {
+        use alloy::eips::eip2718::Encodable2718;
+
+        let receipts = self.provider
+            .get_block_receipts(alloy::eips::BlockNumberOrTag::Number(block_number).into())
+            .await
+            .context("eth_getBlockReceipts RPC call failed")?
+            .context("Block not found")?;
+
+        let mut encoded = Vec::with_capacity(receipts.len());
+        for receipt in receipts {
+            // EIP-2718: typed receipts are `type || rlp(body)`, legacy is bare.
+            let envelope = receipt.inner.map_logs(|l| l.inner);
+            encoded.push(envelope.encoded_2718());
+        }
+        Ok(encoded)
+    }
+
+    // --- Privacy V2: solvent-set derivation helpers ---
+
+    /// Get an ERC-20 balance at a specific block via `eth_call` of
+    /// `balanceOf(address)` (selector `0x70a08231`).
+    pub async fn get_erc20_balance_at_block(
+        &self,
+        token_hex: &str,
+        holder_hex: &str,
+        block_number: u64,
+    ) -> Result<u128> {
+        use alloy::primitives::{Bytes, TxKind, U256};
+        use alloy::rpc::types::{TransactionInput, TransactionRequest};
+
+        let token = Address::from_str(token_hex).context("Invalid token address")?;
+        let holder = Address::from_str(holder_hex).context("Invalid holder address")?;
+
+        let mut calldata = Vec::with_capacity(36);
+        calldata.extend_from_slice(&[0x70, 0xa0, 0x82, 0x31]); // balanceOf(address)
+        calldata.extend_from_slice(&[0u8; 12]);
+        calldata.extend_from_slice(holder.as_slice());
+
+        let tx = TransactionRequest {
+            to: Some(TxKind::Call(token)),
+            input: TransactionInput::new(Bytes::from(calldata)),
+            ..Default::default()
+        };
+
+        let output = self.provider
+            .call(tx)
+            .block(alloy::eips::BlockNumberOrTag::Number(block_number).into())
+            .await
+            .context("eth_call balanceOf failed")?;
+
+        if output.len() < 32 {
+            anyhow::bail!("balanceOf returned {} bytes, expected 32", output.len());
+        }
+        let balance = U256::from_be_slice(&output[..32]);
+        Ok(balance.try_into().unwrap_or(u128::MAX))
+    }
+
+    /// Fetch ERC-20 `Transfer` event logs for a token over a block range.
+    ///
+    /// Used for solvent-set candidate discovery: every address that has sent
+    /// or received the token in the range is a candidate whose balance is then
+    /// checked at the reference block.
+    pub async fn get_transfer_logs(
+        &self,
+        token_hex: &str,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<alloy::rpc::types::Log>> {
+        use alloy::primitives::B256;
+        use alloy::rpc::types::Filter;
+
+        let token = Address::from_str(token_hex).context("Invalid token address")?;
+        let filter = Filter::new()
+            .address(token)
+            .event_signature(B256::from(TRANSFER_EVENT_TOPIC))
+            .from_block(from_block)
+            .to_block(to_block);
+
+        self.provider
+            .get_logs(&filter)
+            .await
+            .context("eth_getLogs RPC call failed")
+    }
+}
+
+/// RLP helpers for header reconstruction.
+fn rlp_bytes(data: &[u8]) -> Vec<u8> {
+    if data.len() == 1 && data[0] < 0x80 {
+        return data.to_vec();
+    }
+    let mut out = Vec::with_capacity(data.len() + 5);
+    if data.len() < 56 {
+        out.push(0x80 + data.len() as u8);
+    } else {
+        let len_bytes: Vec<u8> =
+            data.len().to_be_bytes().into_iter().skip_while(|b| *b == 0).collect();
+        out.push(0xB7 + len_bytes.len() as u8);
+        out.extend_from_slice(&len_bytes);
+    }
+    out.extend_from_slice(data);
+    out
+}
+
+fn rlp_list(items: &[Vec<u8>]) -> Vec<u8> {
+    let payload: Vec<u8> = items.concat();
+    let mut out = Vec::with_capacity(payload.len() + 9);
+    if payload.len() < 56 {
+        out.push(0xC0 + payload.len() as u8);
+    } else {
+        let len_bytes: Vec<u8> =
+            payload.len().to_be_bytes().into_iter().skip_while(|b| *b == 0).collect();
+        out.push(0xF7 + len_bytes.len() as u8);
+        out.extend_from_slice(&len_bytes);
+    }
+    out.extend_from_slice(&payload);
+    out
+}
+
+fn rlp_uint(value: u128) -> Vec<u8> {
+    let trimmed: Vec<u8> = value.to_be_bytes().into_iter().skip_while(|b| *b == 0).collect();
+    rlp_bytes(&trimmed)
+}
+
+fn rlp_uint_u256(value: alloy::primitives::U256) -> Vec<u8> {
+    let be = value.to_be_bytes::<32>();
+    let trimmed: Vec<u8> = be.into_iter().skip_while(|b| *b == 0).collect();
+    rlp_bytes(&trimmed)
+}
+
+/// `keccak256("Transfer(address,address,uint256)")` — topic0 of ERC-20 transfers.
+pub const TRANSFER_EVENT_TOPIC: [u8; 32] = [
+    0xdd, 0xf2, 0x52, 0xad, 0x1b, 0xe2, 0xc8, 0x9b, 0x69, 0xc2, 0xb0, 0x68, 0xfc, 0x37, 0x8d,
+    0xaa, 0x95, 0x2b, 0xa7, 0xf1, 0x63, 0xc4, 0xa1, 0x16, 0x28, 0xf5, 0x5a, 0x4d, 0xf5, 0x23,
+    0xb3, 0xef,
+];
+
+/// Extract the unique `from`/`to` participants from ERC-20 Transfer logs.
+///
+/// Returns lowercase hex addresses (no 0x prefix), sorted and deduplicated.
+/// Logs that are not standard indexed Transfers (fewer than 3 topics) are
+/// skipped.
+pub fn parse_transfer_participants(logs: &[alloy::rpc::types::Log]) -> Vec<String> {
+    use std::collections::BTreeSet;
+
+    let mut participants = BTreeSet::new();
+    for log in logs {
+        let topics = log.topics();
+        if topics.len() >= 3 && topics[0].as_slice() == TRANSFER_EVENT_TOPIC {
+            for topic in &topics[1..3] {
+                let mut addr = [0u8; 20];
+                addr.copy_from_slice(&topic.as_slice()[12..]);
+                participants.insert(hex::encode(addr));
+            }
+        }
+    }
+    participants.into_iter().collect()
 }
 
 // ─── Mock RPC Fetcher ────────────────────────────────────────────────────────
@@ -337,5 +628,53 @@ mod tests {
         let mock = MockRpcFetcher::new();
         mock.set_block_number(20_000_000);
         assert_eq!(mock.get_block_number_async().await, 20_000_000);
+    }
+
+    #[test]
+    fn test_parse_transfer_participants() {
+        use super::{parse_transfer_participants, TRANSFER_EVENT_TOPIC};
+        use alloy::primitives::{Address, B256, Log as PrimitiveLog, LogData};
+
+        fn topic_for(addr_byte: u8) -> B256 {
+            let mut bytes = [0u8; 32];
+            bytes[12..].copy_from_slice(&[addr_byte; 20]);
+            B256::from(bytes)
+        }
+
+        fn transfer_log(from: u8, to: u8) -> alloy::rpc::types::Log {
+            let inner = PrimitiveLog {
+                address: Address::ZERO,
+                data: LogData::new_unchecked(
+                    vec![B256::from(TRANSFER_EVENT_TOPIC), topic_for(from), topic_for(to)],
+                    Default::default(),
+                ),
+            };
+            alloy::rpc::types::Log { inner, ..Default::default() }
+        }
+
+        // Two transfers sharing a participant, plus a non-Transfer log (2 topics).
+        let mut logs = vec![transfer_log(0x01, 0x02), transfer_log(0x02, 0x03)];
+        let unrelated = alloy::rpc::types::Log {
+            inner: PrimitiveLog {
+                address: Address::ZERO,
+                data: LogData::new_unchecked(
+                    vec![B256::ZERO, topic_for(0x09)],
+                    Default::default(),
+                ),
+            },
+            ..Default::default()
+        };
+        logs.push(unrelated);
+
+        let participants = parse_transfer_participants(&logs);
+        assert_eq!(
+            participants,
+            vec![
+                hex::encode([0x01; 20]),
+                hex::encode([0x02; 20]),
+                hex::encode([0x03; 20]),
+            ],
+            "Participants must be deduped, sorted, and skip non-Transfer logs"
+        );
     }
 }

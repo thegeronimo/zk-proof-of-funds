@@ -11,6 +11,10 @@ thiserror = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 tiny-keccak = { workspace = true }
+k256 = { workspace = true }
+
+# EIP-1186 account-proof verification (shared with the SP1 guests)
+alloy-rlp = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 rand = { workspace = true }

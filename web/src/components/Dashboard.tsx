@@ -81,9 +81,11 @@ export default function Dashboard() {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const accountProof = (proofResponse as any).accountProof as string[];
 
-      // 3. Submit to agent — wallet_address is used transiently for MPT verification only
+      // 3. Submit to agent — send the trie key (keccak of the address,
+      //    computed here in the browser) so the address never transits.
+      const { computeTrieKey } = await import("@zk-proof-of-funds/sdk/plume");
       const result = await apiClient.submitProof(policyId, memberId, {
-        wallet_address: address,
+        trie_key: computeTrieKey(address),
         proof_nodes: accountProof,
         block_number: blockNum,
       });

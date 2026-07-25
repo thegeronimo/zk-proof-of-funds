@@ -1,1 +1,1 @@
-{"root":["./src/app.tsx","./src/main.tsx","./src/components/dashboard.tsx","./src/components/enrollmentflow.tsx","./src/components/proofviewer.tsx","./src/hooks/useweb3.ts","./src/services/apiclient.ts","./vite-env.d.ts"],"version":"5.9.3"}
+{"root":["./src/app.tsx","./src/main.tsx","./src/components/dashboard.tsx","./src/components/enrollmentflow.tsx","./src/components/proofviewer.tsx","./src/components/solventsetpanel.tsx","./src/hooks/useweb3.ts","./src/services/apiclient.ts","./vite-env.d.ts"],"version":"5.9.3"}

@@ -1,0 +1,1237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>ZK Proof of Funds - System Overview</title>
+    <style>
+@page {
+    size: A4;
+    margin: 2cm 2.5cm;
+    @bottom-center {
+        content: "Page " counter(page) " of " counter(pages);
+        font-size: 9px;
+        color: #888;
+        font-family: 'Helvetica Neue', Arial, sans-serif;
+    }
+    @top-right {
+        content: "ZK Proof of Funds";
+        font-size: 9px;
+        color: #888;
+        font-family: 'Helvetica Neue', Arial, sans-serif;
+    }
+}
+
+body {
+    font-family: 'Helvetica Neue', Arial, sans-serif;
+    font-size: 11px;
+    line-height: 1.65;
+    color: #1a1a2e;
+    max-width: 100%;
+}
+
+h1 {
+    font-size: 26px;
+    font-weight: 700;
+    color: #0f0f23;
+    margin-top: 2em;
+    margin-bottom: 0.5em;
+    padding-bottom: 0.3em;
+    border-bottom: 3px solid #4361ee;
+    page-break-after: avoid;
+}
+
+h1:first-of-type {
+    font-size: 32px;
+    text-align: center;
+    border-bottom: none;
+    margin-top: 0;
+    color: #4361ee;
+}
+
+h2 {
+    font-size: 18px;
+    font-weight: 600;
+    color: #2d2d5e;
+    margin-top: 1.8em;
+    margin-bottom: 0.6em;
+    padding-bottom: 0.2em;
+    border-bottom: 1px solid #ddd;
+    page-break-after: avoid;
+}
+
+h3 {
+    font-size: 14px;
+    font-weight: 600;
+    color: #3a3a6e;
+    margin-top: 1.4em;
+    margin-bottom: 0.4em;
+    page-break-after: avoid;
+}
+
+p {
+    margin-bottom: 0.8em;
+}
+
+strong {
+    color: #0f0f23;
+}
+
+code {
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: 10px;
+    background: #f4f4f8;
+    padding: 1px 4px;
+    border-radius: 3px;
+    color: #4361ee;
+}
+
+pre {
+    background: #f8f8fc;
+    border: 1px solid #e0e0ea;
+    border-left: 4px solid #4361ee;
+    border-radius: 6px;
+    padding: 12px 16px;
+    margin: 1em 0;
+    overflow-x: auto;
+    page-break-inside: avoid;
+}
+
+pre code {
+    background: none;
+    padding: 0;
+    color: #1a1a2e;
+    font-size: 9.5px;
+    line-height: 1.5;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1em 0;
+    font-size: 10.5px;
+    page-break-inside: avoid;
+}
+
+thead {
+    background: #4361ee;
+    color: white;
+}
+
+th {
+    padding: 8px 12px;
+    text-align: left;
+    font-weight: 600;
+    font-size: 10px;
+}
+
+td {
+    padding: 7px 12px;
+    border-bottom: 1px solid #eee;
+}
+
+tr:nth-child(even) td {
+    background: #fafaff;
+}
+
+blockquote {
+    border-left: 4px solid #4361ee;
+    margin: 1em 0;
+    padding: 0.5em 1em;
+    background: #f8f8fc;
+    color: #555;
+}
+
+hr {
+    border: none;
+    border-top: 2px solid #eee;
+    margin: 2em 0;
+}
+
+ul, ol {
+    margin-bottom: 0.8em;
+    padding-left: 1.5em;
+}
+
+li {
+    margin-bottom: 0.3em;
+}
+
+/* Title page styling */
+p:first-of-type {
+    text-align: center;
+    color: #666;
+    font-style: italic;
+}
+
+/* Subtitle line */
+body > p:nth-of-type(2) {
+    text-align: center;
+    color: #888;
+    font-size: 10px;
+}
+</style>
+</head>
+<body>
+<h1 id="zk-proof-of-funds-system-overview">ZK Proof of Funds: System Overview</h1>
+<p><strong>Privacy-Preserving Solvency Attestation for EVM Networks</strong></p>
+<p>Version 1.0 | February 2026</p>
+<hr />
+<h2 id="table-of-contents">Table of Contents</h2>
+<ol>
+<li><a href="#1-what-is-zk-proof-of-funds">What is ZK Proof of Funds?</a></li>
+<li><a href="#2-how-it-works-simple-version">How It Works (Simple Version)</a></li>
+<li><a href="#3-system-architecture">System Architecture</a></li>
+<li><a href="#4-for-end-users-members">For End Users (Members)</a></li>
+<li><a href="#5-for-service-providers-relying-protocols">For Service Providers (Relying Protocols)</a></li>
+<li><a href="#6-for-operators-running-the-solvency-agent">For Operators (Running the Solvency Agent)</a></li>
+<li><a href="#7-privacy--security-model">Privacy &amp; Security Model</a></li>
+<li><a href="#8-worked-example-tiered-credit-card-program">Worked Example: Tiered Credit Card Program</a></li>
+<li><a href="#9-technical-reference">Technical Reference</a></li>
+<li><a href="#10-glossary">Glossary</a></li>
+</ol>
+<hr />
+<h2 id="1-what-is-zk-proof-of-funds">1. What is ZK Proof of Funds?</h2>
+<p>ZK Proof of Funds is a <strong>middleware-driven solvency attestation system</strong> that lets users prove they hold a minimum balance on Ethereum without revealing their wallet address, exact balance, or any other private information.</p>
+<h3 id="the-problem">The Problem</h3>
+<p>Many decentralized applications need to verify that a user meets a financial threshold:</p>
+<ul>
+<li>A lending protocol wants to ensure depositors are creditworthy</li>
+<li>A governance system wants to restrict voting to stakeholders with meaningful skin-in-the-game</li>
+<li>A premium service wants to gate features based on staked assets</li>
+<li>An OTC desk needs counterparty solvency verification</li>
+</ul>
+<p>Today, these checks either require the user to reveal their full wallet address (privacy violation) or rely on centralized attestation services (trust violation).</p>
+<h3 id="the-solution">The Solution</h3>
+<p>ZK Proof of Funds provides a <strong>privacy-preserving, cryptographically verifiable</strong> system where:</p>
+<ul>
+<li>Users <strong>enroll once</strong> by signing a message with their wallet</li>
+<li>The system <strong>never learns the user's wallet address</strong> during enrollment</li>
+<li>Users <strong>submit their own balance proofs</strong> from any Ethereum node</li>
+<li>A Solvency Agent <strong>verifies proofs and publishes batch attestations</strong> on-chain</li>
+<li>Relying protocols <strong>check membership via a cheap on-chain call</strong> (~8,000 gas)</li>
+</ul>
+<p>The user's wallet address is never stored. Only a privacy-preserving identifier (a hash of their signature) links them to the system.</p>
+<hr />
+<h2 id="2-how-it-works-simple-version">2. How It Works (Simple Version)</h2>
+<p>The system operates in four phases:</p>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span><span class="nx">ENROLL</span><span class="w">              </span><span class="nx">PROVE</span><span class="w">               </span><span class="nx">BATCH</span><span class="w">              </span><span class="nx">VERIFY</span>
+<span class="w">   </span><span class="p">(</span><span class="nx">one</span><span class="o">-</span><span class="nx">time</span><span class="p">)</span><span class="w">         </span><span class="p">(</span><span class="nx">per</span><span class="o">-</span><span class="nx">epoch</span><span class="p">)</span><span class="w">          </span><span class="p">(</span><span class="nx">agent</span><span class="p">)</span><span class="w">           </span><span class="p">(</span><span class="nx">on</span><span class="o">-</span><span class="nx">chain</span><span class="p">)</span>
+
+<span class="w">  </span><span class="o">+----------+</span><span class="w">      </span><span class="o">+------------+</span><span class="w">      </span><span class="o">+----------+</span><span class="w">      </span><span class="o">+----------+</span>
+<span class="w">  </span><span class="o">|</span><span class="w"> </span><span class="nx">User</span><span class="w">     </span><span class="o">|</span><span class="w">      </span><span class="o">|</span><span class="w"> </span><span class="nx">User</span><span class="w">       </span><span class="o">|</span><span class="w">      </span><span class="o">|</span><span class="w"> </span><span class="nx">Agent</span><span class="w">    </span><span class="o">|</span><span class="w">      </span><span class="o">|</span><span class="w"> </span><span class="nx">Protocol</span><span class="w"> </span><span class="o">|</span>
+<span class="w">  </span><span class="o">|</span><span class="w"> </span><span class="nx">signs</span><span class="w">    </span><span class="o">|</span><span class="w"> </span><span class="o">---&gt;</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="nx">fetches</span><span class="w">    </span><span class="o">|</span><span class="w"> </span><span class="o">---&gt;</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="nx">verifies</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="o">---&gt;</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="nx">checks</span><span class="w">   </span><span class="o">|</span>
+<span class="w">  </span><span class="o">|</span><span class="w"> </span><span class="nx">message</span><span class="w">  </span><span class="o">|</span><span class="w">      </span><span class="o">|</span><span class="w"> </span><span class="nx">own</span><span class="w"> </span><span class="nx">proof</span><span class="w">  </span><span class="o">|</span><span class="w">      </span><span class="o">|</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="nx">batches</span><span class="o">|</span><span class="w">      </span><span class="o">|</span><span class="w"> </span><span class="nx">member</span><span class="o">-</span><span class="w">  </span><span class="o">|</span>
+<span class="w">  </span><span class="o">|</span><span class="w">          </span><span class="o">|</span><span class="w">      </span><span class="o">|</span><span class="w"> </span><span class="nx">from</span><span class="w"> </span><span class="nx">node</span><span class="w">  </span><span class="o">|</span><span class="w">      </span><span class="o">|</span><span class="w"> </span><span class="nx">into</span><span class="w"> </span><span class="nx">root</span><span class="o">|</span><span class="w">      </span><span class="o">|</span><span class="w"> </span><span class="nx">ship</span><span class="w">     </span><span class="o">|</span>
+<span class="w">  </span><span class="o">+----------+</span><span class="w">      </span><span class="o">+------------+</span><span class="w">      </span><span class="o">+----------+</span><span class="w">      </span><span class="o">+----------+</span>
+
+<span class="w">  </span><span class="nx">No</span><span class="w"> </span><span class="nx">address</span><span class="w">         </span><span class="nx">Address</span><span class="w"> </span><span class="nx">used</span><span class="w">        </span><span class="nx">One</span><span class="w"> </span><span class="nx">Merkle</span><span class="w">         </span><span class="o">~</span><span class="mi">8</span><span class="p">,</span><span class="mi">000</span><span class="w"> </span><span class="nx">gas</span>
+<span class="w">  </span><span class="nx">sent</span><span class="w"> </span><span class="nx">to</span><span class="w"> </span><span class="nx">agent</span><span class="w">      </span><span class="nx">only</span><span class="w"> </span><span class="nx">locally</span><span class="w">        </span><span class="nx">root</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="nx">all</span><span class="w">       </span><span class="nx">per</span><span class="w"> </span><span class="nx">check</span>
+</code></pre></div>
+
+<p><strong>Step 1 - Enroll:</strong> The user signs a message with their wallet. The signature proves wallet ownership. The system computes <code>memberId = SHA256(signature)</code> as their privacy-preserving identifier. No wallet address is stored or transmitted.</p>
+<p><strong>Step 2 - Submit Proof:</strong> The user fetches an EIP-1186 state proof (<code>eth_getProof</code>) from any Ethereum node, which cryptographically proves their balance at a specific block. They submit this proof to the Solvency Agent. The wallet address is used only to verify the proof and is immediately discarded.</p>
+<p><strong>Step 3 - Batch:</strong> The Solvency Agent verifies all submitted proofs, determines each member's solvency status, and builds a Merkle tree. A single Merkle root representing all members is published on-chain.</p>
+<p><strong>Step 4 - Verify:</strong> Any smart contract can verify a member's solvency status by checking a Merkle inclusion proof against the published root. The agent provides the proof data to the requesting protocol.</p>
+<hr />
+<h2 id="3-system-architecture">3. System Architecture</h2>
+<div class="codehilite"><pre><span></span><code><span class="nb">+------------------------------------------------------------------+</span>
+<span class="c">|                     ON</span><span class="nb">-</span><span class="c">CHAIN (Ethereum)                           |</span>
+<span class="c">|                                                                  |</span>
+<span class="c">|  </span><span class="nb">+---------------------------+</span><span class="c">  </span><span class="nb">+-----------------------------+</span><span class="c">  |</span>
+<span class="c">|  | SolvencyRootOracle</span><span class="nt">.</span><span class="c">sol    |  | PolicyRegistry</span><span class="nt">.</span><span class="c">sol          |  |</span>
+<span class="c">|  |                           |  |                             |  |</span>
+<span class="c">|  |  Per</span><span class="nb">-</span><span class="c">policy Merkle roots  |  |  Policy definitions         |  |</span>
+<span class="c">|  |  verifyMember()  ~8k gas  |  |  (threshold</span><span class="nt">,</span><span class="c"> epoch</span><span class="nt">,</span><span class="c"> TTL)    |  |</span>
+<span class="c">|  |  updateRoot()   ~100k gas |  |  Operator authorization     |  |</span>
+<span class="c">|  </span><span class="nb">+---------------------------+</span><span class="c">  </span><span class="nb">+-----------------------------+</span><span class="c">  |</span>
+<span class="nb">+------------------------------------------------------------------+</span>
+<span class="c">              ^                            ^</span>
+<span class="c">              | updateRoot()               | registerPolicy()</span>
+<span class="c">              |                            |</span>
+<span class="nb">+------------------------------------------------------------------+</span>
+<span class="c">|                 SOLVENCY AGENT (Off</span><span class="nb">-</span><span class="c">Chain)                        |</span>
+<span class="c">|                                                                  |</span>
+<span class="c">|   Enrollment   |   Proof       |  Epoch       |  Chain           |</span>
+<span class="c">|   Service      |   Verifier    |  Processor   |  Publisher       |</span>
+<span class="c">|                |   (MPT)       |  (Merkle)    |  (Tx Submit)     |</span>
+<span class="c">|                                                                  |</span>
+<span class="c">|   REST API (Axum):                                               |</span>
+<span class="c">|   POST /enroll            POST /submit_proof                     |</span>
+<span class="c">|   GET  /proof             GET  /status                           |</span>
+<span class="c">|   POST /admin/trigger_epoch                                      |</span>
+<span class="nb">+------------------------------------------------------------------+</span>
+<span class="c">              ^                            ^</span>
+<span class="c">              | Enroll &amp; Submit            | Fetch Proof</span>
+<span class="c">              |                            |</span>
+<span class="nb">+------------------------------------------------------------------+</span>
+<span class="c">|                    PARTICIPANTS                                   |</span>
+<span class="c">|                                                                  |</span>
+<span class="c">|   </span><span class="nb">+----------+</span><span class="c">    </span><span class="nb">+-------------+</span><span class="c">    </span><span class="nb">+--------------------+</span><span class="c">      |</span>
+<span class="c">|   | End User |    | DApp / SDK  |    | Relying Protocol   |      |</span>
+<span class="c">|   | (wallet) |    | (fetches    |    | (calls oracle      |      |</span>
+<span class="c">|   |          |    |  proofs)    |    |  </span><span class="nt">.</span><span class="c">verifyMember)    |      |</span>
+<span class="c">|   </span><span class="nb">+----------+</span><span class="c">    </span><span class="nb">+-------------+</span><span class="c">    </span><span class="nb">+--------------------+</span><span class="c">      |</span>
+<span class="nb">+------------------------------------------------------------------+</span>
+</code></pre></div>
+
+<h3 id="key-components">Key Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>SolvencyRootOracle</strong></td>
+<td>On-chain contract that stores batch Merkle roots and verifies membership</td>
+</tr>
+<tr>
+<td><strong>PolicyRegistry</strong></td>
+<td>On-chain registry of solvency policies (thresholds, epoch lengths, operators)</td>
+</tr>
+<tr>
+<td><strong>Solvency Agent</strong></td>
+<td>Off-chain middleware that processes enrollments, verifies proofs, builds Merkle trees, and publishes roots</td>
+</tr>
+<tr>
+<td><strong>TypeScript SDK</strong></td>
+<td>Client library for integrators to interact with the agent API</td>
+</tr>
+<tr>
+<td><strong>Web Frontend</strong></td>
+<td>React UI for enrollment and dashboard monitoring</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="4-for-end-users-members">4. For End Users (Members)</h2>
+<h3 id="what-you-need">What You Need</h3>
+<ul>
+<li>An Ethereum wallet (MetaMask, WalletConnect, etc.)</li>
+<li>A balance that meets the policy threshold</li>
+</ul>
+<h3 id="enrollment-one-time-setup">Enrollment (One-Time Setup)</h3>
+<ol>
+<li><strong>Connect your wallet</strong> to the enrollment interface</li>
+<li><strong>Select a policy</strong> you want to enroll in (e.g., "Premium DeFi Access: 10 ETH minimum")</li>
+<li><strong>Sign a message</strong> when prompted by your wallet. The message looks like:
+   <code>zkpof-holder-v1:defi-premium:847291</code>
+   This proves you control the wallet. No funds are transferred.</li>
+<li><strong>Receive your Member ID</strong> - a 32-byte hex string like <code>a7b3c9d1e5...</code>. Save this; it's your privacy-preserving identifier.</li>
+</ol>
+<p><strong>What happens behind the scenes:</strong>
+- Your signature is sent to the Solvency Agent
+- The agent verifies the signature is valid (recovers to a real address)
+- Your Member ID = SHA256(your signature)
+- No wallet address is sent to or stored by the agent</p>
+<h3 id="submitting-solvency-proofs">Submitting Solvency Proofs</h3>
+<p>After enrollment, you periodically submit balance proofs to maintain your solvency status:</p>
+<ol>
+<li><strong>Connect your wallet</strong> on the dashboard</li>
+<li><strong>Click "Submit Solvency Proof"</strong> - the app will:</li>
+<li>Call <code>eth_getProof</code> on your wallet's Ethereum node</li>
+<li>Send the cryptographic proof to the Solvency Agent</li>
+<li>The agent verifies your balance meets the threshold</li>
+<li><strong>View your status</strong> - solvent, insolvent, or pending</li>
+</ol>
+<p><strong>What happens behind the scenes:</strong>
+- Your wallet calls <code>eth_getProof(yourAddress, [], blockNumber)</code> via your connected provider
+- This returns a Merkle-Patricia Trie proof of your account state
+- The proof (plus your address) is sent to the agent
+- The agent verifies the proof against the Ethereum state root
+- Your address is used only for proof verification and is immediately discarded
+- Only your Member ID and solvency status (solvent/insolvent) are stored</p>
+<h3 id="privacy-guarantees-for-users">Privacy Guarantees for Users</h3>
+<table>
+<thead>
+<tr>
+<th>What is known</th>
+<th>By whom</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Your wallet address</td>
+<td><strong>Only you and your Ethereum node</strong> (the agent discards it after proof verification)</td>
+</tr>
+<tr>
+<td>Your exact balance</td>
+<td><strong>Nobody</strong> (only whether it's above or below the threshold)</td>
+</tr>
+<tr>
+<td>Your Member ID</td>
+<td>The Solvency Agent and relying protocols</td>
+</tr>
+<tr>
+<td>Your solvency status</td>
+<td>The Solvency Agent and (via on-chain root) anyone with your Merkle proof</td>
+</tr>
+<tr>
+<td>Which policies you're in</td>
+<td>The Solvency Agent (different policies use different Member IDs)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="what-you-dont-need-to-do">What You Don't Need to Do</h3>
+<ul>
+<li>Run any software</li>
+<li>Monitor your balance</li>
+<li>Interact with the system after submitting your proof each epoch</li>
+<li>Manage private keys for the solvency system</li>
+<li>Pay gas (the agent pays for root publication)</li>
+</ul>
+<hr />
+<h2 id="5-for-service-providers-relying-protocols">5. For Service Providers (Relying Protocols)</h2>
+<h3 id="integration-overview">Integration Overview</h3>
+<p>As a service provider (DeFi protocol, dApp, DAO), you can gate functionality behind solvency verification with minimal smart contract changes.</p>
+<h3 id="on-chain-integration">On-Chain Integration</h3>
+<p>Add a solvency check to any function:</p>
+<div class="codehilite"><pre><span></span><code><span class="kt">import</span><span class="w"> </span><span class="p">{</span>ISolvencyOracle<span class="p">}</span><span class="w"> </span>from<span class="w"> </span><span class="s2">&quot;./interfaces/ISolvencyOracle.sol&quot;</span><span class="p">;</span>
+
+<span class="k">contract</span><span class="w"> </span><span class="ni">MyProtocol</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span>ISolvencyOracle<span class="w"> </span><span class="kt">public</span><span class="w"> </span>oracle<span class="p">;</span>
+<span class="w">    </span><span class="kt">bytes32</span><span class="w"> </span><span class="k">public </span><span class="nv">policyId</span><span class="p">;</span>
+
+<span class="w">    </span><span class="kt">function</span><span class="w"> </span><span class="nv">gatedAction</span><span class="p">(</span>
+<span class="w">        </span><span class="kt">bytes32</span><span class="w"> </span><span class="nv">memberId</span><span class="p">,</span>
+<span class="w">        </span><span class="kt">uint64</span><span class="w"> </span><span class="nv">epoch</span><span class="p">,</span>
+<span class="w">        </span><span class="kt">bytes32</span><span class="p">[]</span><span class="w"> </span>calldata<span class="w"> </span>merkleProof<span class="p">,</span>
+<span class="w">        </span><span class="kt">uint256</span><span class="w"> </span><span class="nv">leafIndex</span><span class="p">,</span>
+<span class="w">        </span><span class="kt">uint256</span><span class="w"> </span><span class="nv">rootIndex</span>
+<span class="w">    </span><span class="p">)</span><span class="w"> </span><span class="kt">external</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// Verify the member is solvent (~8,000 gas)</span>
+<span class="w">        </span><span class="kt">bool</span><span class="w"> </span><span class="nv">solvent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span>oracle<span class="p">.</span>isMemberSolvent<span class="p">(</span>
+<span class="w">            </span>policyId<span class="p">,</span><span class="w"> </span>memberId<span class="p">,</span><span class="w"> </span>epoch<span class="p">,</span>
+<span class="w">            </span>merkleProof<span class="p">,</span><span class="w"> </span>leafIndex<span class="p">,</span><span class="w"> </span>rootIndex
+<span class="w">        </span><span class="p">);</span>
+<span class="w">        </span><span class="kt">require</span><span class="p">(</span>solvent<span class="p">,</span><span class="w"> </span><span class="s2">&quot;Solvency proof required&quot;</span><span class="p">);</span>
+
+<span class="w">        </span><span class="c1">// Proceed with gated logic...</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3 id="off-chain-integration-sdk">Off-Chain Integration (SDK)</h3>
+<p>Use the TypeScript SDK to fetch proofs for your users:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">import</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">SolvencyClient</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="kr">from</span><span class="w"> </span><span class="s2">&quot;@zk-proof-of-funds/sdk&quot;</span><span class="p">;</span>
+
+<span class="kd">const</span><span class="w"> </span><span class="nx">client</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="ow">new</span><span class="w"> </span><span class="nx">SolvencyClient</span><span class="p">({</span>
+<span class="w">  </span><span class="nx">agentUrl</span><span class="o">:</span><span class="w"> </span><span class="s2">&quot;https://agent.example.com&quot;</span><span class="p">,</span>
+<span class="p">});</span>
+
+<span class="c1">// When a user wants to perform a gated action:</span>
+<span class="k">async</span><span class="w"> </span><span class="kd">function</span><span class="w"> </span><span class="nx">performGatedAction</span><span class="p">(</span><span class="nx">memberId</span><span class="o">:</span><span class="w"> </span><span class="kt">string</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="c1">// 1. Fetch the Merkle proof from the agent</span>
+<span class="w">  </span><span class="kd">const</span><span class="w"> </span><span class="nx">proof</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">await</span><span class="w"> </span><span class="nx">client</span><span class="p">.</span><span class="nx">getMemberProof</span><span class="p">(</span><span class="nx">POLICY_ID</span><span class="p">,</span><span class="w"> </span><span class="nx">memberId</span><span class="p">);</span>
+
+<span class="w">  </span><span class="c1">// 2. Include it in the smart contract call</span>
+<span class="w">  </span><span class="kd">const</span><span class="w"> </span><span class="nx">tx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">await</span><span class="w"> </span><span class="nx">myContract</span><span class="p">.</span><span class="nx">gatedAction</span><span class="p">(</span>
+<span class="w">    </span><span class="nx">proof</span><span class="p">.</span><span class="nx">member_id</span><span class="p">,</span>
+<span class="w">    </span><span class="nx">proof</span><span class="p">.</span><span class="nx">epoch</span><span class="p">,</span>
+<span class="w">    </span><span class="nx">proof</span><span class="p">.</span><span class="nx">merkle_proof</span><span class="p">,</span>
+<span class="w">    </span><span class="nx">proof</span><span class="p">.</span><span class="nx">leaf_index</span><span class="p">,</span>
+<span class="w">    </span><span class="mf">0</span><span class="w">  </span><span class="c1">// latest root</span>
+<span class="w">  </span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3 id="setting-up-a-policy">Setting Up a Policy</h3>
+<p>A policy defines what the solvency check verifies:</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Description</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>thresholdWei</code></td>
+<td>Minimum balance required</td>
+<td>10 ETH = <code>10000000000000000000</code></td>
+</tr>
+<tr>
+<td><code>epochLengthBlocks</code></td>
+<td>How often the root is updated</td>
+<td>7200 (~1 day)</td>
+</tr>
+<tr>
+<td><code>maxBlockAge</code></td>
+<td>Maximum age of state proofs</td>
+<td>256 blocks (~51 min)</td>
+</tr>
+<tr>
+<td><code>rootTTLBlocks</code></td>
+<td>How long a published root stays valid</td>
+<td>14400 (~2 days)</td>
+</tr>
+<tr>
+<td><code>operator</code></td>
+<td>Address authorized to publish roots</td>
+<td>Solvency Agent's address</td>
+</tr>
+<tr>
+<td><code>scope</code></td>
+<td>Scoping string for Member ID generation</td>
+<td><code>"my-protocol-v1"</code></td>
+</tr>
+<tr>
+<td><code>trustedMode</code></td>
+<td>Whether to use EIP-712 signatures (fast) or ZK proofs</td>
+<td><code>true</code> / <code>false</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="multi-tier-policies">Multi-Tier Policies</h3>
+<p>For tiered access (e.g., Bronze/Silver/Gold), create <strong>multiple policies</strong> with different thresholds:</p>
+<div class="codehilite"><pre><span></span><code>Policy &quot;bronze-tier&quot;:  thresholdWei = 1 ETH
+Policy &quot;silver-tier&quot;:  thresholdWei = 10 ETH
+Policy &quot;gold-tier&quot;:    thresholdWei = 100 ETH
+</code></pre></div>
+
+<p>Users enroll in each tier they qualify for. Your contract checks the appropriate policy.</p>
+<h3 id="cost-analysis">Cost Analysis</h3>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Gas Cost</th>
+<th>Frequency</th>
+<th>Who Pays</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Root publication (trusted mode)</td>
+<td>~100,000</td>
+<td>Once per epoch per policy</td>
+<td>Agent operator</td>
+</tr>
+<tr>
+<td>Root publication (ZK mode)</td>
+<td>~270,000</td>
+<td>Once per epoch per policy</td>
+<td>Agent operator</td>
+</tr>
+<tr>
+<td>Membership verification</td>
+<td>~8,000</td>
+<td>Per user action</td>
+<td>User (or protocol)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Per-member amortized cost</strong> for root publication: if 100 members are in a policy, each member's share of the publication cost is ~1,000 gas (trusted mode) or ~2,700 gas (ZK mode).</p>
+<hr />
+<h2 id="6-for-operators-running-the-solvency-agent">6. For Operators (Running the Solvency Agent)</h2>
+<h3 id="what-the-agent-does">What the Agent Does</h3>
+<p>The Solvency Agent is the off-chain middleware that:</p>
+<ol>
+<li><strong>Processes enrollments</strong> - verifies signatures, computes Member IDs</li>
+<li><strong>Receives and verifies proofs</strong> - validates EIP-1186 state proofs against Ethereum state roots</li>
+<li><strong>Builds Merkle trees</strong> - creates per-policy solvency trees each epoch</li>
+<li><strong>Publishes roots</strong> - submits Merkle roots to the SolvencyRootOracle contract</li>
+<li><strong>Serves proofs</strong> - provides Merkle inclusion proofs to relying protocols on demand</li>
+</ol>
+<h3 id="running-the-agent">Running the Agent</h3>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Environment variables</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">DATABASE_PATH</span><span class="o">=</span><span class="s2">&quot;solvency_agent.db&quot;</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">RPC_URL</span><span class="o">=</span><span class="s2">&quot;https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY&quot;</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">OPERATOR_PRIVATE_KEY</span><span class="o">=</span><span class="s2">&quot;0x...&quot;</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">ORACLE_ADDRESS</span><span class="o">=</span><span class="s2">&quot;0x...&quot;</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">CHAIN_ID</span><span class="o">=</span><span class="s2">&quot;1&quot;</span>
+
+<span class="c1"># Start the server</span>
+cargo<span class="w"> </span>run<span class="w"> </span>--bin<span class="w"> </span>zk-pof-backend
+</code></pre></div>
+
+<h3 id="api-endpoints">API Endpoints</h3>
+<table>
+<thead>
+<tr>
+<th>Endpoint</th>
+<th>Method</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/health</code></td>
+<td>GET</td>
+<td>Health check</td>
+</tr>
+<tr>
+<td><code>/enroll</code></td>
+<td>POST</td>
+<td>Enroll a new member</td>
+</tr>
+<tr>
+<td><code>/submit_proof/:policyId/:memberId</code></td>
+<td>POST</td>
+<td>Submit an EIP-1186 proof</td>
+</tr>
+<tr>
+<td><code>/proof/:policyId/:memberId</code></td>
+<td>GET</td>
+<td>Get Merkle membership proof</td>
+</tr>
+<tr>
+<td><code>/status/:policyId/:memberId</code></td>
+<td>GET</td>
+<td>Get member status</td>
+</tr>
+<tr>
+<td><code>/admin/members/:policyId</code></td>
+<td>GET</td>
+<td>List all members</td>
+</tr>
+<tr>
+<td><code>/admin/epochs/:policyId</code></td>
+<td>GET</td>
+<td>Epoch history</td>
+</tr>
+<tr>
+<td><code>/admin/trigger_epoch/:policyId</code></td>
+<td>POST</td>
+<td>Manually trigger an epoch</td>
+</tr>
+</tbody>
+</table>
+<h3 id="epoch-lifecycle">Epoch Lifecycle</h3>
+<div class="codehilite"><pre><span></span><code><span class="mf">1.</span><span class="w"> </span><span class="n">Admin</span><span class="w"> </span><span class="n">triggers</span><span class="w"> </span><span class="n">epoch</span><span class="w"> </span><span class="p">(</span><span class="ow">or</span><span class="w"> </span><span class="n">scheduler</span><span class="w"> </span><span class="n">fires</span><span class="w"> </span><span class="n">automatically</span><span class="p">)</span>
+
+<span class="mf">2.</span><span class="w"> </span><span class="n">Agent</span><span class="w"> </span><span class="kr">read</span><span class="n">s</span><span class="w"> </span><span class="n">proof</span><span class="w"> </span><span class="n">submissions</span><span class="w"> </span><span class="n">from</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="kd">data</span><span class="n">base</span>
+<span class="w">   </span><span class="o">-</span><span class="w"> </span><span class="n">Members</span><span class="w"> </span><span class="n">who</span><span class="w"> </span><span class="n">submitted</span><span class="w"> </span><span class="nb">val</span><span class="n">id</span><span class="w"> </span><span class="n">proofs</span><span class="p">:</span><span class="w"> </span><span class="n">use</span><span class="w"> </span><span class="n">verified</span><span class="w"> </span><span class="n">balance</span>
+<span class="w">   </span><span class="o">-</span><span class="w"> </span><span class="n">Members</span><span class="w"> </span><span class="n">without</span><span class="w"> </span><span class="n">proofs</span><span class="p">:</span><span class="w"> </span><span class="n">use</span><span class="w"> </span><span class="n">last</span><span class="w"> </span><span class="n">known</span><span class="w"> </span><span class="n">balance</span>
+
+<span class="mf">3.</span><span class="w"> </span><span class="kr">For</span><span class="w"> </span><span class="n">each</span><span class="w"> </span><span class="n">eligible</span><span class="w"> </span><span class="n">member</span><span class="p">:</span>
+<span class="w">   </span><span class="o">-</span><span class="w"> </span><span class="n">Determine</span><span class="w"> </span><span class="n">status</span><span class="p">:</span><span class="w"> </span><span class="n">solvent</span><span class="w"> </span><span class="p">(</span><span class="mf">1</span><span class="p">)</span><span class="w"> </span><span class="kr">if</span><span class="w"> </span><span class="n">balance</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="n">threshold</span><span class="p">,</span><span class="w"> </span><span class="n">insolvent</span><span class="w"> </span><span class="p">(</span><span class="mf">0</span><span class="p">)</span><span class="w"> </span><span class="n">otherwise</span>
+<span class="w">   </span><span class="o">-</span><span class="w"> </span><span class="n">Compute</span><span class="w"> </span><span class="n">leaf</span><span class="p">:</span><span class="w"> </span><span class="n">SHA256</span><span class="p">(</span><span class="n">memberId</span><span class="w"> </span><span class="err">||</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="err">||</span><span class="w"> </span><span class="n">epoch</span><span class="w"> </span><span class="err">||</span><span class="w"> </span><span class="n">policyId</span><span class="p">)</span>
+
+<span class="mf">4.</span><span class="w"> </span><span class="n">Build</span><span class="w"> </span><span class="n">binary</span><span class="w"> </span><span class="n">Merkle</span><span class="w"> </span><span class="n">tree</span><span class="w"> </span><span class="n">from</span><span class="w"> </span><span class="n">all</span><span class="w"> </span><span class="n">leaves</span>
+
+<span class="mf">5.</span><span class="w"> </span><span class="n">Publish</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="kr">to</span><span class="w"> </span><span class="n">SolvencyRootOracle</span><span class="w"> </span><span class="kr">cont</span><span class="n">ract</span>
+<span class="w">   </span><span class="o">-</span><span class="w"> </span><span class="n">Trusted</span><span class="w"> </span><span class="n">mode</span><span class="p">:</span><span class="w"> </span><span class="n">sign</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="n">EIP</span><span class="o">-</span><span class="mf">712</span><span class="w"> </span><span class="ow">and</span><span class="w"> </span><span class="n">submit</span>
+<span class="w">   </span><span class="o">-</span><span class="w"> </span><span class="n">ZK</span><span class="w"> </span><span class="n">mode</span><span class="p">:</span><span class="w"> </span><span class="n">generate</span><span class="w"> </span><span class="n">SP1</span><span class="w"> </span><span class="n">batch</span><span class="w"> </span><span class="n">proof</span><span class="w"> </span><span class="ow">and</span><span class="w"> </span><span class="n">submit</span>
+
+<span class="mf">6.</span><span class="w"> </span><span class="n">Store</span><span class="w"> </span><span class="n">tree</span><span class="w"> </span><span class="kr">for</span><span class="w"> </span><span class="n">serving</span><span class="w"> </span><span class="n">individual</span><span class="w"> </span><span class="n">Merkle</span><span class="w"> </span><span class="n">proofs</span>
+</code></pre></div>
+
+<h3 id="trust-model">Trust Model</h3>
+<table>
+<thead>
+<tr>
+<th>What the operator CAN do</th>
+<th>What the operator CANNOT do</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Withhold updates (liveness)</td>
+<td>Steal user funds (non-custodial)</td>
+</tr>
+<tr>
+<td>See that proofs were submitted</td>
+<td>See wallet addresses (discarded after verification)</td>
+</tr>
+<tr>
+<td>Determine member solvency</td>
+<td>Falsify statuses in ZK mode</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="7-privacy-security-model">7. Privacy &amp; Security Model</h2>
+<h3 id="privacy-layers">Privacy Layers</h3>
+<div class="codehilite"><pre><span></span><code><span class="nx">Layer</span><span class="w"> </span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="nx">Enrollment</span><span class="w"> </span><span class="nx">Privacy</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="nx">User</span><span class="w"> </span><span class="nx">signs</span><span class="w"> </span><span class="nx">a</span><span class="w"> </span><span class="nx">message</span><span class="p">;</span><span class="w"> </span><span class="nx">agent</span><span class="w"> </span><span class="nx">receives</span><span class="w"> </span><span class="nx">only</span><span class="w"> </span><span class="nx">the</span><span class="w"> </span><span class="nx">signature</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="nx">memberId</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">SHA256</span><span class="p">(</span><span class="nx">signature</span><span class="p">)</span><span class="w"> </span><span class="k">is</span><span class="w"> </span><span class="nx">non</span><span class="o">-</span><span class="nx">invertible</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="nx">Agent</span><span class="w"> </span><span class="nx">cannot</span><span class="w"> </span><span class="nx">determine</span><span class="w"> </span><span class="nx">the</span><span class="w"> </span><span class="nx">user</span><span class="err">&#39;</span><span class="nx">s</span><span class="w"> </span><span class="nx">wallet</span><span class="w"> </span><span class="nx">address</span><span class="w"> </span><span class="nx">from</span><span class="w"> </span><span class="nx">enrollment</span>
+
+<span class="nx">Layer</span><span class="w"> </span><span class="mi">2</span><span class="p">:</span><span class="w"> </span><span class="nx">Proof</span><span class="w"> </span><span class="nx">Submission</span><span class="w"> </span><span class="nx">Privacy</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="nx">User</span><span class="w"> </span><span class="nx">submits</span><span class="w"> </span><span class="nx">eth_getProof</span><span class="w"> </span><span class="nx">with</span><span class="w"> </span><span class="nx">their</span><span class="w"> </span><span class="nx">address</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="nx">Address</span><span class="w"> </span><span class="k">is</span><span class="w"> </span><span class="nx">used</span><span class="w"> </span><span class="nx">ONLY</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="nx">MPT</span><span class="w"> </span><span class="nx">trie</span><span class="w"> </span><span class="nx">key</span><span class="w"> </span><span class="nx">computation</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="nx">Address</span><span class="w"> </span><span class="k">is</span><span class="w"> </span><span class="nx">immediately</span><span class="w"> </span><span class="nx">discarded</span><span class="w"> </span><span class="nx">after</span><span class="w"> </span><span class="nx">verification</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="nx">Only</span><span class="w"> </span><span class="nx">memberId</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">solvent</span><span class="o">/</span><span class="nx">insolvent</span><span class="w"> </span><span class="nx">status</span><span class="w"> </span><span class="k">is</span><span class="w"> </span><span class="nx">stored</span>
+
+<span class="nx">Layer</span><span class="w"> </span><span class="mi">3</span><span class="p">:</span><span class="w"> </span><span class="nx">On</span><span class="o">-</span><span class="nx">Chain</span><span class="w"> </span><span class="nx">Privacy</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="nx">Only</span><span class="w"> </span><span class="nx">Merkle</span><span class="w"> </span><span class="nx">roots</span><span class="w"> </span><span class="nx">are</span><span class="w"> </span><span class="nx">published</span><span class="w"> </span><span class="nx">on</span><span class="o">-</span><span class="nx">chain</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="nx">Individual</span><span class="w"> </span><span class="nx">balances</span><span class="p">,</span><span class="w"> </span><span class="nx">addresses</span><span class="p">,</span><span class="w"> </span><span class="k">and</span><span class="w"> </span><span class="nx">statuses</span><span class="w"> </span><span class="nx">are</span><span class="w"> </span><span class="nx">hidden</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="nx">Verification</span><span class="w"> </span><span class="nx">requires</span><span class="w"> </span><span class="nx">a</span><span class="w"> </span><span class="nx">Merkle</span><span class="w"> </span><span class="nx">proof</span><span class="w"> </span><span class="p">(</span><span class="nx">served</span><span class="w"> </span><span class="nx">by</span><span class="w"> </span><span class="nx">the</span><span class="w"> </span><span class="nx">agent</span><span class="p">)</span>
+
+<span class="nx">Layer</span><span class="w"> </span><span class="mi">4</span><span class="p">:</span><span class="w"> </span><span class="nx">Cross</span><span class="o">-</span><span class="nx">Policy</span><span class="w"> </span><span class="nx">Unlinkability</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="nx">Different</span><span class="w"> </span><span class="nx">policy</span><span class="w"> </span><span class="nx">scopes</span><span class="w"> </span><span class="nx">produce</span><span class="w"> </span><span class="nx">different</span><span class="w"> </span><span class="nx">memberIds</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="nx">Same</span><span class="w"> </span><span class="nx">user</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="s">&quot;lending-pool&quot;</span><span class="w"> </span><span class="k">and</span><span class="w"> </span><span class="s">&quot;governance&quot;</span><span class="w"> </span><span class="nx">scopes</span>
+<span class="w">    </span><span class="nx">has</span><span class="w"> </span><span class="nx">two</span><span class="w"> </span><span class="nx">different</span><span class="p">,</span><span class="w"> </span><span class="nx">unlinkable</span><span class="w"> </span><span class="nx">memberIds</span>
+</code></pre></div>
+
+<h3 id="security-properties">Security Properties</h3>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Guarantee</th>
+<th>Mechanism</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Non-custodial</strong></td>
+<td>Agent never controls funds</td>
+<td>Only reads state via EIP-1186 proofs</td>
+</tr>
+<tr>
+<td><strong>Correctness</strong></td>
+<td>Statuses match on-chain reality</td>
+<td>MPT proof verification against state roots</td>
+</tr>
+<tr>
+<td><strong>Tamper-proof</strong> (ZK mode)</td>
+<td>Agent cannot falsify statuses</td>
+<td>SP1 ZK proof verifies all balance checks</td>
+</tr>
+<tr>
+<td><strong>Tamper-evident</strong> (trusted mode)</td>
+<td>Forgery detectable</td>
+<td>EIP-712 signatures from known operator</td>
+</tr>
+<tr>
+<td><strong>Replay-resistant</strong></td>
+<td>Old proofs cannot be reused</td>
+<td>Epoch number in leaf + root TTL expiry</td>
+</tr>
+<tr>
+<td><strong>Forward-secure</strong></td>
+<td>Balance drops detected</td>
+<td>Insolvent status in next epoch</td>
+</tr>
+</tbody>
+</table>
+<h3 id="what-happens-if">What Happens If...</h3>
+<table>
+<thead>
+<tr>
+<th>Scenario</th>
+<th>System Response</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>User's balance drops below threshold</td>
+<td>Status changes to "insolvent" in the next epoch</td>
+</tr>
+<tr>
+<td>User's balance recovers</td>
+<td>Status changes back to "solvent" in the following epoch</td>
+</tr>
+<tr>
+<td>Agent goes offline</td>
+<td>Existing roots remain valid until TTL expires; alerts fire</td>
+</tr>
+<tr>
+<td>Agent database is compromised</td>
+<td>No wallet addresses stored; only Member IDs and statuses</td>
+</tr>
+<tr>
+<td>User loses their Member ID</td>
+<td>They can re-derive it by signing the same message again</td>
+</tr>
+<tr>
+<td>RPC node returns false data</td>
+<td>ZK proof verification catches inconsistencies with state root</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="8-worked-example-tiered-credit-card-program">8. Worked Example: Tiered Credit Card Program</h2>
+<h3 id="scenario">Scenario</h3>
+<p><strong>CryptoCard Inc.</strong> is a crypto-native credit card provider that offers different card tiers based on how much ETH a user holds. They want to verify holdings without learning users' wallet addresses.</p>
+<h3 id="tier-structure">Tier Structure</h3>
+<table>
+<thead>
+<tr>
+<th>Tier</th>
+<th>Required Balance</th>
+<th>Benefits</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Standard</strong></td>
+<td>1 ETH (~$3,500)</td>
+<td>Basic card, 1% cashback</td>
+</tr>
+<tr>
+<td><strong>Silver</strong></td>
+<td>10 ETH (~$35,000)</td>
+<td>Higher limits, 2% cashback, airport lounge access</td>
+</tr>
+<tr>
+<td><strong>Gold</strong></td>
+<td>50 ETH (~$175,000)</td>
+<td>Premium limits, 3% cashback, concierge, travel insurance</td>
+</tr>
+<tr>
+<td><strong>Platinum</strong></td>
+<td>100 ETH (~$350,000)</td>
+<td>Unlimited, 5% cashback, all Gold perks + private banking</td>
+</tr>
+</tbody>
+</table>
+<h3 id="setup-creating-policies">Setup: Creating Policies</h3>
+<p>CryptoCard creates four solvency policies on-chain:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1">// Standard Tier: 1 ETH minimum, checked daily</span>
+policyRegistry<span class="p">.</span>createPolicy<span class="p">(</span>Policy<span class="p">({</span>
+<span class="w">    </span>thresholdWei<span class="o">:</span><span class="w"> </span><span class="m m-Decimal">1</span><span class="w"> </span>ether<span class="p">,</span>
+<span class="w">    </span>tokenAddress<span class="o">:</span><span class="w"> </span><span class="kt">address</span><span class="p">(</span><span class="m m-Decimal">0</span><span class="p">),</span><span class="w">       </span><span class="c1">// Native ETH</span>
+<span class="w">    </span>chainId<span class="o">:</span><span class="w"> </span><span class="m m-Decimal">1</span><span class="p">,</span><span class="w">                      </span><span class="c1">// Ethereum mainnet</span>
+<span class="w">    </span>epochLengthBlocks<span class="o">:</span><span class="w"> </span><span class="m m-Decimal">7200</span><span class="p">,</span><span class="w">         </span><span class="c1">// ~1 day</span>
+<span class="w">    </span>maxBlockAge<span class="o">:</span><span class="w"> </span><span class="m m-Decimal">256</span><span class="p">,</span>
+<span class="w">    </span>rootTTLBlocks<span class="o">:</span><span class="w"> </span><span class="m m-Decimal">14400</span><span class="p">,</span><span class="w">            </span><span class="c1">// ~2 days validity</span>
+<span class="w">    </span>operator<span class="o">:</span><span class="w"> </span>SOLVENCY_AGENT_ADDR<span class="p">,</span>
+<span class="w">    </span>scope<span class="o">:</span><span class="w"> </span><span class="s2">&quot;cryptocard-standard-v1&quot;</span><span class="p">,</span>
+<span class="w">    </span>trustedMode<span class="o">:</span><span class="w"> </span><span class="kt">true</span><span class="p">,</span>
+<span class="w">    </span>active<span class="o">:</span><span class="w"> </span><span class="kt">true</span>
+<span class="p">}));</span>
+<span class="c1">// Returns policyId: 0xaaaa...</span>
+
+<span class="c1">// Silver Tier: 10 ETH minimum</span>
+<span class="c1">// ... same structure, thresholdWei: 10 ether, scope: &quot;cryptocard-silver-v1&quot;</span>
+<span class="c1">// Returns policyId: 0xbbbb...</span>
+
+<span class="c1">// Gold Tier: 50 ETH minimum</span>
+<span class="c1">// ... thresholdWei: 50 ether, scope: &quot;cryptocard-gold-v1&quot;</span>
+<span class="c1">// Returns policyId: 0xcccc...</span>
+
+<span class="c1">// Platinum Tier: 100 ETH minimum</span>
+<span class="c1">// ... thresholdWei: 100 ether, scope: &quot;cryptocard-platinum-v1&quot;</span>
+<span class="c1">// Returns policyId: 0xdddd...</span>
+</code></pre></div>
+
+<h3 id="integration-the-smart-contract">Integration: The Smart Contract</h3>
+<p>CryptoCard deploys a tiered access contract:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1">// SPDX-License-Identifier: MIT</span>
+<span class="k">pragma solidity</span><span class="w"> </span><span class="o">^</span><span class="k">0.8.26</span><span class="p">;</span>
+
+<span class="kt">import</span><span class="w"> </span><span class="p">{</span>ISolvencyOracle<span class="p">}</span><span class="w"> </span>from<span class="w"> </span><span class="s2">&quot;./interfaces/ISolvencyOracle.sol&quot;</span><span class="p">;</span>
+
+<span class="k">contract</span><span class="w"> </span><span class="ni">CryptoCardTiers</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span>ISolvencyOracle<span class="w"> </span><span class="kt">public</span><span class="w"> </span>immutable<span class="w"> </span>oracle<span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// Tier policy IDs</span>
+<span class="w">    </span><span class="kt">bytes32</span><span class="w"> </span><span class="k">public </span><span class="nv">constant</span><span class="w"> </span>STANDARD_POLICY<span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0xaaaa</span><span class="p">...;</span>
+<span class="w">    </span><span class="kt">bytes32</span><span class="w"> </span><span class="k">public </span><span class="nv">constant</span><span class="w"> </span>SILVER_POLICY<span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="mh">0xbbbb</span><span class="p">...;</span>
+<span class="w">    </span><span class="kt">bytes32</span><span class="w"> </span><span class="k">public </span><span class="nv">constant</span><span class="w"> </span>GOLD_POLICY<span class="w">     </span><span class="o">=</span><span class="w"> </span><span class="mh">0xcccc</span><span class="p">...;</span>
+<span class="w">    </span><span class="kt">bytes32</span><span class="w"> </span><span class="k">public </span><span class="nv">constant</span><span class="w"> </span>PLATINUM_POLICY<span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0xdddd</span><span class="p">...;</span>
+
+<span class="w">    </span><span class="kt">enum</span><span class="w"> </span><span class="nv">Tier</span><span class="w"> </span><span class="p">{</span><span class="w"> </span>None<span class="p">,</span><span class="w"> </span>Standard<span class="p">,</span><span class="w"> </span>Silver<span class="p">,</span><span class="w"> </span>Gold<span class="p">,</span><span class="w"> </span>Platinum<span class="w"> </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// Track highest verified tier per member</span>
+<span class="w">    </span><span class="kt">mapping</span><span class="p">(</span><span class="kt">bytes32</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span>Tier<span class="p">)</span><span class="w"> </span><span class="kt">public</span><span class="w"> </span>memberTier<span class="p">;</span>
+
+<span class="w">    </span><span class="kt">event</span><span class="w"> </span><span class="nv">TierVerified</span><span class="p">(</span><span class="kt">bytes32</span><span class="w"> </span><span class="nv">indexed</span><span class="w"> </span>memberId<span class="p">,</span><span class="w"> </span>Tier<span class="w"> </span>tier<span class="p">);</span>
+
+<span class="w">    </span><span class="c1">/// @notice Verify a member&#39;s tier using their solvency proof.</span>
+<span class="w">    </span><span class="c1">/// @dev The frontend calls the Solvency Agent API for each tier the user</span>
+<span class="w">    </span><span class="c1">///      qualifies for, then submits the highest tier proof here.</span>
+<span class="w">    </span><span class="kt">function</span><span class="w"> </span><span class="nv">verifyTier</span><span class="p">(</span>
+<span class="w">        </span><span class="kt">bytes32</span><span class="w"> </span><span class="nv">policyId</span><span class="p">,</span>
+<span class="w">        </span><span class="kt">bytes32</span><span class="w"> </span><span class="nv">memberId</span><span class="p">,</span>
+<span class="w">        </span><span class="kt">uint64</span><span class="w"> </span><span class="nv">epoch</span><span class="p">,</span>
+<span class="w">        </span><span class="kt">bytes32</span><span class="p">[]</span><span class="w"> </span>calldata<span class="w"> </span>merkleProof<span class="p">,</span>
+<span class="w">        </span><span class="kt">uint256</span><span class="w"> </span><span class="nv">leafIndex</span><span class="p">,</span>
+<span class="w">        </span><span class="kt">uint256</span><span class="w"> </span><span class="nv">rootIndex</span>
+<span class="w">    </span><span class="p">)</span><span class="w"> </span><span class="kt">external</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">bool</span><span class="w"> </span><span class="nv">solvent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span>oracle<span class="p">.</span>isMemberSolvent<span class="p">(</span>
+<span class="w">            </span>policyId<span class="p">,</span><span class="w"> </span>memberId<span class="p">,</span><span class="w"> </span>epoch<span class="p">,</span>
+<span class="w">            </span>merkleProof<span class="p">,</span><span class="w"> </span>leafIndex<span class="p">,</span><span class="w"> </span>rootIndex
+<span class="w">        </span><span class="p">);</span>
+<span class="w">        </span><span class="kt">require</span><span class="p">(</span>solvent<span class="p">,</span><span class="w"> </span><span class="s2">&quot;Solvency proof invalid&quot;</span><span class="p">);</span>
+
+<span class="w">        </span>Tier<span class="w"> </span>tier<span class="p">;</span>
+<span class="w">        </span><span class="kt">if</span><span class="w"> </span><span class="p">(</span>policyId<span class="w"> </span><span class="o">==</span><span class="w"> </span>PLATINUM_POLICY<span class="p">)</span><span class="w">     </span>tier<span class="w"> </span><span class="o">=</span><span class="w"> </span>Tier<span class="p">.</span>Platinum<span class="p">;</span>
+<span class="w">        </span><span class="kt">else</span><span class="w"> </span><span class="kt">if</span><span class="w"> </span><span class="p">(</span>policyId<span class="w"> </span><span class="o">==</span><span class="w"> </span>GOLD_POLICY<span class="p">)</span><span class="w">    </span>tier<span class="w"> </span><span class="o">=</span><span class="w"> </span>Tier<span class="p">.</span>Gold<span class="p">;</span>
+<span class="w">        </span><span class="kt">else</span><span class="w"> </span><span class="kt">if</span><span class="w"> </span><span class="p">(</span>policyId<span class="w"> </span><span class="o">==</span><span class="w"> </span>SILVER_POLICY<span class="p">)</span><span class="w">  </span>tier<span class="w"> </span><span class="o">=</span><span class="w"> </span>Tier<span class="p">.</span>Silver<span class="p">;</span>
+<span class="w">        </span><span class="kt">else</span><span class="w"> </span><span class="kt">if</span><span class="w"> </span><span class="p">(</span>policyId<span class="w"> </span><span class="o">==</span><span class="w"> </span>STANDARD_POLICY<span class="p">)</span><span class="w"> </span>tier<span class="w"> </span><span class="o">=</span><span class="w"> </span>Tier<span class="p">.</span>Standard<span class="p">;</span>
+<span class="w">        </span><span class="kt">else</span><span class="w"> </span>revert<span class="p">(</span><span class="s2">&quot;Unknown policy&quot;</span><span class="p">);</span>
+
+<span class="w">        </span><span class="c1">// Only upgrade, never downgrade within same epoch</span>
+<span class="w">        </span><span class="kt">if</span><span class="w"> </span><span class="p">(</span><span class="kt">uint8</span><span class="p">(</span>tier<span class="p">)</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="kt">uint8</span><span class="p">(</span>memberTier<span class="p">[</span>memberId<span class="p">]))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span>memberTier<span class="p">[</span>memberId<span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span>tier<span class="p">;</span>
+<span class="w">            </span>emit<span class="w"> </span>TierVerified<span class="p">(</span>memberId<span class="p">,</span><span class="w"> </span>tier<span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">/// @notice Check if a member has at least the required tier.</span>
+<span class="w">    </span><span class="kt">function</span><span class="w"> </span><span class="nv">hasMinimumTier</span><span class="p">(</span>
+<span class="w">        </span><span class="kt">bytes32</span><span class="w"> </span><span class="nv">memberId</span><span class="p">,</span>
+<span class="w">        </span>Tier<span class="w"> </span>requiredTier
+<span class="w">    </span><span class="p">)</span><span class="w"> </span><span class="kt">external</span><span class="w"> </span>view<span class="w"> </span><span class="kt">returns</span><span class="w"> </span><span class="p">(</span><span class="kt">bool</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">return</span><span class="w"> </span><span class="kt">uint8</span><span class="p">(</span>memberTier<span class="p">[</span>memberId<span class="p">])</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="kt">uint8</span><span class="p">(</span>requiredTier<span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3 id="user-journey-alice-gets-a-platinum-card">User Journey: Alice Gets a Platinum Card</h3>
+<p><strong>Alice holds 120 ETH</strong> and wants the Platinum card.</p>
+<p><strong>Step 1: Enrollment</strong></p>
+<p>Alice visits the CryptoCard enrollment page and enrolls in all four tiers:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">For</span><span class="w"> </span><span class="k">each</span><span class="w"> </span><span class="n">tier</span><span class="w"> </span><span class="p">(</span><span class="n">Standard</span><span class="p">,</span><span class="w"> </span><span class="n">Silver</span><span class="p">,</span><span class="w"> </span><span class="n">Gold</span><span class="p">,</span><span class="w"> </span><span class="n">Platinum</span><span class="p">)</span><span class="err">:</span>
+<span class="w">  </span><span class="mf">1.</span><span class="w"> </span><span class="n">Alice</span><span class="w"> </span><span class="n">clicks</span><span class="w"> </span><span class="ss">&quot;Enroll in [Tier]&quot;</span>
+<span class="w">  </span><span class="mf">2.</span><span class="w"> </span><span class="n">Her</span><span class="w"> </span><span class="n">wallet</span><span class="w"> </span><span class="n">prompts</span><span class="w"> </span><span class="n">her</span><span class="w"> </span><span class="k">to</span><span class="w"> </span><span class="nf">sign</span><span class="err">:</span>
+<span class="w">     </span><span class="ss">&quot;zkpof-holder-v1:cryptocard-platinum-v1:583921&quot;</span>
+<span class="w">  </span><span class="mf">3.</span><span class="w"> </span><span class="n">The</span><span class="w"> </span><span class="n">signature</span><span class="w"> </span><span class="k">is</span><span class="w"> </span><span class="n">sent</span><span class="w"> </span><span class="k">to</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">Solvency</span><span class="w"> </span><span class="n">Agent</span>
+<span class="w">  </span><span class="mf">4.</span><span class="w"> </span><span class="n">Agent</span><span class="w"> </span><span class="n">computes</span><span class="w"> </span><span class="n">memberId</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SHA256</span><span class="p">(</span><span class="n">signature</span><span class="p">)</span>
+<span class="w">  </span><span class="mf">5.</span><span class="w"> </span><span class="n">Alice</span><span class="w"> </span><span class="n">receives</span><span class="w"> </span><span class="n">her</span><span class="w"> </span><span class="k">Member</span><span class="w"> </span><span class="n">ID</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">that</span><span class="w"> </span><span class="n">tier</span>
+</code></pre></div>
+
+<p>Each tier has a different scope, so Alice gets four different Member IDs. This means her Standard tier membership cannot be linked to her Platinum tier membership by external observers.</p>
+<p><strong>Step 2: Submitting Proofs</strong></p>
+<p>Once per epoch (~daily), Alice opens the dashboard and clicks "Submit Solvency Proof" for each tier:</p>
+<div class="codehilite"><pre><span></span><code><span class="mf">1.</span><span class="w"> </span><span class="n">Alice</span><span class="err">&#39;</span><span class="n">s</span><span class="w"> </span><span class="n">wallet</span><span class="w"> </span><span class="n">calls</span><span class="w"> </span><span class="n">eth_getProof</span><span class="p">(</span><span class="n">alice_address</span><span class="p">,</span><span class="w"> </span><span class="err">[]</span><span class="p">,</span><span class="w"> </span><span class="n">latest_block</span><span class="p">)</span>
+<span class="mf">2.</span><span class="w"> </span><span class="n">The</span><span class="w"> </span><span class="n">proof</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="n">submitted</span><span class="w"> </span><span class="kr">to</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">Solvency</span><span class="w"> </span><span class="n">Agent</span>
+<span class="mf">3.</span><span class="w"> </span><span class="n">The</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="n">verifies</span><span class="p">:</span>
+<span class="w">   </span><span class="o">-</span><span class="w"> </span><span class="n">The</span><span class="w"> </span><span class="n">MPT</span><span class="w"> </span><span class="n">proof</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="nb">val</span><span class="n">id</span><span class="w"> </span><span class="n">against</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">Ethereum</span><span class="w"> </span><span class="n">state</span><span class="w"> </span><span class="n">root</span>
+<span class="w">   </span><span class="o">-</span><span class="w"> </span><span class="n">Alice</span><span class="err">&#39;</span><span class="n">s</span><span class="w"> </span><span class="n">balance</span><span class="w"> </span><span class="p">(</span><span class="mf">120</span><span class="w"> </span><span class="n">ETH</span><span class="p">)</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="n">tier</span><span class="w"> </span><span class="n">threshold</span>
+<span class="mf">4.</span><span class="w"> </span><span class="n">Result</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;solvent&quot;</span><span class="w"> </span><span class="kr">for</span><span class="w"> </span><span class="n">all</span><span class="w"> </span><span class="n">four</span><span class="w"> </span><span class="n">tiers</span>
+<span class="mf">5.</span><span class="w"> </span><span class="n">Alice</span><span class="err">&#39;</span><span class="n">s</span><span class="w"> </span><span class="n">address</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="n">discarded</span><span class="w"> </span><span class="n">immediately</span>
+</code></pre></div>
+
+<p><strong>Step 3: Epoch Processing</strong></p>
+<p>The Solvency Agent processes each policy:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">For</span><span class="w"> </span><span class="s">&quot;cryptocard-platinum-v1&quot;</span><span class="w"> </span><span class="p">(</span><span class="kr">threshold</span><span class="o">:</span><span class="w"> </span><span class="mi">100</span><span class="w"> </span><span class="n">ETH</span><span class="p">)</span><span class="o">:</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="n">Alice</span><span class="w"> </span><span class="n">submitted</span><span class="w"> </span><span class="n">proof</span><span class="o">:</span><span class="w"> </span><span class="n">balance</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">120</span><span class="w"> </span><span class="n">ETH</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="mi">100</span><span class="w"> </span><span class="n">ETH</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="p">(</span><span class="n">solvent</span><span class="p">)</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="n">Bob</span><span class="w"> </span><span class="n">submitted</span><span class="w"> </span><span class="n">proof</span><span class="o">:</span><span class="w">   </span><span class="n">balance</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">80</span><span class="w"> </span><span class="n">ETH</span><span class="w">  </span><span class="o">&lt;</span><span class="w">  </span><span class="mi">100</span><span class="w"> </span><span class="n">ETH</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">(</span><span class="n">insolvent</span><span class="p">)</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="n">Carol</span><span class="o">:</span><span class="w"> </span><span class="n">no</span><span class="w"> </span><span class="n">proof</span><span class="w"> </span><span class="n">submitted</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">uses</span><span class="w"> </span><span class="kr">last</span><span class="w"> </span><span class="n">known</span><span class="w"> </span><span class="n">balance</span>
+
+<span class="w">  </span><span class="kr">Build</span><span class="w"> </span><span class="n">Merkle</span><span class="w"> </span><span class="n">tree</span><span class="o">:</span>
+<span class="w">    </span><span class="n">leaf_0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SHA256</span><span class="p">(</span><span class="n">alice_memberId</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="mh">0x01</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">epoch</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">policyId</span><span class="p">)</span>
+<span class="w">    </span><span class="n">leaf_1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SHA256</span><span class="p">(</span><span class="n">bob_memberId</span><span class="w">   </span><span class="o">||</span><span class="w"> </span><span class="mh">0x00</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">epoch</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">policyId</span><span class="p">)</span>
+<span class="w">    </span><span class="n">leaf_2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SHA256</span><span class="p">(</span><span class="n">carol_memberId</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="mh">0x01</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">epoch</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">policyId</span><span class="p">)</span>
+<span class="w">    </span><span class="p">...</span>
+<span class="w">    </span><span class="n">root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Merkle</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="kr">of</span><span class="w"> </span><span class="kr">all</span><span class="w"> </span><span class="n">leaves</span>
+
+<span class="w">  </span><span class="n">Publish</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="n">on</span><span class="o">-</span><span class="n">chain</span><span class="w"> </span><span class="n">via</span><span class="w"> </span><span class="n">updateRootTrusted</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>Step 4: Using the Card</strong></p>
+<p>When Alice wants to use her Platinum card benefits, the CryptoCard backend:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1">// CryptoCard backend fetches proof from the Solvency Agent</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">proof</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">await</span><span class="w"> </span><span class="nx">solvencyClient</span><span class="p">.</span><span class="nx">getMemberProof</span><span class="p">(</span>
+<span class="w">  </span><span class="nx">PLATINUM_POLICY_ID</span><span class="p">,</span>
+<span class="w">  </span><span class="nx">alice_platinum_member_id</span>
+<span class="p">);</span>
+
+<span class="c1">// Verify on-chain (or the frontend includes this in a transaction)</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">tx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">await</span><span class="w"> </span><span class="nx">cryptoCardContract</span><span class="p">.</span><span class="nx">verifyTier</span><span class="p">(</span>
+<span class="w">  </span><span class="nx">PLATINUM_POLICY_ID</span><span class="p">,</span>
+<span class="w">  </span><span class="nx">proof</span><span class="p">.</span><span class="nx">member_id</span><span class="p">,</span>
+<span class="w">  </span><span class="nx">proof</span><span class="p">.</span><span class="nx">epoch</span><span class="p">,</span>
+<span class="w">  </span><span class="nx">proof</span><span class="p">.</span><span class="nx">merkle_proof</span><span class="p">,</span>
+<span class="w">  </span><span class="nx">proof</span><span class="p">.</span><span class="nx">leaf_index</span><span class="p">,</span>
+<span class="w">  </span><span class="mf">0</span><span class="w">  </span><span class="c1">// latest root index</span>
+<span class="p">);</span>
+<span class="c1">// Cost: ~8,000 gas</span>
+</code></pre></div>
+
+<p><strong>Step 5: Automatic Tier Adjustment</strong></p>
+<p>If Alice's balance drops to 40 ETH:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">Next</span><span class="w"> </span><span class="nv">epoch</span>:
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="nv">Standard</span><span class="w"> </span><span class="ss">(</span><span class="mi">1</span><span class="w"> </span><span class="nv">ETH</span><span class="ss">)</span>:<span class="w">   </span><span class="nv">Alice</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nv">solvent</span><span class="w">    </span><span class="ss">(</span><span class="mi">40</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="mi">1</span><span class="ss">)</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="nv">Silver</span><span class="w"> </span><span class="ss">(</span><span class="mi">10</span><span class="w"> </span><span class="nv">ETH</span><span class="ss">)</span>:<span class="w">    </span><span class="nv">Alice</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nv">solvent</span><span class="w">    </span><span class="ss">(</span><span class="mi">40</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="mi">10</span><span class="ss">)</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="nv">Gold</span><span class="w"> </span><span class="ss">(</span><span class="mi">50</span><span class="w"> </span><span class="nv">ETH</span><span class="ss">)</span>:<span class="w">      </span><span class="nv">Alice</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nv">INSOLVENT</span><span class="w">  </span><span class="ss">(</span><span class="mi">40</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">50</span><span class="ss">)</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="nv">Platinum</span><span class="w"> </span><span class="ss">(</span><span class="mi">100</span><span class="w"> </span><span class="nv">ETH</span><span class="ss">)</span>:<span class="w"> </span><span class="nv">Alice</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nv">INSOLVENT</span><span class="w">  </span><span class="ss">(</span><span class="mi">40</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">100</span><span class="ss">)</span>
+
+<span class="nv">CryptoCard</span><span class="s1">&#39;s system detects that Alice&#39;</span><span class="nv">s</span><span class="w"> </span><span class="nv">Platinum</span><span class="w"> </span><span class="nv">proof</span>
+<span class="nv">now</span><span class="w"> </span><span class="nv">fails</span><span class="w"> </span><span class="nv">verification</span>.<span class="w"> </span><span class="nv">She</span><span class="err">&#39;s automatically downgraded</span>
+<span class="err">to Silver tier until her balance recovers.</span>
+</code></pre></div>
+
+<h3 id="architecture-diagram-for-cryptocard">Architecture Diagram for CryptoCard</h3>
+<div class="codehilite"><pre><span></span><code><span class="w">  </span><span class="n">Alice</span><span class="s">&#39;s Wallet                  CryptoCard System</span>
+<span class="s">  +------------+                  +------------------+</span>
+<span class="s">  |            |  1. Sign msg     |                  |</span>
+<span class="s">  | MetaMask   |-----------------&gt;| Enrollment Page  |</span>
+<span class="s">  |            |  2. eth_getProof |                  |</span>
+<span class="s">  |            |-----------------&gt;| Dashboard        |</span>
+<span class="s">  +------------+                  +------------------+</span>
+<span class="s">                                         |</span>
+<span class="s">                                         v</span>
+<span class="s">                                  +------------------+</span>
+<span class="s">                                  | Solvency Agent   |</span>
+<span class="s">                                  |                  |</span>
+<span class="s">                                  | - Verify proofs  |</span>
+<span class="s">                                  | - Build trees    |</span>
+<span class="s">                                  | - Publish roots  |</span>
+<span class="s">                                  | - Serve proofs   |</span>
+<span class="s">                                  +------------------+</span>
+<span class="s">                                    |           |</span>
+<span class="s">                            publish |           | serve proof</span>
+<span class="s">                                    v           v</span>
+<span class="s">                                  +------------------+</span>
+<span class="s">                                  | Ethereum          |</span>
+<span class="s">                                  |                  |</span>
+<span class="s">                                  | SolvencyOracle   |</span>
+<span class="s">                                  | (4 policies:     |</span>
+<span class="s">                                  |  Standard/Silver |</span>
+<span class="s">                                  |  /Gold/Platinum) |</span>
+<span class="s">                                  +------------------+</span>
+<span class="s">                                         |</span>
+<span class="s">                                         | verifyMember()</span>
+<span class="s">                                         v</span>
+<span class="s">                                  +------------------+</span>
+<span class="s">                                  | CryptoCardTiers  |</span>
+<span class="s">                                  | Smart Contract   |</span>
+<span class="s">                                  |                  |</span>
+<span class="s">                                  | Gate card access |</span>
+<span class="s">                                  | based on tier    |</span>
+<span class="s">                                  +------------------+</span>
+</code></pre></div>
+
+<h3 id="what-cryptocard-knows-vs-doesnt-know">What CryptoCard Knows vs. Doesn't Know</h3>
+<table>
+<thead>
+<tr>
+<th>Information</th>
+<th>Known to CryptoCard?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Alice's wallet address</td>
+<td><strong>No</strong></td>
+</tr>
+<tr>
+<td>Alice's exact ETH balance</td>
+<td><strong>No</strong></td>
+</tr>
+<tr>
+<td>Alice holds &gt;= 100 ETH</td>
+<td><strong>Yes</strong> (while Platinum proof verifies)</td>
+</tr>
+<tr>
+<td>Alice's other crypto holdings</td>
+<td><strong>No</strong></td>
+</tr>
+<tr>
+<td>Alice's transaction history</td>
+<td><strong>No</strong></td>
+</tr>
+<tr>
+<td>Alice's identity</td>
+<td>Only if she provided KYC separately</td>
+</tr>
+<tr>
+<td>Alice dropped below threshold</td>
+<td><strong>Yes</strong> (proof stops verifying in next epoch)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="cost-breakdown-for-cryptocard">Cost Breakdown for CryptoCard</h3>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Cost</th>
+<th>Frequency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Policy creation (4 tiers)</td>
+<td>~200k gas x 4</td>
+<td>One-time</td>
+</tr>
+<tr>
+<td>Root publication per tier</td>
+<td>~100k gas</td>
+<td>Daily per tier</td>
+</tr>
+<tr>
+<td>Total daily publication (4 tiers)</td>
+<td>~400k gas (~$2-5 at typical gas prices)</td>
+<td>Daily</td>
+</tr>
+<tr>
+<td>Per-user tier verification</td>
+<td>~8k gas</td>
+<td>Per card use</td>
+</tr>
+<tr>
+<td>Solvency Agent hosting</td>
+<td>Standard server costs</td>
+<td>Ongoing</td>
+</tr>
+</tbody>
+</table>
+<p>For 1,000 cardholders across 4 tiers, the daily root publication cost is shared: approximately $0.005 per user per day.</p>
+<hr />
+<h2 id="9-technical-reference">9. Technical Reference</h2>
+<h3 id="merkle-leaf-structure">Merkle Leaf Structure</h3>
+<p>Each member's status is encoded as a Merkle tree leaf:</p>
+<div class="codehilite"><pre><span></span><code>leaf = SHA256(memberId || status || epoch || policyId)
+
+Where:
+  memberId:  32 bytes  (SHA256 of enrollment signature)
+  status:     1 byte   (0x01 = solvent, 0x00 = insolvent)
+  epoch:      8 bytes   (big-endian uint64)
+  policyId:  32 bytes  (policy identifier)
+</code></pre></div>
+
+<h3 id="member-id-computation">Member ID Computation</h3>
+<div class="codehilite"><pre><span></span><code><span class="ss">message</span>  <span class="o">=</span> <span class="s2">&quot;zkpof-holder-v1:{scope}:{nonce}&quot;</span>
+<span class="ss">signature</span> <span class="o">=</span> wallet<span class="o">.</span>sign<span class="p">(</span>message<span class="p">)</span>
+<span class="ss">memberId</span>  <span class="o">=</span> SHA256<span class="p">(</span>signature<span class="p">)</span>
+</code></pre></div>
+
+<p>Properties:
+- <strong>Deterministic</strong>: Same wallet + scope + nonce always produces the same memberId
+- <strong>Non-invertible</strong>: Cannot recover the wallet address from the memberId
+- <strong>Unlinkable</strong>: Different scopes produce different memberIds for the same wallet</p>
+<h3 id="state-proof-verification-eip-1186">State Proof Verification (EIP-1186)</h3>
+<p>The system uses Ethereum's native <code>eth_getProof</code> RPC method to obtain cryptographic proofs of account state:</p>
+<div class="codehilite"><pre><span></span><code><span class="mf">1.</span><span class="w"> </span><span class="n">User</span><span class="w"> </span><span class="n">calls</span><span class="p">:</span><span class="w"> </span><span class="n">eth_getProof</span><span class="p">(</span><span class="n">address</span><span class="p">,</span><span class="w"> </span><span class="err">[]</span><span class="p">,</span><span class="w"> </span><span class="n">blockNumber</span><span class="p">)</span>
+
+<span class="mf">2.</span><span class="w"> </span><span class="n">Node</span><span class="w"> </span><span class="kr">return</span><span class="n">s</span><span class="p">:</span><span class="w"> </span><span class="err">{</span>
+<span class="w">     </span><span class="n">accountProof</span><span class="p">:</span><span class="w"> </span><span class="err">[</span><span class="n">RLP</span><span class="o">-</span><span class="n">encoded</span><span class="w"> </span><span class="n">MPT</span><span class="w"> </span><span class="n">nodes</span><span class="mf">...</span><span class="err">]</span><span class="p">,</span>
+<span class="w">     </span><span class="n">balance</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;0x...&quot;</span><span class="p">,</span>
+<span class="w">     </span><span class="n">nonce</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;0x...&quot;</span><span class="p">,</span>
+<span class="w">     </span><span class="mf">...</span>
+<span class="w">   </span><span class="err">}</span>
+
+<span class="mf">3.</span><span class="w"> </span><span class="n">Agent</span><span class="w"> </span><span class="n">verifies</span><span class="p">:</span>
+<span class="w">   </span><span class="n">a</span><span class="mf">.</span><span class="w"> </span><span class="n">Fetch</span><span class="w"> </span><span class="n">state</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="kr">for</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">given</span><span class="w"> </span><span class="n">block</span>
+<span class="w">   </span><span class="n">b</span><span class="mf">.</span><span class="w"> </span><span class="n">Compute</span><span class="w"> </span><span class="n">trie</span><span class="w"> </span><span class="n">key</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">keccak256</span><span class="p">(</span><span class="n">address</span><span class="p">)</span>
+<span class="w">   </span><span class="n">c</span><span class="mf">.</span><span class="w"> </span><span class="n">Walk</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">MPT</span><span class="w"> </span><span class="n">proof</span><span class="w"> </span><span class="n">nodes</span><span class="w"> </span><span class="n">from</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="kr">to</span><span class="w"> </span><span class="n">leaf</span>
+<span class="w">   </span><span class="n">d</span><span class="mf">.</span><span class="w"> </span><span class="kr">Verify</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">proved</span><span class="w"> </span><span class="n">account</span><span class="err">&#39;</span><span class="n">s</span><span class="w"> </span><span class="n">balance</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="n">threshold</span>
+</code></pre></div>
+
+<h3 id="smart-contract-interface">Smart Contract Interface</h3>
+<div class="codehilite"><pre><span></span><code>interface<span class="w"> </span>ISolvencyOracle<span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">/// Verify a member is included in a solvency root with given status.</span>
+<span class="w">    </span><span class="kt">function</span><span class="w"> </span><span class="nv">verifyMember</span><span class="p">(</span>
+<span class="w">        </span><span class="kt">bytes32</span><span class="w"> </span><span class="nv">policyId</span><span class="p">,</span>
+<span class="w">        </span><span class="kt">bytes32</span><span class="w"> </span><span class="nv">memberId</span><span class="p">,</span>
+<span class="w">        </span><span class="kt">uint8</span><span class="w"> </span><span class="nv">status</span><span class="p">,</span>
+<span class="w">        </span><span class="kt">uint64</span><span class="w"> </span><span class="nv">epoch</span><span class="p">,</span>
+<span class="w">        </span><span class="kt">bytes32</span><span class="p">[]</span><span class="w"> </span>calldata<span class="w"> </span>merkleProof<span class="p">,</span>
+<span class="w">        </span><span class="kt">uint256</span><span class="w"> </span><span class="nv">leafIndex</span><span class="p">,</span>
+<span class="w">        </span><span class="kt">uint256</span><span class="w"> </span><span class="nv">rootIndex</span>
+<span class="w">    </span><span class="p">)</span><span class="w"> </span><span class="kt">external</span><span class="w"> </span>view<span class="w"> </span><span class="kt">returns</span><span class="w"> </span><span class="p">(</span><span class="kt">bool</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">/// Convenience: verify member is solvent (status=1).</span>
+<span class="w">    </span><span class="kt">function</span><span class="w"> </span><span class="nv">isMemberSolvent</span><span class="p">(</span>
+<span class="w">        </span><span class="kt">bytes32</span><span class="w"> </span><span class="nv">policyId</span><span class="p">,</span>
+<span class="w">        </span><span class="kt">bytes32</span><span class="w"> </span><span class="nv">memberId</span><span class="p">,</span>
+<span class="w">        </span><span class="kt">uint64</span><span class="w"> </span><span class="nv">epoch</span><span class="p">,</span>
+<span class="w">        </span><span class="kt">bytes32</span><span class="p">[]</span><span class="w"> </span>calldata<span class="w"> </span>merkleProof<span class="p">,</span>
+<span class="w">        </span><span class="kt">uint256</span><span class="w"> </span><span class="nv">leafIndex</span><span class="p">,</span>
+<span class="w">        </span><span class="kt">uint256</span><span class="w"> </span><span class="nv">rootIndex</span>
+<span class="w">    </span><span class="p">)</span><span class="w"> </span><span class="kt">external</span><span class="w"> </span>view<span class="w"> </span><span class="kt">returns</span><span class="w"> </span><span class="p">(</span><span class="kt">bool</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3 id="two-verification-modes">Two Verification Modes</h3>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Root Publication</th>
+<th>Security Model</th>
+<th>Gas Cost</th>
+<th>Speed</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Trusted</strong></td>
+<td>EIP-712 operator signature</td>
+<td>Trust the operator</td>
+<td>~100k gas</td>
+<td>Instant</td>
+</tr>
+<tr>
+<td><strong>ZK</strong></td>
+<td>SP1 Groth16 proof</td>
+<td>Trustless (ZK verified)</td>
+<td>~270k gas</td>
+<td>Minutes (proving time)</td>
+</tr>
+</tbody>
+</table>
+<p>Both modes produce the same Merkle root structure, so relying protocols use the same <code>verifyMember()</code> interface regardless of mode.</p>
+<hr />
+<h2 id="10-glossary">10. Glossary</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Definition</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Member</strong></td>
+<td>A user enrolled in a solvency policy</td>
+</tr>
+<tr>
+<td><strong>Member ID</strong></td>
+<td>Privacy-preserving identifier: SHA256(enrollment signature)</td>
+</tr>
+<tr>
+<td><strong>Policy</strong></td>
+<td>A set of rules defining what balance threshold to check, how often, and on which chain</td>
+</tr>
+<tr>
+<td><strong>Epoch</strong></td>
+<td>A time interval (measured in blocks) at which the solvency state is updated</td>
+</tr>
+<tr>
+<td><strong>Merkle Root</strong></td>
+<td>A single 32-byte hash summarizing the solvency status of ALL members in a policy</td>
+</tr>
+<tr>
+<td><strong>Merkle Proof</strong></td>
+<td>A list of sibling hashes proving a specific member is included in the Merkle root</td>
+</tr>
+<tr>
+<td><strong>Solvency Agent</strong></td>
+<td>The off-chain middleware that processes proofs and publishes roots</td>
+</tr>
+<tr>
+<td><strong>EIP-1186</strong></td>
+<td>Ethereum standard for <code>eth_getProof</code> - cryptographic proof of account state</td>
+</tr>
+<tr>
+<td><strong>MPT</strong></td>
+<td>Merkle-Patricia Trie - Ethereum's state storage data structure</td>
+</tr>
+<tr>
+<td><strong>SP1</strong></td>
+<td>Succinct's zkVM - a zero-knowledge virtual machine for writing ZK circuits in Rust</td>
+</tr>
+<tr>
+<td><strong>Trusted Mode</strong></td>
+<td>Verification via operator's EIP-712 signature (fast, requires trust)</td>
+</tr>
+<tr>
+<td><strong>ZK Mode</strong></td>
+<td>Verification via SP1 zero-knowledge proof (slower, trustless)</td>
+</tr>
+<tr>
+<td><strong>Root TTL</strong></td>
+<td>Time-to-live for a published root - how long it remains valid for verification</td>
+</tr>
+<tr>
+<td><strong>Scope</strong></td>
+<td>A string used to generate unique Member IDs per policy (enables unlinkability)</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<p><em>ZK Proof of Funds is open-source software. For technical documentation, see ARCHITECTURE.md and the project repository.</em></p>
+</body>
+</html>

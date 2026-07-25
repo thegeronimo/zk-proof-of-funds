@@ -14,6 +14,16 @@
 > (receipt_scan, 160-byte public values) is implemented; wallet-side nullifier
 > crypto ships as `@zk-proof-of-funds/sdk/plume`; production vkeys live in
 > `config/vkeys.env`.
+>
+> **Phase 13 amendments** (normative): the nullifier is now computed **exactly
+> as ERC-7524 specifies** — `N = hash_to_curve(scope_hash ‖ sec1(pk))^sk` over
+> a 32-byte message with the standard `secp256k1_XMD:SHA-256_SSWU_RO_` suite —
+> so a wallet implementing `eth_getPlumeSignature` derives the same member
+> identity (§3.1, §3.3). Identity separation moves from `policy_id` to a
+> **scope hash** (default `SHA256("zkpof-scope-v1:" ‖ policy_id)`), making
+> cross-policy shared identity an opt-in configuration. Membership public
+> values are 224 bytes (adds `scopeHash`). Stage B.2 composition is enforced
+> on-chain by `publishRootProvenComplete` (§4.3-§4.4).
 
 ---
 
@@ -96,36 +106,43 @@ All points are secp256k1, SEC1-encoded. Compressed points are 33 bytes.
 `H` is SHA-256. `‖` is byte concatenation.
 
 ```
-DST_H2C   = "zkpof-v1:secp256k1_XMD:SHA-256_SSWU_RO_"          (ASCII, RFC 9380 XMD:SHA-256 SSWU RO)
-msg_pol   = "zkpof-nullifier-v2:" ‖ lowercase_hex(policy_id)    (ASCII; 19 + 64 chars)
+DST_H2C    = "secp256k1_XMD:SHA-256_SSWU_RO_"        (RFC 9380 / ERC-7524 standard suite)
+scope_hash = H("zkpof-scope-v1:" ‖ policy_id)        (32 bytes; default — may be shared)
 
-pk        = g · sk                                              (secp256k1 generator g)
-h         = hash_to_curve(msg_pol ‖ pk_compressed, DST_H2C)     (RFC 9380 hash-to-curve)
-N         = h · sk                                              (the nullifier, a curve point)
-nullifier_hash = H(N_compressed)                                (32 bytes)
+pk         = g · sk                                  (secp256k1 generator g)
+h          = hash_to_curve(scope_hash ‖ sec1(pk), DST_H2C)   (65-byte input, per ERC-7524)
+N          = h · sk                                  (the nullifier, a curve point)
+nullifier_hash = H(sec1(N))                          (32 bytes)
 
-member_id = nullifier_hash
+member_id  = nullifier_hash
 ```
+
+**This is the ERC-7524 nullifier**, with `scope_hash` as the ERC's 32-byte
+message `m`. Matching it exactly is deliberate: it is what allows a wallet to
+produce this identity natively (§3.3), and it costs nothing, since the scope
+already had to be a 32-byte domain separator.
 
 Properties:
 
 - **Deterministic**: one and only one `N` exists per `(sk, policy_id)`. No nonce,
   no signer discretion, no malleability. The multiplicity attacks in §1(3) are
   structurally impossible.
-- **Unlinkable across policies**: different `policy_id` → different `h` →
-  unrelated nullifiers. (V1's string `scope` gave scope-level linkage; V2 binds to
-  `policy_id` because `policy_id` is what the chain can verify. If two policies
-  intentionally want shared identities, a committed `scope_hash` can be added to
-  the public values later — noted in §7.)
+- **Unlinkable across scopes**: different `scope_hash` → different `h` →
+  unrelated nullifiers. Each policy gets its own scope by default, so policies
+  are mutually unlinkable. Two policies that *want* one sybil-resistance
+  namespace configure the same explicit scope
+  (`SolventSetOracle.setScopeHash`); the membership proof commits `scope_hash`
+  publicly so the contract pins it to the policy's configured value.
 - **Non-invertible**: recovering `pk` or the address from `N` requires breaking
   DDH-style assumptions on secp256k1; `nullifier_hash` additionally hides `N`.
 - `pk` is folded into the hash-to-curve input (as in PLUME) so each key gets a
   distinct base point `h`.
 
-This is the PLUME construction ("Verifiably Deterministic Signatures on ECDSA",
-2022) with project-specific domain separation. We do not claim wire-format
-compatibility with the PLUME spec's test vectors; parameters above are normative
-for this project.
+The *nullifier* above is wire-compatible with ERC-7524 (PLUME Signature in
+Wallets, Draft). The *DLEQ proof encoding* below is project-specific: the ERC
+defines its own challenge layout (V1/V2 variants), which we do not claim to
+match. Only the nullifier — the identity-defining value, and the one baked
+into on-chain nullifier sets — needs to agree for wallet interoperability.
 
 ### 3.2 Proving the nullifier is well-formed
 
@@ -137,15 +154,15 @@ is the point of monitored mode) plus a **Chaum–Pedersen DLEQ proof** that
 `log_g(pk) = log_h(N)`:
 
 ```
-r  = reduce(H("zkpof-dleq-nonce-v1" ‖ sk_be32 ‖ pk ‖ N ‖ msg_pol))   (deterministic nonce; reject r = 0)
+r  = reduce(H("zkpof-dleq-nonce-v1" ‖ sk_be32 ‖ pk ‖ N ‖ scope_hash))   (deterministic nonce; reject r = 0)
 A  = g · r
 B  = h · r
-c  = reduce(H("zkpof-dleq-chal-v1" ‖ pk ‖ N ‖ A ‖ B ‖ msg_pol))
+c  = reduce(H("zkpof-dleq-chal-v1" ‖ pk ‖ N ‖ A ‖ B ‖ scope_hash))
 s  = r + c · sk  (mod n)
 
 proof = (A, B, s)      — 33 + 33 + 32 = 98 bytes
 verify: g·s == A + pk·c   AND   h·s == B + N·c
-        (verifier recomputes h from msg_pol and pk; rejects identity/invalid points)
+        (verifier recomputes h from scope_hash and pk; rejects identity/invalid points)
 ```
 
 `reduce` maps 32 bytes to a scalar mod `n`; the modulo bias is ≤ 2⁻¹²⁷ for
@@ -156,23 +173,39 @@ the zkVM computes `N = hash_to_curve(msg_pol ‖ pk) · sk` directly from the pr
 `sk` and commits `nullifier_hash` as a public output. The proof of the whole
 program subsumes well-formedness.
 
-### 3.3 Wallet-support caveat (honest limits)
+### 3.3 Wallet support: why a snap cannot do this, and what can
 
-Computing `N` requires raw access to `sk`. Browser wallets (MetaMask et al.) do
-not expose it; PLUME requires wallet cooperation (`eth_getPlumeSignature`
-proposals, MetaMask snaps, or embedded/local signers). Consequences:
+Computing `N` requires the raw `sk`, which a browser wallet never exposes.
+
+**A MetaMask snap cannot close this gap.** Snaps derive keys through
+`snap_getBip32Entropy` / `snap_getBip44Entropy`, and **coin type 60 — the
+Ethereum path — is reserved for MetaMask's own accounts and blocked for
+snaps**; the documented way for a snap to touch an EOA is
+`endowment:ethereum-provider`, which *requests signatures* rather than
+exposing keys. So a snap can only ever produce nullifiers for keys it
+generates itself, whose addresses are not the user's and therefore are not in
+the solvent set. Snap packaging is not a missing sprint of work here; it is
+the wrong shape of solution.
+
+**The right shape is wallet-native PLUME**: ERC-7524 (Draft) specifies
+`eth_getPlumeSignature`, where the wallet computes `nullifier = htc(m ‖
+sec1(pk))^sk` internally and returns it — no key exposure. Since Phase 13 our
+nullifier *is* that construction (§3.1) with `m = scope_hash`, so a wallet
+shipping ERC-7524 produces exactly the member identity this system uses. The
+remaining work is adapting the ERC's proof encoding, not the identity.
+
+Consequences today:
 
 - The Rust implementation is the reference, and `zkpof-client` (Phase 11) is
   the supported local-signer path: `nullifier`/`enroll`/`witness`/`prove`
   subcommands compute everything key-touching on the user's machine. The React
   app keeps the legacy signature flow for enrollment (plus a read-only
   solvent-set panel with local membership checks) until wallet support exists.
-- Phase 12 adds the JavaScript port: `@zk-proof-of-funds/sdk/plume`
-  (@noble/curves + @noble/hashes, locked byte-for-byte to the Rust reference
-  by shared test vectors). `buildEnrollV2Request(sk, policyId)` gives any
-  raw-key JS context — a MetaMask snap, an embedded wallet, a Node script —
-  everything `POST /v2/enroll` needs. Snap *packaging* remains open; the
-  crypto no longer is.
+- `@zk-proof-of-funds/sdk/plume` is the JavaScript port (@noble/curves +
+  @noble/hashes, locked byte-for-byte to the Rust reference by shared test
+  vectors). `buildEnrollV2Request(sk, policyId, scope?)` gives any raw-key JS
+  context — an embedded wallet, a key-holding service, a Node script —
+  everything `POST /v2/enroll` needs.
 - The legacy `SHA256(signature)` path is **retained but hardened**: low-`s`
   signatures are now enforced (EIP-2 half-order check), which closes the
   third-party malleability attack. The owner-multiplicity attack is inherent to
@@ -232,16 +265,18 @@ downloaders. The anonymity set is every solvent address on the chain.
 
 ```
 Private inputs:  sk (32B), streak (u32), merkle_siblings (Vec<[u8;32]>), leaf_index (u64)
-Public inputs:   solvent_set_root (32B), policy_id (32B), epoch (u64), chain_id (u64), min_streak (u64)
+Public inputs:   solvent_set_root (32B), policy_id (32B), epoch (u64), chain_id (u64),
+                 min_streak (u64), scope_hash (32B)
 
 1. assert sk is a valid nonzero scalar; pk = g · sk
 2. address = keccak256(pk_uncompressed[1..65])[12..32]
 3. assert streak >= min_streak                       (time-dimension gate)
 4. leaf = SHA256("zkpof-solvent-leaf-v2" ‖ address ‖ streak_be4)
 5. assert MerkleVerify(leaf, leaf_index, merkle_siblings, solvent_set_root)
-6. N = hash_to_curve("zkpof-nullifier-v2:" ‖ hex(policy_id) ‖ pk_compressed, DST_H2C) · sk
-7. nullifier_hash = SHA256(N_compressed)
-8. commit abi.encode(solvent_set_root, policy_id, epoch, nullifier_hash, chain_id, min_streak)
+6. N = hash_to_curve(scope_hash ‖ sec1(pk), DST_H2C) · sk        (ERC-7524 form)
+7. nullifier_hash = SHA256(sec1(N))
+8. commit abi.encode(solvent_set_root, policy_id, epoch, nullifier_hash, chain_id,
+                     min_streak, scope_hash)
 ```
 
 The exact streak stays private — the proof reveals only that it meets the
@@ -249,8 +284,10 @@ policy minimum, not how long the member has actually held funds.
 
 **Public values ABI (normative):** `abi.encode(bytes32 solventSetRoot,
 bytes32 policyId, uint64 epoch, bytes32 nullifierHash, uint64 chainId,
-uint64 minStreak)` — six 32-byte words, 192 bytes, committed as a single
-`commit_slice` blob so Solidity `abi.decode` consumes it directly.
+uint64 minStreak, bytes32 scopeHash)` — seven 32-byte words, 224 bytes,
+committed as a single `commit_slice` blob so Solidity `abi.decode` consumes it
+directly. The contract checks `scopeHash == effectiveScopeHash(policyId)`, so
+a proof scoped to another policy cannot be replayed under this one.
 
 Note the unification: `nullifier_hash` here equals `member_id` from Construction
 A. A member enrolled in monitored mode and the same key proving client-side in V2
@@ -267,11 +304,18 @@ interchangeable per policy without integration changes.
   (state root extracted from the header by a fixed-shape RLP walk), checks
   `prevRoot` against the stored history (streak continuity), and cross-checks
   the policy's threshold/chain. Entries record a `proven` flag.
+- `publishRootProvenComplete(policyId, headerRlp, publicValues, proofBytes,
+  scanPublicValues, scanProofBytes)` — **anyone** may call: additionally
+  verifies a receipt-scan proof (§4.4 Stage B.2) and enforces the composition
+  `scan.participantsRoot == derivation.candidatesRoot`, plus that the scan
+  covers the policy's token and ends at the current chain tip
+  (`blockhash(block.number - 1)`), so a stale scan cannot be replayed.
+  Policies with `requiresCompleteness` set accept *only* this path.
 - `verifyMembership(policyId, rootIndex, publicValues, proofBytes) →
   (nullifierHash, minStreak)` — view; checks TTL, verifies the SP1 proof
   against `membershipVKey`, decodes and cross-checks the public values against
-  the stored entry. Relying protocols requiring "solvent ≥ k epochs" check
-  `minStreak >= k`.
+  the stored entry, and pins `scopeHash` to the policy's configured scope.
+  Relying protocols requiring "solvent ≥ k epochs" check `minStreak >= k`.
 - `verifyAndConsume(...)` — same, then marks `usedNullifiers[policyId][nullifierHash]`,
   reverting on reuse. For one-per-address semantics (votes, mints). Protocols that
   want their own consumption namespace use the view function and track nullifiers
@@ -313,18 +357,28 @@ The derivation is the only part of V2 where trust is staged rather than immediat
   and commit the participant set as `participants_root` — the same
   construction the derivation proof commits as `candidates_root`. Equality of
   the two roots shows the derivation missed no holder active in the scanned
-  window. Remaining: the on-chain composition check and operator tooling to
-  build the witness (fetch raw receipts, rebuild tries). Caveats: nonstandard
-  tokens (rebasing, fee-on-transfer) break log accounting and must be flagged
-  per policy.
+  window — and that composition is **enforced on-chain** by
+  `publishRootProvenComplete`. Witness building ships as
+  `zkpof-client scan-witness` / `agent::scan_witness`: it re-encodes receipts
+  per EIP-2718, rebuilds each block's receipts trie, and accepts the result
+  only when `keccak256(header) == block.hash` and the rebuilt root equals the
+  header's `receiptsRoot` — so a bad reconstruction fails at build time rather
+  than producing an unprovable witness, and the witness *producer* is never
+  trusted. Caveats: nonstandard tokens (rebasing, fee-on-transfer) break log
+  accounting and must be flagged per policy; the scan must start from the
+  token's deployment (or a checkpointed set) to be a true superset.
 - **Stage C (research)**: multi-party or light-client-verified candidate
   sourcing so even the candidate list needs no single operator.
 
-An honest framing of the residual trust: with Stage B, an operator (or anyone
-publishing) can no longer fake balances or streaks — but whoever assembles the
-candidate list can still *omit* an address (censorship → liveness failure for
-that user, visible to them immediately in the public set). TTL and
-epoch-increasing rules bound the damage window on-chain.
+An honest framing of the residual trust: with Stage B nobody can fake balances
+or streaks, and with Stage B.2 enforced (`requiresCompleteness`) nobody can
+silently omit a holder either — the published root must cover every address the
+scan saw. What remains is the scan's own starting point: a range that begins
+after the token's first Transfer proves completeness only relative to that
+window, so policies must pin a range (deployment block, or a checkpoint whose
+set is itself proven). For native-ETH policies completeness is still
+unproven — there is no log trail for plain balance changes, which is why
+Stage C (light-client-verified state enumeration) remains open.
 
 ### 4.5 What V2 deliberately does not solve
 
@@ -385,16 +439,39 @@ entry list (SDK, `crates/common`, and `zkpof-client` all implement it).
 
 ## 7. Open items
 
-- On-chain composition: require `scan.participants_root ==
-  derivation.candidates_root` when a policy demands completeness-proven
-  publication (both commitment surfaces exist; the equality check does not yet).
-- Receipt-scan witness tooling: fetch raw receipts and rebuild the tries
-  (any full node can produce the witness; the proof does not trust it).
-- MetaMask snap packaging around `sdk/plume` (the crypto is done; the snap
-  shell, permissions, and distribution are not).
-- Browser proving target: SP1 is not browser-feasible today; either delegate
-  proving with TEE privacy, or compile the membership statement to a small
-  dedicated circuit (circom/noir) with the same public-values ABI.
-- Committed `scope_hash` if cross-policy shared identity is wanted.
-- Remove the deprecated `wallet_address` fallback from `/submit_proof` once
-  all clients send `trie_key`.
+Closed since the last revision: on-chain completeness composition, receipt-scan
+witness tooling, `scope_hash`, and the plaintext-address fallback (see §4.3,
+§4.4, §3.1, and the note below). What genuinely remains:
+
+- **Native-ETH completeness.** Stage B.2 proves candidate completeness from
+  Transfer logs, which only exist for tokens. Plain ETH balance changes leave
+  no log trail, so a native-ETH policy's candidate list is still
+  operator-assembled. Closing this needs proven state enumeration
+  (RSP-style block execution, or a light-client-verified state snapshot) —
+  Stage C.
+- **Scan range provenance.** A completeness proof is relative to the block
+  range it scanned. Policies must pin a range that starts at the token's
+  deployment or at a checkpoint whose participant set is itself proven;
+  the contract currently checks only that the scan *ends* at the chain tip.
+- **ERC-7524 proof-format adapter.** Our nullifier already matches the ERC
+  exactly, so a wallet's `eth_getPlumeSignature` yields the right identity;
+  consuming a wallet-produced *proof* additionally needs a verifier for the
+  ERC's own challenge encoding (V1/V2), which should be written against the
+  reference implementation's test vectors rather than from the prose spec.
+- **Browser-native proving.** SP1 cannot prove in a browser. The two viable
+  paths are (a) a small dedicated circuit (circom/noir) for the membership
+  statement with the same 224-byte public-values ABI — which needs a trusted
+  setup ceremony, not just code — or (b) delegated proving with a TEE
+  privacy boundary. `zkpof-client` remains the supported client prover.
+- **Ops hardening for proving**: real Groth16 runs on prover infrastructure,
+  vkey rotation procedure, and monitoring — tracked under Phase 9.
+
+Explicitly *not* planned:
+
+- **MetaMask snap packaging.** Blocked by design, not by effort: snaps cannot
+  derive coin type 60, so they cannot produce a nullifier for the user's own
+  EOA (§3.3). ERC-7524 is the path that actually works.
+- **Removing the `wallet_address` field entirely.** It is already rejected by
+  default (`ZKPOF_ALLOW_PLAINTEXT_ADDRESS=1` re-enables it for un-migrated
+  integrators); deleting the field outright is a breaking API change to
+  schedule with integrators rather than a code gap.

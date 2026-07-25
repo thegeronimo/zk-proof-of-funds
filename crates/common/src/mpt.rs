@@ -469,6 +469,81 @@ mod tests {
     }
 
     #[test]
+    fn test_build_trie_roundtrips_with_enumeration() {
+        use super::{build_trie, receipt_trie_key};
+        use crate::receipt_scan::enumerate_trie_values;
+
+        // Values large enough to be hashed nodes, plus a tiny one that ends up
+        // inline — both paths must survive the round trip.
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..5u64)
+            .map(|i| (receipt_trie_key(i), vec![i as u8; 40 + i as usize]))
+            .chain(std::iter::once((receipt_trie_key(9), vec![0xAB])))
+            .collect();
+
+        let (root, nodes) = build_trie(&entries);
+        assert_ne!(root, EMPTY_TRIE_ROOT);
+
+        let mut values = enumerate_trie_values(&root, &nodes).unwrap();
+        let mut expected: Vec<Vec<u8>> = entries.iter().map(|(_, v)| v.clone()).collect();
+        values.sort();
+        expected.sort();
+        assert_eq!(values, expected, "Every stored value must be enumerable");
+    }
+
+    #[test]
+    fn test_build_trie_matches_independent_fixtures() {
+        use super::build_trie;
+        use crate::solvent_derivation::fixtures::{single_leaf_trie, two_leaf_trie};
+
+        // The builder must agree byte-for-byte with the hand-written fixture
+        // constructions (which the receipt-scan and derivation suites already
+        // verify against the real walker).
+        let key = keccak256(&[0x11; 20]);
+        let value = vec![0xAB; 40];
+        let (fixture_root, fixture_nodes) = single_leaf_trie(key, value.clone());
+        let (built_root, built_nodes) = build_trie(&[(key.to_vec(), value)]);
+        assert_eq!(built_root, fixture_root, "single-leaf root must match");
+        assert_eq!(built_nodes, fixture_nodes);
+
+        // Two keys splitting at the first nibble → branch + two leaves.
+        let key_a = keccak256(&[0x01; 20]);
+        let key_b = {
+            let mut candidate = keccak256(&[0x02; 20]);
+            let mut filler = 2u8;
+            while (candidate[0] >> 4) == (key_a[0] >> 4) {
+                filler += 1;
+                candidate = keccak256(&[filler; 20]);
+            }
+            candidate
+        };
+        let value_a = vec![0xAA; 40];
+        let value_b = vec![0xBB; 40];
+        let (fixture_root2, _, _) =
+            two_leaf_trie(key_a, value_a.clone(), key_b, value_b.clone());
+        let (built_root2, _) =
+            build_trie(&[(key_a.to_vec(), value_a), (key_b.to_vec(), value_b)]);
+        assert_eq!(built_root2, fixture_root2, "branch-node root must match");
+    }
+
+    #[test]
+    fn test_build_trie_empty_is_empty_root() {
+        use super::build_trie;
+        let (root, nodes) = build_trie(&[]);
+        assert_eq!(root, EMPTY_TRIE_ROOT);
+        assert!(nodes.is_empty());
+    }
+
+    #[test]
+    fn test_receipt_trie_key_encoding() {
+        use super::receipt_trie_key;
+        assert_eq!(receipt_trie_key(0), vec![0x80]);
+        assert_eq!(receipt_trie_key(1), vec![0x01]);
+        assert_eq!(receipt_trie_key(127), vec![0x7F]);
+        assert_eq!(receipt_trie_key(128), vec![0x81, 0x80]);
+        assert_eq!(receipt_trie_key(256), vec![0x82, 0x01, 0x00]);
+    }
+
+    #[test]
     fn test_account_balance_with_key_matches_address_path() {
         // Equivalent verification through the precomputed trie key.
         let state_root = [0xAA; 32];
@@ -490,4 +565,199 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("hash mismatch"));
     }
+}
+
+// ─── Trie construction (witness building) ───────────────────────────────────
+
+/// Build a Merkle-Patricia trie from `(key, value)` pairs and return
+/// `(root, nodes)` — every node of the finished trie, which is exactly the
+/// witness `enumerate_trie_values` needs.
+///
+/// Used to reconstruct a block's receipts trie from raw receipts
+/// (`key = rlp(index)`), so a Stage B.2 scan witness can be produced from any
+/// full node. The caller checks the returned root against the block header's
+/// `receiptsRoot`; a mismatch means the inputs were wrong, which is why this
+/// helper needs no trust.
+///
+/// Keys must be unique. Values are stored verbatim (already-encoded receipts).
+pub fn build_trie(entries: &[(Vec<u8>, Vec<u8>)]) -> (([u8; 32]), Vec<Vec<u8>>) {
+    if entries.is_empty() {
+        return (EMPTY_TRIE_ROOT, Vec::new());
+    }
+
+    // Work in nibble space; the builder is a straightforward recursive
+    // construction over the sorted key set.
+    let mut items: Vec<(Vec<u8>, Vec<u8>)> = entries
+        .iter()
+        .map(|(k, v)| (bytes_to_nibbles(k), v.clone()))
+        .collect();
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut nodes = Vec::new();
+    let reference = build_node(&items, 0, &mut nodes);
+
+    // The root reference is either a 32-byte hash (node already collected) or
+    // an inline node small enough to embed — in which case it is the root
+    // node itself and must be hashed.
+    let root = match reference {
+        NodeRef::Hash(h) => h,
+        NodeRef::Inline(encoded) => {
+            let h = keccak256(&encoded);
+            nodes.push(encoded);
+            h
+        }
+    };
+    (root, nodes)
+}
+
+/// A child reference inside the trie builder.
+enum NodeRef {
+    Hash([u8; 32]),
+    Inline(Vec<u8>),
+}
+
+impl NodeRef {
+    /// The RLP item a parent embeds for this child: a 32-byte string for
+    /// hashed nodes, or the node's own encoding inline.
+    fn to_rlp_item(&self) -> Vec<u8> {
+        match self {
+            NodeRef::Hash(h) => rlp_encode_bytes(h),
+            NodeRef::Inline(encoded) => encoded.clone(),
+        }
+    }
+}
+
+fn bytes_to_nibbles(bytes: &[u8]) -> Vec<u8> {
+    bytes.iter().flat_map(|b| [b >> 4, b & 0x0F]).collect()
+}
+
+/// Hex-prefix encode a nibble path.
+fn hp_encode(nibbles: &[u8], is_leaf: bool) -> Vec<u8> {
+    let flag = if is_leaf { 2u8 } else { 0u8 };
+    let mut out = Vec::with_capacity(nibbles.len() / 2 + 1);
+    if nibbles.len() % 2 == 1 {
+        out.push(((flag + 1) << 4) | nibbles[0]);
+        for pair in nibbles[1..].chunks(2) {
+            out.push((pair[0] << 4) | pair[1]);
+        }
+    } else {
+        out.push(flag << 4);
+        for pair in nibbles.chunks(2) {
+            out.push((pair[0] << 4) | pair[1]);
+        }
+    }
+    out
+}
+
+fn rlp_encode_bytes(data: &[u8]) -> Vec<u8> {
+    if data.len() == 1 && data[0] < 0x80 {
+        return data.to_vec();
+    }
+    let mut out = Vec::with_capacity(data.len() + 5);
+    if data.len() < 56 {
+        out.push(0x80 + data.len() as u8);
+    } else {
+        let len_bytes: Vec<u8> = data
+            .len()
+            .to_be_bytes()
+            .into_iter()
+            .skip_while(|b| *b == 0)
+            .collect();
+        out.push(0xB7 + len_bytes.len() as u8);
+        out.extend_from_slice(&len_bytes);
+    }
+    out.extend_from_slice(data);
+    out
+}
+
+fn rlp_encode_list(items: &[Vec<u8>]) -> Vec<u8> {
+    let payload: Vec<u8> = items.concat();
+    let mut out = Vec::with_capacity(payload.len() + 9);
+    if payload.len() < 56 {
+        out.push(0xC0 + payload.len() as u8);
+    } else {
+        let len_bytes: Vec<u8> = payload
+            .len()
+            .to_be_bytes()
+            .into_iter()
+            .skip_while(|b| *b == 0)
+            .collect();
+        out.push(0xF7 + len_bytes.len() as u8);
+        out.extend_from_slice(&len_bytes);
+    }
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// Finish a node: nodes ≥ 32 bytes encoded are hashed and collected; shorter
+/// ones are embedded inline in their parent (standard MPT rule).
+fn finish_node(encoded: Vec<u8>, nodes: &mut Vec<Vec<u8>>) -> NodeRef {
+    if encoded.len() >= 32 {
+        let hash = keccak256(&encoded);
+        nodes.push(encoded);
+        NodeRef::Hash(hash)
+    } else {
+        NodeRef::Inline(encoded)
+    }
+}
+
+/// Recursively build the subtrie covering `items` (sorted, sharing the first
+/// `depth` nibbles).
+fn build_node(items: &[(Vec<u8>, Vec<u8>)], depth: usize, nodes: &mut Vec<Vec<u8>>) -> NodeRef {
+    debug_assert!(!items.is_empty());
+
+    if items.len() == 1 {
+        let (key, value) = &items[0];
+        let encoded = rlp_encode_list(&[
+            rlp_encode_bytes(&hp_encode(&key[depth..], true)),
+            rlp_encode_bytes(value),
+        ]);
+        return finish_node(encoded, nodes);
+    }
+
+    // Longest common prefix beyond `depth` → extension node.
+    let first = &items[0].0;
+    let last = &items[items.len() - 1].0;
+    let mut common = depth;
+    while common < first.len() && common < last.len() && first[common] == last[common] {
+        common += 1;
+    }
+    if common > depth {
+        let child = build_node(items, common, nodes);
+        let encoded = rlp_encode_list(&[
+            rlp_encode_bytes(&hp_encode(&first[depth..common], false)),
+            child.to_rlp_item(),
+        ]);
+        return finish_node(encoded, nodes);
+    }
+
+    // Branch node: split by the nibble at `depth`.
+    let mut branch_items: Vec<Vec<u8>> = Vec::with_capacity(17);
+    for nibble in 0..16u8 {
+        let group: Vec<(Vec<u8>, Vec<u8>)> = items
+            .iter()
+            .filter(|(k, _)| k.len() > depth && k[depth] == nibble)
+            .cloned()
+            .collect();
+        if group.is_empty() {
+            branch_items.push(rlp_encode_bytes(&[]));
+        } else {
+            branch_items.push(build_node(&group, depth + 1, nodes).to_rlp_item());
+        }
+    }
+    // Value slot: a key that ends exactly here.
+    match items.iter().find(|(k, _)| k.len() == depth) {
+        Some((_, value)) => branch_items.push(rlp_encode_bytes(value)),
+        None => branch_items.push(rlp_encode_bytes(&[])),
+    }
+    finish_node(rlp_encode_list(&branch_items), nodes)
+}
+
+/// The receipts-trie key for transaction `index`: `rlp(index)`.
+pub fn receipt_trie_key(index: u64) -> Vec<u8> {
+    if index == 0 {
+        return rlp_encode_bytes(&[]);
+    }
+    let be: Vec<u8> = index.to_be_bytes().into_iter().skip_while(|b| *b == 0).collect();
+    rlp_encode_bytes(&be)
 }

@@ -17,6 +17,7 @@ import {SolventSetOracle} from "../src/SolventSetOracle.sol";
 ///   PROGRAM_VKEY          - Batch solvency program vkey (optional, defaults to 0x0)
 ///   MEMBERSHIP_VKEY       - V2 membership program vkey (optional; from `print-vkeys membership`)
 ///   DERIVATION_VKEY       - V2 derivation program vkey (optional; from `print-vkeys derivation`)
+///   RECEIPT_SCAN_VKEY     - Stage B.2 scan program vkey (optional; from `print-vkeys receipt-scan`)
 contract DeployScript is Script {
     function run() external {
         uint256 deployerKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
@@ -24,6 +25,7 @@ contract DeployScript is Script {
         bytes32 programVKey = vm.envOr("PROGRAM_VKEY", bytes32(0));
         bytes32 membershipVKey = vm.envOr("MEMBERSHIP_VKEY", bytes32(0));
         bytes32 derivationVKey = vm.envOr("DERIVATION_VKEY", bytes32(0));
+        bytes32 scanVKey = vm.envOr("RECEIPT_SCAN_VKEY", bytes32(0));
 
         vm.startBroadcast(deployerKey);
 
@@ -41,7 +43,8 @@ contract DeployScript is Script {
             address(registry),
             sp1Verifier,
             membershipVKey,
-            derivationVKey
+            derivationVKey,
+            scanVKey
         );
         console.log("SolventSetOracle deployed at:", address(solventSetOracle));
 

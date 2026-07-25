@@ -108,10 +108,8 @@ impl<'a> EnrollmentService<'a> {
         let member_id_hex = hex::encode(member_id);
 
         // 5. Check if already enrolled
-        if let Some(existing) = self.db.get_member(&member_id_hex)? {
-            if existing.policy_id == policy_id_hex {
-                bail!("Member {} is already enrolled in policy {}", member_id_hex, policy_id_hex);
-            }
+        if self.db.get_member_for_policy(&member_id_hex, policy_id_hex)?.is_some() {
+            bail!("Member {} is already enrolled in policy {}", member_id_hex, policy_id_hex);
         }
 
         // 6. Determine effective epoch (next epoch after enrollment)
@@ -145,6 +143,9 @@ impl<'a> EnrollmentService<'a> {
     }
 
     /// Process a V2 (nullifier) enrollment for the monitored flow.
+    ///
+    /// The nullifier's scope comes from `enrollment.scope_hash` (defaulting to
+    /// the policy's own scope).
     ///
     /// Verifies the DLEQ proof, checks the wallet's balance against the policy
     /// threshold (the address is derived transiently from the public key and
@@ -187,6 +188,10 @@ impl<'a> EnrollmentService<'a> {
 pub struct NullifierEnrollment<'a> {
     /// Policy identifier as 32-byte hex (0x prefix optional).
     pub policy_id_hex: &'a str,
+    /// Scope the nullifier is bound to. `None` uses the policy's default
+    /// scope (`SHA256("zkpof-scope-v1:" || policy_id)`); an explicit value
+    /// lets policies share one sybil-resistance namespace.
+    pub scope_hash: Option<[u8; 32]>,
     /// Compressed secp256k1 public key of the wallet.
     pub public_key: [u8; 33],
     /// Compressed nullifier point `N = hash_to_curve(msg, pk) * sk`.
@@ -226,11 +231,14 @@ pub fn register_nullifier_member(
 ) -> Result<EnrollmentResult> {
     let policy_id = parse_policy_id(enrollment.policy_id_hex)?;
     let policy_id_hex = hex::encode(policy_id); // canonical lowercase, no 0x
+    let scope_hash = enrollment
+        .scope_hash
+        .unwrap_or_else(|| plume::default_scope_hash(&policy_id));
 
     plume::verify_nullifier(
         &enrollment.public_key,
         &enrollment.nullifier,
-        &policy_id,
+        &scope_hash,
         &enrollment.proof,
     )
     .context("Nullifier DLEQ verification failed")?;
@@ -244,10 +252,8 @@ pub fn register_nullifier_member(
             policy_id_hex
         );
     }
-    if let Some(existing) = db.get_member(&member_id_hex)? {
-        if existing.policy_id == policy_id_hex {
-            bail!("Member {} is already enrolled in policy {}", member_id_hex, policy_id_hex);
-        }
+    if db.get_member_for_policy(&member_id_hex, &policy_id_hex)?.is_some() {
+        bail!("Member {} is already enrolled in policy {}", member_id_hex, policy_id_hex);
     }
 
     let effective_epoch = current_epoch + 1;
@@ -465,9 +471,27 @@ mod tests {
 
     fn nullifier_enrollment(sk: &[u8; 32], policy_id_hex: &'static str) -> NullifierEnrollment<'static> {
         let policy_id = parse_policy_id(policy_id_hex).unwrap();
-        let (nullifier, proof) = prove_nullifier(sk, &policy_id).unwrap();
+        let scope = zk_pof_common::plume::default_scope_hash(&policy_id);
+        let (nullifier, proof) = prove_nullifier(sk, &scope).unwrap();
         NullifierEnrollment {
             policy_id_hex,
+            scope_hash: None,
+            public_key: derive_public_key(sk).unwrap(),
+            nullifier,
+            proof,
+        }
+    }
+
+    /// Enrollment bound to an explicit shared scope.
+    fn scoped_enrollment(
+        sk: &[u8; 32],
+        policy_id_hex: &'static str,
+        scope: [u8; 32],
+    ) -> NullifierEnrollment<'static> {
+        let (nullifier, proof) = prove_nullifier(sk, &scope).unwrap();
+        NullifierEnrollment {
+            policy_id_hex,
+            scope_hash: Some(scope),
             public_key: derive_public_key(sk).unwrap(),
             nullifier,
             proof,
@@ -520,6 +544,28 @@ mod tests {
     }
 
     #[test]
+    fn test_shared_scope_gives_one_identity_across_policies() {
+        // Two policies configured with the same explicit scope produce the
+        // same memberId — the opt-in cross-policy identity.
+        let db = Database::open_in_memory().unwrap();
+        let sk = test_sk(5);
+        let shared = [0x5C; 32];
+
+        let a = register_nullifier_member(&db, &scoped_enrollment(&sk, POLICY_HEX, shared), 10)
+            .unwrap();
+        let b =
+            register_nullifier_member(&db, &scoped_enrollment(&sk, OTHER_POLICY_HEX, shared), 10)
+                .unwrap();
+        assert_eq!(a.member_id, b.member_id, "Shared scope => shared identity");
+
+        // ...and it differs from the default per-policy scope.
+        let db2 = Database::open_in_memory().unwrap();
+        let default_id =
+            register_nullifier_member(&db2, &nullifier_enrollment(&sk, POLICY_HEX), 10).unwrap();
+        assert_ne!(a.member_id, default_id.member_id);
+    }
+
+    #[test]
     fn test_register_nullifier_rejects_invalid_proof() {
         let db = Database::open_in_memory().unwrap();
         let mut enrollment = nullifier_enrollment(&test_sk(5), POLICY_HEX);
@@ -535,6 +581,7 @@ mod tests {
         let victim = nullifier_enrollment(&test_sk(5), POLICY_HEX);
         let attacker = NullifierEnrollment {
             policy_id_hex: POLICY_HEX,
+            scope_hash: None,
             public_key: derive_public_key(&test_sk(6)).unwrap(),
             nullifier: victim.nullifier,
             proof: victim.proof.clone(),

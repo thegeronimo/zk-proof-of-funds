@@ -42,8 +42,13 @@ contract SolventSetOracle is Ownable {
     // --- Constants ---
 
     /// @dev abi.encode(bytes32 root, bytes32 policyId, uint64 epoch,
-    ///      bytes32 nullifierHash, uint64 chainId, uint64 minStreak).
-    uint256 private constant MEMBERSHIP_PUBLIC_VALUES_LEN = 192;
+    ///      bytes32 nullifierHash, uint64 chainId, uint64 minStreak,
+    ///      bytes32 scopeHash).
+    uint256 private constant MEMBERSHIP_PUBLIC_VALUES_LEN = 224;
+
+    /// @dev abi.encode(bytes32 endBlockHash, uint64 numBlocks, address token,
+    ///      bytes32 participantsRoot, uint32 participantCount).
+    uint256 private constant SCAN_PUBLIC_VALUES_LEN = 160;
 
     /// @dev abi.encode(bytes32 stateRoot, bytes32 prevRoot, bytes32 newRoot,
     ///      bytes32 policyId, uint64 epoch, uint64 blockNumber, uint64 chainId,
@@ -79,6 +84,20 @@ contract SolventSetOracle is Ownable {
     ///         match it — a proof against the wrong slot proves nothing.
     mapping(bytes32 => uint64) public balanceSlotOf;
 
+    /// @notice Optional explicit nullifier scope. Zero means "use the policy's
+    ///         default scope" (`sha256("zkpof-scope-v1:" || policyId)`).
+    ///         Policies configured with the *same* scope deliberately share one
+    ///         member-identity namespace (PRIVACY_V2.md §3.1).
+    mapping(bytes32 => bytes32) public scopeHashOf;
+
+    /// @notice Policies that require a completeness-proven publication
+    ///         (Stage B.2): `publishRootProven` alone is rejected, only
+    ///         `publishRootProvenComplete` is accepted.
+    mapping(bytes32 => bool) public requiresCompleteness;
+
+    /// @notice Verification key of the receipt-scan program (program-receipt-scan/).
+    bytes32 public scanVKey;
+
     // --- Events ---
 
     event SolventSetRootPublished(
@@ -96,6 +115,9 @@ contract SolventSetOracle is Ownable {
     event MembershipVKeyUpdated(bytes32 oldVKey, bytes32 newVKey);
     event DerivationVKeyUpdated(bytes32 oldVKey, bytes32 newVKey);
     event BalanceSlotSet(bytes32 indexed policyId, uint64 balanceSlot);
+    event ScopeHashSet(bytes32 indexed policyId, bytes32 scopeHash);
+    event CompletenessRequirementSet(bytes32 indexed policyId, bool required);
+    event ScanVKeyUpdated(bytes32 oldVKey, bytes32 newVKey);
 
     // --- Custom Errors ---
 
@@ -114,6 +136,10 @@ contract SolventSetOracle is Ownable {
     error ChainIdMismatch(uint64 expected, uint64 actual);
     error TokenMismatch(address policyToken, address provenToken);
     error BalanceSlotMismatch(uint64 pinnedSlot, uint64 provenSlot);
+    error ScopeMismatch(bytes32 expected, bytes32 actual);
+    error CompletenessRequired(bytes32 policyId);
+    error CandidatesNotCovered(bytes32 participantsRoot, bytes32 candidatesRoot);
+    error ScanBlockNotCurrent(bytes32 expectedHash, bytes32 scanEndHash);
     error StaleReferenceBlock(uint256 currentBlock, uint64 blockNumber, uint64 maxBlockAge);
     error BlockhashUnavailable(uint64 blockNumber);
     error HeaderHashMismatch(bytes32 expected, bytes32 actual);
@@ -128,16 +154,20 @@ contract SolventSetOracle is Ownable {
     ///                        (or bytes32(0) until `print-vkeys` output is set).
     /// @param _derivationVKey Verification key of the derivation program
     ///                        (or bytes32(0) until `print-vkeys` output is set).
+    /// @param _scanVKey       Verification key of the receipt-scan program
+    ///                        (or bytes32(0); only needed for completeness).
     constructor(
         address _policyRegistry,
         address _sp1Verifier,
         bytes32 _membershipVKey,
-        bytes32 _derivationVKey
+        bytes32 _derivationVKey,
+        bytes32 _scanVKey
     ) Ownable(msg.sender) {
         policyRegistry = PolicyRegistry(_policyRegistry);
         sp1Verifier = ISP1Verifier(_sp1Verifier);
         membershipVKey = _membershipVKey;
         derivationVKey = _derivationVKey;
+        scanVKey = _scanVKey;
     }
 
     // --- Admin ---
@@ -154,6 +184,40 @@ contract SolventSetOracle is Ownable {
         bytes32 oldVKey = derivationVKey;
         derivationVKey = _vkey;
         emit DerivationVKeyUpdated(oldVKey, _vkey);
+    }
+
+    /// @notice Update the receipt-scan program verification key.
+    function setScanVKey(bytes32 _vkey) external onlyOwner {
+        bytes32 oldVKey = scanVKey;
+        scanVKey = _vkey;
+        emit ScanVKeyUpdated(oldVKey, _vkey);
+    }
+
+    /// @notice The nullifier scope a policy's membership proofs must use.
+    /// @dev Defaults to `sha256("zkpof-scope-v1:" || policyId)`, mirroring
+    ///      `zk_pof_common::plume::default_scope_hash`.
+    function effectiveScopeHash(bytes32 policyId) public view returns (bytes32) {
+        bytes32 configured = scopeHashOf[policyId];
+        if (configured != bytes32(0)) return configured;
+        return sha256(abi.encodePacked("zkpof-scope-v1:", policyId));
+    }
+
+    /// @notice Configure an explicit nullifier scope (operator-only).
+    /// @dev Setting the same scope on two policies makes them share one member
+    ///      identity namespace — deliberate linkage, opt-in only.
+    function setScopeHash(bytes32 policyId, bytes32 scope) external {
+        PolicyRegistry.Policy memory policy = policyRegistry.getPolicy(policyId);
+        if (msg.sender != policy.operator) revert NotOperator(msg.sender, policy.operator);
+        scopeHashOf[policyId] = scope;
+        emit ScopeHashSet(policyId, scope);
+    }
+
+    /// @notice Require completeness-proven publication for a policy (operator-only).
+    function setRequiresCompleteness(bytes32 policyId, bool required) external {
+        PolicyRegistry.Policy memory policy = policyRegistry.getPolicy(policyId);
+        if (msg.sender != policy.operator) revert NotOperator(msg.sender, policy.operator);
+        requiresCompleteness[policyId] = required;
+        emit CompletenessRequirementSet(policyId, required);
     }
 
     /// @notice Pin the `balanceOf` mapping slot for an ERC-20 policy's token.
@@ -206,6 +270,67 @@ contract SolventSetOracle is Ownable {
         bytes calldata publicValues,
         bytes calldata proofBytes
     ) external {
+        if (requiresCompleteness[policyId]) revert CompletenessRequired(policyId);
+        _publishRootProven(policyId, headerRlp, publicValues, proofBytes, bytes32(0), false);
+    }
+
+    /// @notice Publish a proven root that is ALSO proven *complete*: a second
+    ///         SP1 proof (program-receipt-scan/) shows the candidate list the
+    ///         derivation checked covers every address that appeared in any
+    ///         `Transfer` of the policy's token over a contiguous block range
+    ///         ending at the current chain tip. Callable by anyone.
+    /// @dev The composition is `participantsRoot == candidatesRoot`: both
+    ///      proofs commit the same address-set commitment, so equality means
+    ///      the derivation omitted nobody the scan saw. This closes the
+    ///      censorship/liveness gap left by Stage B (PRIVACY_V2.md §4.4).
+    /// @param scanPublicValues ABI-encoded public outputs of the scan program.
+    /// @param scanProofBytes   SP1 Groth16 proof of the scan program.
+    function publishRootProvenComplete(
+        bytes32 policyId,
+        bytes calldata headerRlp,
+        bytes calldata publicValues,
+        bytes calldata proofBytes,
+        bytes calldata scanPublicValues,
+        bytes calldata scanProofBytes
+    ) external {
+        PolicyRegistry.Policy memory policy = policyRegistry.getPolicy(policyId);
+
+        if (scanPublicValues.length != SCAN_PUBLIC_VALUES_LEN) {
+            revert InvalidPublicValuesLength(scanPublicValues.length);
+        }
+        (
+            bytes32 endBlockHash,
+            , // numBlocks
+            address scanToken,
+            bytes32 participantsRoot,
+            // uint32 participantCount
+        ) = abi.decode(scanPublicValues, (bytes32, uint64, address, bytes32, uint32));
+
+        // The scan must cover the policy's asset...
+        if (scanToken != policy.tokenAddress) {
+            revert TokenMismatch(policy.tokenAddress, scanToken);
+        }
+        // ...and end at a block this chain actually produced, recently enough
+        // that the scan cannot be an ancient replay. `blockhash(block.number-1)`
+        // is the newest hash the EVM exposes.
+        bytes32 tipHash = _blockhash(uint64(block.number - 1));
+        if (endBlockHash != tipHash) revert ScanBlockNotCurrent(tipHash, endBlockHash);
+
+        sp1Verifier.verifyProof(scanVKey, scanPublicValues, scanProofBytes);
+
+        _publishRootProven(policyId, headerRlp, publicValues, proofBytes, participantsRoot, true);
+    }
+
+    /// @dev Shared publication core. When `checkCompleteness` is set, the
+    ///      derivation's `candidatesRoot` must equal `participantsRoot`.
+    function _publishRootProven(
+        bytes32 policyId,
+        bytes calldata headerRlp,
+        bytes calldata publicValues,
+        bytes calldata proofBytes,
+        bytes32 participantsRoot,
+        bool checkCompleteness
+    ) internal {
         PolicyRegistry.Policy memory policy = policyRegistry.getPolicy(policyId);
         if (!policy.active) revert PolicyNotActive(policyId);
 
@@ -225,8 +350,7 @@ contract SolventSetOracle is Ownable {
             , // candidateCount
             address provenToken,
             uint64 provenBalanceSlot,
-            // bytes32 candidatesRoot — the Stage B.2 completeness binding
-            // surface; unchecked on-chain until composition lands.
+            bytes32 candidatesRoot
         ) = abi.decode(
             publicValues,
             (
@@ -248,6 +372,11 @@ contract SolventSetOracle is Ownable {
         uint64 pinnedSlot = provenToken == address(0) ? 0 : balanceSlotOf[policyId];
         if (provenBalanceSlot != pinnedSlot) {
             revert BalanceSlotMismatch(pinnedSlot, provenBalanceSlot);
+        }
+        // Stage B.2 composition: the checked candidate list must be exactly
+        // the participant list the scan proved complete.
+        if (checkCompleteness && participantsRoot != candidatesRoot) {
+            revert CandidatesNotCovered(participantsRoot, candidatesRoot);
         }
 
         // Epoch strictly increasing; streak continuity binds to our history.
@@ -317,8 +446,12 @@ contract SolventSetOracle is Ownable {
             uint64 provenEpoch,
             bytes32 provenNullifierHash,
             uint64 provenChainId,
-            uint64 provenMinStreak
-        ) = abi.decode(publicValues, (bytes32, bytes32, uint64, bytes32, uint64, uint64));
+            uint64 provenMinStreak,
+            bytes32 provenScopeHash
+        ) = abi.decode(
+            publicValues,
+            (bytes32, bytes32, uint64, bytes32, uint64, uint64, bytes32)
+        );
 
         if (
             provenRoot != entry.root ||
@@ -327,6 +460,13 @@ contract SolventSetOracle is Ownable {
             provenChainId != uint64(block.chainid)
         ) {
             revert PublicValuesMismatch();
+        }
+        // The nullifier must be bound to this policy's configured scope —
+        // otherwise a proof from a differently-scoped policy could be replayed
+        // here under a different identity.
+        bytes32 expectedScope = effectiveScopeHash(policyId);
+        if (provenScopeHash != expectedScope) {
+            revert ScopeMismatch(expectedScope, provenScopeHash);
         }
 
         return (provenNullifierHash, provenMinStreak);

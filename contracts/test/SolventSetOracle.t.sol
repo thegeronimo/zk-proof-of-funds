@@ -16,8 +16,9 @@ contract TestableSolventSetOracle is SolventSetOracle {
         address _policyRegistry,
         address _sp1Verifier,
         bytes32 _membershipVKey,
-        bytes32 _derivationVKey
-    ) SolventSetOracle(_policyRegistry, _sp1Verifier, _membershipVKey, _derivationVKey) {}
+        bytes32 _derivationVKey,
+        bytes32 _scanVKey
+    ) SolventSetOracle(_policyRegistry, _sp1Verifier, _membershipVKey, _derivationVKey, _scanVKey) {}
 
     function setBlockhash(uint64 blockNumber, bytes32 hash) external {
         _hashes[blockNumber] = hash;
@@ -41,6 +42,8 @@ contract SolventSetOracleTest is Test {
     bytes32 constant SET_ROOT = bytes32(uint256(0xABCD));
     bytes32 constant NULLIFIER_HASH = bytes32(uint256(0xFEED));
     bytes32 constant STATE_ROOT = bytes32(uint256(0x57A7E));
+    bytes32 constant CANDIDATES_ROOT = bytes32(uint256(0xCA4D));
+    bytes32 constant TIP_HASH = bytes32(uint256(0x71B));
     uint64 constant ROOT_TTL = 1000;
     uint256 constant THRESHOLD = 1 ether;
 
@@ -54,7 +57,8 @@ contract SolventSetOracleTest is Test {
             address(registry),
             address(mockVerifier),
             bytes32(0), // placeholder membership vkey
-            bytes32(0)  // placeholder derivation vkey
+            bytes32(0), // placeholder derivation vkey
+            bytes32(0)  // placeholder scan vkey
         );
 
         PolicyRegistry.Policy memory policy = PolicyRegistry.Policy({
@@ -83,7 +87,10 @@ contract SolventSetOracleTest is Test {
         bytes32 nullifierHash,
         uint64 minStreak
     ) internal view returns (bytes memory) {
-        return abi.encode(root, policyId, epoch, nullifierHash, uint64(block.chainid), minStreak);
+        return abi.encode(
+            root, policyId, epoch, nullifierHash, uint64(block.chainid), minStreak,
+            oracle.effectiveScopeHash(policyId)
+        );
     }
 
     /// @dev ABI-encode derivation public values exactly as the SP1 program
@@ -116,11 +123,39 @@ contract SolventSetOracleTest is Test {
         address token,
         uint64 balanceSlot
     ) internal pure returns (bytes memory) {
+        return _derivationValuesWithCandidates(
+            policyId, stateRoot, prevRoot, newRoot, epoch, blockNumber, chainId,
+            thresholdWei, token, balanceSlot, CANDIDATES_ROOT
+        );
+    }
+
+    function _derivationValuesWithCandidates(
+        bytes32 policyId,
+        bytes32 stateRoot,
+        bytes32 prevRoot,
+        bytes32 newRoot,
+        uint64 epoch,
+        uint64 blockNumber,
+        uint64 chainId,
+        uint256 thresholdWei,
+        address token,
+        uint64 balanceSlot,
+        bytes32 candidatesRoot
+    ) internal pure returns (bytes memory) {
         return abi.encode(
             stateRoot, prevRoot, newRoot, policyId, epoch, blockNumber, chainId,
-            thresholdWei, uint32(3), uint32(5), token, balanceSlot,
-            bytes32(uint256(0xCA4D)) // candidatesRoot (unchecked on-chain)
+            thresholdWei, uint32(3), uint32(5), token, balanceSlot, candidatesRoot
         );
+    }
+
+    /// @dev ABI-encode receipt-scan public values as the scan program commits
+    ///      them (crates/common/src/receipt_scan.rs::abi_encode).
+    function _scanValues(
+        bytes32 endBlockHash,
+        address token,
+        bytes32 participantsRoot
+    ) internal pure returns (bytes memory) {
+        return abi.encode(endBlockHash, uint64(128), token, participantsRoot, uint32(3));
     }
 
     /// @dev A minimal header the fixed-shape walker accepts: list prefix, two
@@ -538,7 +573,8 @@ contract SolventSetOracleTest is Test {
         _publishDefaultRoot();
 
         bytes memory publicValues = abi.encode(
-            SET_ROOT, POLICY_ID, uint64(1), NULLIFIER_HASH, uint64(block.chainid + 1), uint64(1)
+            SET_ROOT, POLICY_ID, uint64(1), NULLIFIER_HASH, uint64(block.chainid + 1), uint64(1),
+            oracle.effectiveScopeHash(POLICY_ID)
         );
         vm.expectRevert(SolventSetOracle.PublicValuesMismatch.selector);
         oracle.verifyMembership(POLICY_ID, 0, publicValues, hex"");
@@ -547,7 +583,8 @@ contract SolventSetOracleTest is Test {
     function test_VerifyMembership_RevertsOnBadLength() public {
         _publishDefaultRoot();
 
-        bytes memory tooShort = abi.encode(SET_ROOT, POLICY_ID, uint64(1), NULLIFIER_HASH);
+        bytes memory tooShort =
+            abi.encode(SET_ROOT, POLICY_ID, uint64(1), NULLIFIER_HASH, uint64(block.chainid));
         vm.expectRevert(
             abi.encodeWithSelector(SolventSetOracle.InvalidPublicValuesLength.selector, tooShort.length)
         );
@@ -624,6 +661,174 @@ contract SolventSetOracleTest is Test {
 
         // Consumption under one policy does not mark other policies.
         assertFalse(oracle.isNullifierUsed(OTHER_POLICY_ID, NULLIFIER_HASH));
+    }
+
+    // --- publishRootProvenComplete (Stage B.2 composition) ---
+
+    /// @dev Prepare both a reference block and the chain-tip hash the scan
+    ///      proof must end at.
+    function _prepareCompleteBlocks() internal returns (uint64, bytes memory) {
+        (uint64 refBlock, bytes memory headerRlp) = _prepareProvenBlock(STATE_ROOT);
+        oracle.setBlockhash(uint64(block.number - 1), TIP_HASH);
+        return (refBlock, headerRlp);
+    }
+
+    function test_PublishRootProvenComplete() public {
+        (uint64 refBlock, bytes memory headerRlp) = _prepareCompleteBlocks();
+        bytes memory pv = _derivationValues(
+            STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock, uint64(block.chainid), THRESHOLD
+        );
+        bytes memory scanPv = _scanValues(TIP_HASH, address(0), CANDIDATES_ROOT);
+
+        vm.prank(stranger); // permissionless
+        oracle.publishRootProvenComplete(POLICY_ID, headerRlp, pv, hex"", scanPv, hex"");
+
+        assertTrue(oracle.getSetEntry(POLICY_ID, 0).proven);
+    }
+
+    function test_PublishRootProvenComplete_RevertsWhenCandidatesNotCovered() public {
+        (uint64 refBlock, bytes memory headerRlp) = _prepareCompleteBlocks();
+        // The derivation checked a DIFFERENT candidate list than the scan
+        // proved complete — exactly the censorship case composition catches.
+        bytes32 omittedSomeone = bytes32(uint256(0xBAD5));
+        bytes memory pv = _derivationValuesWithCandidates(
+            POLICY_ID, STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock,
+            uint64(block.chainid), THRESHOLD, address(0), 0, omittedSomeone
+        );
+        bytes memory scanPv = _scanValues(TIP_HASH, address(0), CANDIDATES_ROOT);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SolventSetOracle.CandidatesNotCovered.selector, CANDIDATES_ROOT, omittedSomeone
+            )
+        );
+        oracle.publishRootProvenComplete(POLICY_ID, headerRlp, pv, hex"", scanPv, hex"");
+    }
+
+    function test_PublishRootProvenComplete_RevertsOnStaleScan() public {
+        (uint64 refBlock, bytes memory headerRlp) = _prepareCompleteBlocks();
+        bytes memory pv = _derivationValues(
+            STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock, uint64(block.chainid), THRESHOLD
+        );
+        // A scan that ended at some other (e.g. ancient) block cannot be replayed.
+        bytes32 staleTip = bytes32(uint256(0x0107));
+        bytes memory scanPv = _scanValues(staleTip, address(0), CANDIDATES_ROOT);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SolventSetOracle.ScanBlockNotCurrent.selector, TIP_HASH, staleTip
+            )
+        );
+        oracle.publishRootProvenComplete(POLICY_ID, headerRlp, pv, hex"", scanPv, hex"");
+    }
+
+    function test_PublishRootProvenComplete_RevertsOnScanTokenMismatch() public {
+        (uint64 refBlock, bytes memory headerRlp) = _prepareCompleteBlocks();
+        bytes memory pv = _derivationValues(
+            STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock, uint64(block.chainid), THRESHOLD
+        );
+        // Scan covered a different token than the (native-ETH) policy.
+        address wrongToken = address(0xBEEF);
+        bytes memory scanPv = _scanValues(TIP_HASH, wrongToken, CANDIDATES_ROOT);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(SolventSetOracle.TokenMismatch.selector, address(0), wrongToken)
+        );
+        oracle.publishRootProvenComplete(POLICY_ID, headerRlp, pv, hex"", scanPv, hex"");
+    }
+
+    function test_PublishRootProvenComplete_RevertsOnInvalidScanProof() public {
+        (uint64 refBlock, bytes memory headerRlp) = _prepareCompleteBlocks();
+        mockVerifier.setShouldPass(false);
+        bytes memory pv = _derivationValues(
+            STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock, uint64(block.chainid), THRESHOLD
+        );
+        bytes memory scanPv = _scanValues(TIP_HASH, address(0), CANDIDATES_ROOT);
+
+        vm.expectRevert(MockSP1Verifier.MockVerifierRejected.selector);
+        oracle.publishRootProvenComplete(POLICY_ID, headerRlp, pv, hex"", scanPv, hex"");
+    }
+
+    function test_RequiresCompleteness_RejectsPlainProvenPublication() public {
+        vm.prank(operatorAddr);
+        oracle.setRequiresCompleteness(POLICY_ID, true);
+
+        (uint64 refBlock, bytes memory headerRlp) = _prepareCompleteBlocks();
+        bytes memory pv = _derivationValues(
+            STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock, uint64(block.chainid), THRESHOLD
+        );
+
+        vm.expectRevert(
+            abi.encodeWithSelector(SolventSetOracle.CompletenessRequired.selector, POLICY_ID)
+        );
+        oracle.publishRootProven(POLICY_ID, headerRlp, pv, hex"");
+
+        // ...but the complete path is accepted.
+        bytes memory scanPv = _scanValues(TIP_HASH, address(0), CANDIDATES_ROOT);
+        oracle.publishRootProvenComplete(POLICY_ID, headerRlp, pv, hex"", scanPv, hex"");
+        assertEq(oracle.getSetCount(POLICY_ID), 1);
+    }
+
+    function test_SetRequiresCompleteness_OperatorOnly() public {
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(SolventSetOracle.NotOperator.selector, stranger, operatorAddr)
+        );
+        oracle.setRequiresCompleteness(POLICY_ID, true);
+    }
+
+    // --- Scopes ---
+
+    function test_EffectiveScopeHash_DefaultsToPolicyScope() public view {
+        assertEq(
+            oracle.effectiveScopeHash(POLICY_ID),
+            sha256(abi.encodePacked("zkpof-scope-v1:", POLICY_ID)),
+            "Default scope must mirror plume::default_scope_hash"
+        );
+        assertTrue(
+            oracle.effectiveScopeHash(POLICY_ID) != oracle.effectiveScopeHash(OTHER_POLICY_ID)
+        );
+    }
+
+    function test_SetScopeHash_SharedIdentityAcrossPolicies() public {
+        bytes32 shared = bytes32(uint256(0x5C09E));
+        vm.prank(operatorAddr);
+        oracle.setScopeHash(POLICY_ID, shared);
+        assertEq(oracle.effectiveScopeHash(POLICY_ID), shared);
+
+        // Membership proofs must now carry the shared scope.
+        _publishDefaultRoot();
+        bytes memory publicValues = _publicValues(SET_ROOT, POLICY_ID, 1, NULLIFIER_HASH, 1);
+        (bytes32 nullifierHash,) = oracle.verifyMembership(POLICY_ID, 0, publicValues, hex"");
+        assertEq(nullifierHash, NULLIFIER_HASH);
+    }
+
+    function test_VerifyMembership_RevertsOnScopeMismatch() public {
+        _publishDefaultRoot();
+        // A proof scoped to a different policy must not verify here, even
+        // though every other public value matches.
+        bytes32 foreignScope = oracle.effectiveScopeHash(OTHER_POLICY_ID);
+        bytes memory publicValues = abi.encode(
+            SET_ROOT, POLICY_ID, uint64(1), NULLIFIER_HASH, uint64(block.chainid), uint64(1),
+            foreignScope
+        );
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SolventSetOracle.ScopeMismatch.selector,
+                oracle.effectiveScopeHash(POLICY_ID),
+                foreignScope
+            )
+        );
+        oracle.verifyMembership(POLICY_ID, 0, publicValues, hex"");
+    }
+
+    function test_SetScopeHash_OperatorOnly() public {
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(SolventSetOracle.NotOperator.selector, stranger, operatorAddr)
+        );
+        oracle.setScopeHash(POLICY_ID, bytes32(uint256(1)));
     }
 
     // --- Admin ---

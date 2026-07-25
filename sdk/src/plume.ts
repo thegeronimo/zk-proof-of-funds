@@ -1,5 +1,5 @@
 /**
- * Wallet-side PLUME-style deterministic nullifiers (Privacy V2, PRIVACY_V2.md §3).
+ * Wallet-side PLUME deterministic nullifiers (Privacy V2, PRIVACY_V2.md §3).
  *
  * A JavaScript port of `crates/common/src/plume.rs`, byte-for-byte compatible
  * (locked by shared test vectors in plume.test.ts). This is the crypto a
@@ -11,13 +11,16 @@
  * `@noble/hashes` libraries.
  *
  * ```text
- * msg  = "zkpof-nullifier-v2:" || lowercase_hex(policy_id)
- * h    = hash_to_curve(msg || pk_compressed, DST)     (RFC 9380, secp256k1_XMD:SHA-256_SSWU_RO_)
- * N    = h * sk
- * memberId = SHA256(N_compressed)
- * DLEQ: r = reduce(SHA256("zkpof-dleq-nonce-v1" || sk || pk || N || msg)), A = g*r, B = h*r,
- *       c = reduce(SHA256("zkpof-dleq-chal-v1" || pk || N || A || B || msg)), s = r + c*sk
+ * scope = SHA256("zkpof-scope-v1:" || policy_id)      (default; may be shared)
+ * h     = hash_to_curve(scope || sec1(pk), DST)       (ERC-7524 construction)
+ * N     = h * sk
+ * memberId = SHA256(sec1(N))
+ * DLEQ: r = reduce(SHA256("zkpof-dleq-nonce-v1" || sk || pk || N || scope)), A = g*r, B = h*r,
+ *       c = reduce(SHA256("zkpof-dleq-chal-v1" || pk || N || A || B || scope)), s = r + c*sk
  * ```
+ *
+ * The nullifier matches ERC-7524 exactly, so a wallet implementing
+ * `eth_getPlumeSignature` yields the same member identity.
  */
 
 import { secp256k1, hashToCurve } from "@noble/curves/secp256k1";
@@ -25,11 +28,15 @@ import { sha256 } from "@noble/hashes/sha256";
 import { keccak_256 } from "@noble/hashes/sha3";
 import { fromHex, toHex, stripHexPrefix } from "./utils/formatting";
 
-/** RFC 9380 domain separation tag (must match crates/common/src/plume.rs). */
-export const DST_H2C = "zkpof-v1:secp256k1_XMD:SHA-256_SSWU_RO_";
+/**
+ * RFC 9380 suite, per ERC-7524 — the *standard* secp256k1 DST, so this
+ * nullifier is byte-identical to a wallet-produced PLUME nullifier over the
+ * same 32-byte message.
+ */
+export const DST_H2C = "secp256k1_XMD:SHA-256_SSWU_RO_";
 
-/** Prefix for the per-policy nullifier base message. */
-export const NULLIFIER_MSG_PREFIX = "zkpof-nullifier-v2:";
+/** Prefix used to derive a policy's default scope hash. */
+export const SCOPE_PREFIX = "zkpof-scope-v1:";
 
 const DLEQ_NONCE_DOMAIN = new TextEncoder().encode("zkpof-dleq-nonce-v1");
 const DLEQ_CHALLENGE_DOMAIN = new TextEncoder().encode("zkpof-dleq-chal-v1");
@@ -108,9 +115,23 @@ function parsePolicyId(policyIdHex: string): Uint8Array {
   return bytes;
 }
 
-/** `"zkpof-nullifier-v2:" || lowercase_hex(policy_id)` as bytes. */
-function nullifierMessage(policyId: Uint8Array): Uint8Array {
-  return new TextEncoder().encode(NULLIFIER_MSG_PREFIX + toHex(policyId));
+function parseScopeHash(scopeHex: string): Uint8Array {
+  const bytes = fromHex(stripHexPrefix(scopeHex));
+  if (bytes.length !== 32) {
+    throw new Error(`Invalid scope_hash length: expected 32 bytes, got ${bytes.length}`);
+  }
+  return bytes;
+}
+
+/**
+ * A policy's default scope hash: `SHA256("zkpof-scope-v1:" || policy_id)`.
+ *
+ * Mirrors `plume::default_scope_hash`. Policies that deliberately share an
+ * identity namespace pass an explicit shared scope instead.
+ */
+export function defaultScopeHash(policyIdHex: string): string {
+  const policyId = parsePolicyId(policyIdHex);
+  return toHex(sha256(concatBytes(new TextEncoder().encode(SCOPE_PREFIX), policyId)));
 }
 
 /** Reduce 32 hash bytes to a scalar mod n (bias ≤ 2⁻¹²⁷, same as Rust). */
@@ -118,9 +139,9 @@ function reduceToScalar(bytes: Uint8Array): bigint {
   return bytesToBigInt(bytes) % ORDER;
 }
 
-/** h = hash_to_curve(msg_pol || pk_compressed, DST). */
-function hashToBasePoint(pkCompressed: Uint8Array, policyId: Uint8Array) {
-  const input = concatBytes(nullifierMessage(policyId), pkCompressed);
+/** ERC-7524 base point: `h = hash_to_curve(scope_hash || sec1(pk), DST)`. */
+function hashToBasePoint(pkCompressed: Uint8Array, scopeHash: Uint8Array) {
+  const input = concatBytes(scopeHash, pkCompressed);
   const h2c = hashToCurve(input, { DST: DST_H2C });
   // Normalize to the curve's ProjectivePoint type.
   return Point.fromAffine(h2c.toAffine());
@@ -156,11 +177,11 @@ export function computeTrieKey(addressHex: string): string {
 }
 
 /** Compute the deterministic nullifier `N = h * sk` for a (key, policy) pair. */
-export function computeNullifier(skHex: string, policyIdHex: string): string {
+export function computeNullifier(skHex: string, scopeHex: string): string {
   const sk = parseSecretKey(skHex);
-  const policyId = parsePolicyId(policyIdHex);
+  const scope = parseScopeHash(scopeHex);
   const pk = Point.BASE.multiply(sk).toRawBytes(true);
-  const h = hashToBasePoint(pk, policyId);
+  const h = hashToBasePoint(pk, scope);
   return toHex(h.multiply(sk).toRawBytes(true));
 }
 
@@ -173,17 +194,17 @@ export function nullifierHash(nullifierHex: string): string {
  * Compute the nullifier and its DLEQ proof — everything `POST /v2/enroll`
  * needs. Deterministic (hedged nonce), so it is idempotent per (key, policy).
  */
-export function proveNullifier(skHex: string, policyIdHex: string): NullifierBundle {
+export function proveNullifier(skHex: string, scopeHex: string): NullifierBundle {
   const sk = parseSecretKey(skHex);
-  const policyId = parsePolicyId(policyIdHex);
+  const scope = parseScopeHash(scopeHex);
   const skBytes = fromHex(stripHexPrefix(skHex));
 
   const pkPoint = Point.BASE.multiply(sk);
   const pk = pkPoint.toRawBytes(true);
-  const h = hashToBasePoint(pk, policyId);
+  const h = hashToBasePoint(pk, scope);
   const nullifierPoint = h.multiply(sk);
   const nullifier = nullifierPoint.toRawBytes(true);
-  const msg = nullifierMessage(policyId);
+  const msg = scope;
 
   // Deterministic nonce: r = reduce(H(domain || sk || pk || N || msg)).
   let r = reduceToScalar(sha256(concatBytes(DLEQ_NONCE_DOMAIN, skBytes, pk, nullifier, msg)));
@@ -211,11 +232,11 @@ export function proveNullifier(skHex: string, policyIdHex: string): NullifierBun
 export function verifyNullifier(
   pkHex: string,
   nullifierHex: string,
-  policyIdHex: string,
+  scopeHex: string,
   dleq: DleqProof
 ): boolean {
   try {
-    const policyId = parsePolicyId(policyIdHex);
+    const scope = parseScopeHash(scopeHex);
     const pkBytes = fromHex(stripHexPrefix(pkHex));
     const nullifierBytes = fromHex(stripHexPrefix(nullifierHex));
     const aBytes = fromHex(stripHexPrefix(dleq.a));
@@ -229,8 +250,8 @@ export function verifyNullifier(
     const s = bytesToBigInt(fromHex(stripHexPrefix(dleq.s)));
     if (s >= ORDER) return false; // non-canonical response
 
-    const h = hashToBasePoint(pkBytes, policyId);
-    const msg = nullifierMessage(policyId);
+    const h = hashToBasePoint(pkBytes, scope);
+    const msg = scope;
     const c = reduceToScalar(
       sha256(concatBytes(DLEQ_CHALLENGE_DOMAIN, pkBytes, nullifierBytes, aBytes, bBytes, msg))
     );
@@ -254,9 +275,11 @@ export function verifyNullifier(
  */
 export function buildEnrollV2Request(
   skHex: string,
-  policyIdHex: string
+  policyIdHex: string,
+  scopeHex?: string
 ): {
   policy_id: string;
+  scope_hash: string;
   public_key: string;
   nullifier: string;
   dleq_a: string;
@@ -264,9 +287,11 @@ export function buildEnrollV2Request(
   dleq_s: string;
 } {
   const policyId = toHex(parsePolicyId(policyIdHex));
-  const bundle = proveNullifier(skHex, policyIdHex);
+  const scope = scopeHex ? toHex(parseScopeHash(scopeHex)) : defaultScopeHash(policyIdHex);
+  const bundle = proveNullifier(skHex, scope);
   return {
     policy_id: policyId,
+    scope_hash: scope,
     public_key: bundle.publicKey,
     nullifier: bundle.nullifier,
     dleq_a: bundle.dleq.a,

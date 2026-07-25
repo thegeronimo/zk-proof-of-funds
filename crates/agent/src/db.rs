@@ -49,13 +49,17 @@ impl Database {
         self.conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS members (
-                member_id       TEXT PRIMARY KEY,   -- hex-encoded 32 bytes (SHA256 of signature)
+                -- (member_id, policy_id) is the key: with a shared scope
+                -- (PRIVACY_V2.md §3.1) one identity legitimately enrolls in
+                -- several policies, so member_id alone is not unique.
+                member_id       TEXT NOT NULL,       -- hex-encoded 32 bytes (nullifier hash / legacy sig hash)
                 policy_id       TEXT NOT NULL,       -- hex-encoded 32 bytes
                 status          TEXT NOT NULL DEFAULT 'pending',  -- solvent/insolvent/pending/fetch_failed
                 enrolled_at     INTEGER NOT NULL,    -- unix timestamp
                 effective_epoch INTEGER NOT NULL,     -- first epoch this member appears in
                 last_balance_wei TEXT NOT NULL DEFAULT '0',  -- stored as string (can exceed i64 for large balances)
-                last_checked_block INTEGER NOT NULL DEFAULT 0
+                last_checked_block INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (member_id, policy_id)
             );
 
             CREATE INDEX IF NOT EXISTS idx_members_policy ON members(policy_id);
@@ -196,7 +200,61 @@ impl Database {
         }
     }
 
+    /// Get a member row for a specific policy.
+    ///
+    /// Prefer this over [`Self::get_member`] whenever the policy is known: a
+    /// member identity can span policies that share a scope.
+    pub fn get_member_for_policy(
+        &self,
+        member_id: &str,
+        policy_id: &str,
+    ) -> Result<Option<MemberRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT member_id, policy_id, status, enrolled_at,
+                    effective_epoch, last_balance_wei, last_checked_block
+             FROM members WHERE member_id = ?1 AND policy_id = ?2"
+        )?;
+        let mut rows = stmt.query_map(params![member_id, policy_id], |row| {
+            Ok(MemberRow {
+                member_id: row.get(0)?,
+                policy_id: row.get(1)?,
+                status: row.get(2)?,
+                enrolled_at: row.get(3)?,
+                effective_epoch: row.get(4)?,
+                last_balance_wei: row.get(5)?,
+                last_checked_block: row.get(6)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
     /// Update a member's status and balance after an epoch check.
+    ///
+    /// Scoped to one policy — a shared-scope identity enrolled in several
+    /// policies must not have its other memberships overwritten.
+    pub fn update_member_status_for_policy(
+        &self,
+        member_id: &str,
+        policy_id: &str,
+        status: &str,
+        balance_wei: &str,
+        checked_block: u64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE members SET status = ?1, last_balance_wei = ?2, last_checked_block = ?3
+             WHERE member_id = ?4 AND policy_id = ?5",
+            params![status, balance_wei, checked_block, member_id, policy_id],
+        )?;
+        Ok(())
+    }
+
+    /// Update a member's status across every policy it is enrolled in.
+    ///
+    /// Retained for the single-policy call sites that predate shared scopes;
+    /// prefer [`Self::update_member_status_for_policy`].
     pub fn update_member_status(
         &self,
         member_id: &str,
@@ -683,6 +741,33 @@ mod tests {
 
         // Non-existent epoch returns None
         assert!(db.get_merkle_tree("policy_001", 99).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_member_key_is_per_policy() {
+        // A shared-scope identity enrolls in two policies: same member_id,
+        // different policy rows, independently updatable.
+        let db = Database::open_in_memory().unwrap();
+        db.insert_member("shared_id", "policy_a", 1700000000, 1).unwrap();
+        db.insert_member("shared_id", "policy_b", 1700000000, 1).unwrap();
+
+        assert!(db.get_member_for_policy("shared_id", "policy_a").unwrap().is_some());
+        assert!(db.get_member_for_policy("shared_id", "policy_b").unwrap().is_some());
+        assert!(db.get_member_for_policy("shared_id", "policy_c").unwrap().is_none());
+
+        db.update_member_status_for_policy("shared_id", "policy_a", "solvent", "5", 100).unwrap();
+        assert_eq!(
+            db.get_member_for_policy("shared_id", "policy_a").unwrap().unwrap().status,
+            "solvent"
+        );
+        assert_eq!(
+            db.get_member_for_policy("shared_id", "policy_b").unwrap().unwrap().status,
+            "pending",
+            "Updating one policy must not touch the other"
+        );
+
+        // The same (member, policy) pair is still rejected.
+        assert!(db.insert_member("shared_id", "policy_a", 1700000000, 1).is_err());
     }
 
     #[test]

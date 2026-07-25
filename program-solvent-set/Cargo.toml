@@ -1,0 +1,21 @@
+[package]
+name = "zk-pof-solvent-set-program"
+version = "0.1.0"
+edition = "2021"
+
+# This crate compiles to RISC-V for SP1 execution.
+# Build with: cd program-solvent-set && cargo prove build
+
+[dependencies]
+# SP1 zkVM guest library — provides io::read/commit and entrypoint macro
+sp1-zkvm = "6"
+
+# The derivation statement (EIP-1186 verification, streak continuity, set
+# building) lives in the shared crate so the guest and the host-side mirror
+# (crates/common/src/solvent_derivation.rs) are the same code.
+zk-pof-common = { path = "../crates/common" }
+
+# Standalone: not part of the root workspace (also listed in its `exclude`).
+# The explicit empty table keeps `cargo prove build` working even when the
+# checkout is nested inside another workspace (e.g. git worktrees).
+[workspace]

@@ -36,8 +36,19 @@ export interface EnrollmentResponse {
 
 /** Request body for POST /submit_proof/{policyId}/{memberId}. */
 export interface ProofSubmissionRequest {
-  /** Hex-encoded Ethereum address (used transiently for MPT verification, NOT stored). */
-  wallet_address: string;
+  /**
+   * Preferred: the state-trie key (keccak256 of the address), computed
+   * client-side — the plaintext address then never transits the agent.
+   * Compute with `computeTrieKey()` from `@zk-proof-of-funds/sdk/plume`.
+   */
+  trie_key?: string;
+  /**
+   * @deprecated Send `trie_key` instead. Agents reject this field unless
+   * explicitly configured to accept it (ZKPOF_ALLOW_PLAINTEXT_ADDRESS=1),
+   * because a plaintext address makes privacy a retention promise rather than
+   * a property.
+   */
+  wallet_address?: string;
   /** Hex-encoded RLP-encoded MPT proof nodes from eth_getProof. */
   proof_nodes: string[];
   /** Block number the proof references. */
@@ -160,6 +171,81 @@ export interface HealthResponse {
   status: string;
   /** Service version string. */
   version: string;
+}
+
+// ─── Privacy V2 (PRIVACY_V2.md) ─────────────────────────────────────────────
+
+/**
+ * Request body for POST /v2/enroll — nullifier enrollment.
+ *
+ * Requires raw key access (or a wallet implementing ERC-7524
+ * `eth_getPlumeSignature`, whose nullifier construction this matches); see
+ * PRIVACY_V2.md §3.3. Build it with `buildEnrollV2Request()` from
+ * `@zk-proof-of-funds/sdk/plume`. All fields hex-encoded, 0x optional.
+ */
+export interface EnrollV2Request {
+  /** 32-byte policy ID. */
+  policy_id: string;
+  /**
+   * Optional 32-byte scope the nullifier is bound to. Omit to use the
+   * policy's default scope; set it to share one identity namespace across
+   * policies (both must configure the same scope on-chain).
+   */
+  scope_hash?: string;
+  /** 33-byte compressed secp256k1 public key. */
+  public_key: string;
+  /** 33-byte compressed nullifier point. */
+  nullifier: string;
+  /** DLEQ commitment A (33 bytes). */
+  dleq_a: string;
+  /** DLEQ commitment B (33 bytes). */
+  dleq_b: string;
+  /** DLEQ response s (32 bytes). */
+  dleq_s: string;
+}
+
+/** Response from POST /v2/enroll. */
+export interface EnrollV2Response {
+  /** memberId = SHA256(nullifier) — unique per (key, policy). */
+  member_id: string;
+  /** Enrollment status ("enrolled"). */
+  status: string;
+  /** First epoch this member appears in. */
+  effective_epoch: number;
+  /** Enrollment mode ("nullifier"). */
+  mode: string;
+}
+
+/** Response from GET /v2/solvent_set/:policy_id. */
+export interface SolventSetInfo {
+  /** Canonical policy ID (lowercase hex). */
+  policy_id: string;
+  /** Solvent-set epoch number. */
+  epoch: number;
+  /** Reference block balances were sampled at. */
+  block_number: number;
+  /** Solvent-set Merkle root (0x-prefixed hex). */
+  root: string;
+  /** Number of addresses in the set. */
+  member_count: number;
+}
+
+/** Response from GET /v2/solvent_set/:policy_id/leaves. */
+export interface SolventSetLeavesPage {
+  policy_id: string;
+  epoch: number;
+  block_number: number;
+  root: string;
+  /** Total entries in the set. */
+  total: number;
+  /** Page offset. */
+  offset: number;
+  /** Page size limit. */
+  limit: number;
+  /** Addresses in this page (lowercase hex, no 0x, canonical order). */
+  addresses: string[];
+  /** Entries in this page as [address, streak] pairs (canonical order). */
+  entries: [string, number][];
 }
 
 // ─── Errors ─────────────────────────────────────────────────────────────────

@@ -1,5 +1,10 @@
 # ZK Proof of Funds — Solvency Agent Architecture
 
+> **Privacy V2**: this document describes the V1 (watched/monitored) model.
+> The V2 design — solvent-set membership proofs (the agent never learns any
+> address) and PLUME-style deterministic nullifiers (one identity per key per
+> policy) — is specified in **PRIVACY_V2.md** and coexists with V1 per policy.
+
 ## 1. Objective
 
 A **middleware-driven solvency attestation system** for EVM networks. A holder enrolls once (proves wallet control + initial threshold), then a **Solvency Agent** middleware continuously monitors enrolled members, batches their status into a single on-chain Merkle root per policy per epoch, and serves membership proofs to relying protocols on demand.

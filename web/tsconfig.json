@@ -17,7 +17,8 @@
     "noFallthroughCasesInSwitch": true,
     "forceConsistentCasingInFileNames": true,
     "paths": {
-      "@zk-proof-of-funds/sdk": ["../sdk/src/index.ts"]
+      "@zk-proof-of-funds/sdk": ["../sdk/src/index.ts"],
+      "@zk-proof-of-funds/sdk/plume": ["../sdk/src/plume.ts"]
     }
   },
   "include": ["src", "vite-env.d.ts"]

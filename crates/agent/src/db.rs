@@ -49,13 +49,17 @@ impl Database {
         self.conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS members (
-                member_id       TEXT PRIMARY KEY,   -- hex-encoded 32 bytes (SHA256 of signature)
+                -- (member_id, policy_id) is the key: with a shared scope
+                -- (PRIVACY_V2.md §3.1) one identity legitimately enrolls in
+                -- several policies, so member_id alone is not unique.
+                member_id       TEXT NOT NULL,       -- hex-encoded 32 bytes (nullifier hash / legacy sig hash)
                 policy_id       TEXT NOT NULL,       -- hex-encoded 32 bytes
                 status          TEXT NOT NULL DEFAULT 'pending',  -- solvent/insolvent/pending/fetch_failed
                 enrolled_at     INTEGER NOT NULL,    -- unix timestamp
                 effective_epoch INTEGER NOT NULL,     -- first epoch this member appears in
                 last_balance_wei TEXT NOT NULL DEFAULT '0',  -- stored as string (can exceed i64 for large balances)
-                last_checked_block INTEGER NOT NULL DEFAULT 0
+                last_checked_block INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (member_id, policy_id)
             );
 
             CREATE INDEX IF NOT EXISTS idx_members_policy ON members(policy_id);
@@ -103,6 +107,25 @@ impl Database {
             );
 
             CREATE INDEX IF NOT EXISTS idx_webhooks_policy ON webhooks(policy_id, active);
+
+            CREATE TABLE IF NOT EXISTS nullifiers (
+                policy_id       TEXT NOT NULL,       -- canonical lowercase hex (32 bytes)
+                nullifier_hash  TEXT NOT NULL,       -- hex 32 bytes; equals the member_id
+                nullifier       TEXT NOT NULL,       -- hex 33-byte compressed secp256k1 point
+                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (policy_id, nullifier_hash)
+            );
+
+            CREATE TABLE IF NOT EXISTS solvent_sets (
+                policy_id       TEXT NOT NULL,
+                epoch           INTEGER NOT NULL,
+                block_number    INTEGER NOT NULL,    -- reference block balances were sampled at
+                root            TEXT NOT NULL,       -- hex 32-byte solvent-set Merkle root
+                member_count    INTEGER NOT NULL,
+                addresses_json  TEXT NOT NULL,       -- JSON array of hex addresses (canonical order)
+                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (policy_id, epoch)
+            );
             "
         )?;
         Ok(())
@@ -177,7 +200,61 @@ impl Database {
         }
     }
 
+    /// Get a member row for a specific policy.
+    ///
+    /// Prefer this over [`Self::get_member`] whenever the policy is known: a
+    /// member identity can span policies that share a scope.
+    pub fn get_member_for_policy(
+        &self,
+        member_id: &str,
+        policy_id: &str,
+    ) -> Result<Option<MemberRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT member_id, policy_id, status, enrolled_at,
+                    effective_epoch, last_balance_wei, last_checked_block
+             FROM members WHERE member_id = ?1 AND policy_id = ?2"
+        )?;
+        let mut rows = stmt.query_map(params![member_id, policy_id], |row| {
+            Ok(MemberRow {
+                member_id: row.get(0)?,
+                policy_id: row.get(1)?,
+                status: row.get(2)?,
+                enrolled_at: row.get(3)?,
+                effective_epoch: row.get(4)?,
+                last_balance_wei: row.get(5)?,
+                last_checked_block: row.get(6)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
     /// Update a member's status and balance after an epoch check.
+    ///
+    /// Scoped to one policy — a shared-scope identity enrolled in several
+    /// policies must not have its other memberships overwritten.
+    pub fn update_member_status_for_policy(
+        &self,
+        member_id: &str,
+        policy_id: &str,
+        status: &str,
+        balance_wei: &str,
+        checked_block: u64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE members SET status = ?1, last_balance_wei = ?2, last_checked_block = ?3
+             WHERE member_id = ?4 AND policy_id = ?5",
+            params![status, balance_wei, checked_block, member_id, policy_id],
+        )?;
+        Ok(())
+    }
+
+    /// Update a member's status across every policy it is enrolled in.
+    ///
+    /// Retained for the single-policy call sites that predate shared scopes;
+    /// prefer [`Self::update_member_status_for_policy`].
     pub fn update_member_status(
         &self,
         member_id: &str,
@@ -354,6 +431,110 @@ impl Database {
         }
     }
 
+    // ── Nullifiers (Privacy V2) ─────────────────────────────────────────
+
+    /// Register a nullifier for a policy. Fails if it is already registered —
+    /// this is what enforces "one identity per key per policy".
+    pub fn insert_nullifier(
+        &self,
+        policy_id: &str,
+        nullifier_hash: &str,
+        nullifier: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO nullifiers (policy_id, nullifier_hash, nullifier) VALUES (?1, ?2, ?3)",
+            params![policy_id, nullifier_hash, nullifier],
+        )?;
+        Ok(())
+    }
+
+    /// Check whether a nullifier hash is already registered for a policy.
+    pub fn nullifier_exists(&self, policy_id: &str, nullifier_hash: &str) -> Result<bool> {
+        let mut stmt = self.conn.prepare(
+            "SELECT 1 FROM nullifiers WHERE policy_id = ?1 AND nullifier_hash = ?2",
+        )?;
+        Ok(stmt.exists(params![policy_id, nullifier_hash])?)
+    }
+
+    // ── Solvent Sets (Privacy V2) ───────────────────────────────────────
+
+    /// Store a solvent set for a policy epoch (replaces any prior build of the
+    /// same epoch — rebuilds are idempotent).
+    pub fn store_solvent_set(
+        &self,
+        policy_id: &str,
+        epoch: u64,
+        block_number: u64,
+        root: &str,
+        member_count: u32,
+        addresses_json: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO solvent_sets
+                (policy_id, epoch, block_number, root, member_count, addresses_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![policy_id, epoch, block_number, root, member_count, addresses_json],
+        )?;
+        Ok(())
+    }
+
+    /// Get the solvent set for a specific policy epoch.
+    pub fn get_solvent_set(&self, policy_id: &str, epoch: u64) -> Result<Option<SolventSetRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT policy_id, epoch, block_number, root, member_count, addresses_json
+             FROM solvent_sets WHERE policy_id = ?1 AND epoch = ?2",
+        )?;
+        let mut rows = stmt.query_map(params![policy_id, epoch], Self::map_solvent_set_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Get the most recent solvent set for a policy.
+    pub fn get_latest_solvent_set(&self, policy_id: &str) -> Result<Option<SolventSetRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT policy_id, epoch, block_number, root, member_count, addresses_json
+             FROM solvent_sets WHERE policy_id = ?1 ORDER BY epoch DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![policy_id], Self::map_solvent_set_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Get the most recent solvent set strictly before the given epoch.
+    ///
+    /// Used for streak continuity: rebuilding epoch N must chain from N-1's
+    /// streaks even when N itself was already (partially) built.
+    pub fn get_latest_solvent_set_before(
+        &self,
+        policy_id: &str,
+        epoch: u64,
+    ) -> Result<Option<SolventSetRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT policy_id, epoch, block_number, root, member_count, addresses_json
+             FROM solvent_sets WHERE policy_id = ?1 AND epoch < ?2 ORDER BY epoch DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![policy_id, epoch], Self::map_solvent_set_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    fn map_solvent_set_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SolventSetRow> {
+        Ok(SolventSetRow {
+            policy_id: row.get(0)?,
+            epoch: row.get(1)?,
+            block_number: row.get(2)?,
+            root: row.get(3)?,
+            member_count: row.get(4)?,
+            addresses_json: row.get(5)?,
+        })
+    }
+
     // ── Webhooks ────────────────────────────────────────────────────────
 
     /// Register a new webhook.
@@ -433,6 +614,17 @@ pub struct WebhookRow {
     pub url: String,
     pub policy_id: String,
     pub events: String,
+}
+
+/// A solvent-set row from the database (Privacy V2).
+#[derive(Debug, Clone)]
+pub struct SolventSetRow {
+    pub policy_id: String,
+    pub epoch: u64,
+    pub block_number: u64,
+    pub root: String,
+    pub member_count: u32,
+    pub addresses_json: String,
 }
 
 #[cfg(test)]
@@ -549,6 +741,76 @@ mod tests {
 
         // Non-existent epoch returns None
         assert!(db.get_merkle_tree("policy_001", 99).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_member_key_is_per_policy() {
+        // A shared-scope identity enrolls in two policies: same member_id,
+        // different policy rows, independently updatable.
+        let db = Database::open_in_memory().unwrap();
+        db.insert_member("shared_id", "policy_a", 1700000000, 1).unwrap();
+        db.insert_member("shared_id", "policy_b", 1700000000, 1).unwrap();
+
+        assert!(db.get_member_for_policy("shared_id", "policy_a").unwrap().is_some());
+        assert!(db.get_member_for_policy("shared_id", "policy_b").unwrap().is_some());
+        assert!(db.get_member_for_policy("shared_id", "policy_c").unwrap().is_none());
+
+        db.update_member_status_for_policy("shared_id", "policy_a", "solvent", "5", 100).unwrap();
+        assert_eq!(
+            db.get_member_for_policy("shared_id", "policy_a").unwrap().unwrap().status,
+            "solvent"
+        );
+        assert_eq!(
+            db.get_member_for_policy("shared_id", "policy_b").unwrap().unwrap().status,
+            "pending",
+            "Updating one policy must not touch the other"
+        );
+
+        // The same (member, policy) pair is still rejected.
+        assert!(db.insert_member("shared_id", "policy_a", 1700000000, 1).is_err());
+    }
+
+    #[test]
+    fn test_nullifier_uniqueness() {
+        let db = Database::open_in_memory().unwrap();
+
+        db.insert_nullifier("policy_a", "hash_1", "02aabb").unwrap();
+        assert!(db.nullifier_exists("policy_a", "hash_1").unwrap());
+        assert!(!db.nullifier_exists("policy_a", "hash_2").unwrap());
+        assert!(!db.nullifier_exists("policy_b", "hash_1").unwrap());
+
+        // Same (policy, nullifier) must be rejected — one identity per key per policy.
+        assert!(db.insert_nullifier("policy_a", "hash_1", "02aabb").is_err());
+        // Same nullifier under a different policy is a different identity.
+        db.insert_nullifier("policy_b", "hash_1", "02aabb").unwrap();
+    }
+
+    #[test]
+    fn test_solvent_set_crud() {
+        let db = Database::open_in_memory().unwrap();
+
+        db.store_solvent_set("policy_a", 1, 19_000_000, "rootaa", 3, r#"["aa","bb","cc"]"#)
+            .unwrap();
+        db.store_solvent_set("policy_a", 2, 19_000_100, "rootbb", 4, r#"["aa","bb","cc","dd"]"#)
+            .unwrap();
+
+        let e1 = db.get_solvent_set("policy_a", 1).unwrap().unwrap();
+        assert_eq!(e1.root, "rootaa");
+        assert_eq!(e1.member_count, 3);
+        assert_eq!(e1.block_number, 19_000_000);
+
+        let latest = db.get_latest_solvent_set("policy_a").unwrap().unwrap();
+        assert_eq!(latest.epoch, 2);
+        assert_eq!(latest.root, "rootbb");
+
+        // Rebuilding an epoch replaces it (idempotent).
+        db.store_solvent_set("policy_a", 2, 19_000_101, "rootcc", 5, r#"["aa"]"#).unwrap();
+        let rebuilt = db.get_latest_solvent_set("policy_a").unwrap().unwrap();
+        assert_eq!(rebuilt.root, "rootcc");
+        assert_eq!(rebuilt.member_count, 5);
+
+        assert!(db.get_solvent_set("policy_a", 99).unwrap().is_none());
+        assert!(db.get_latest_solvent_set("policy_zzz").unwrap().is_none());
     }
 
     #[test]

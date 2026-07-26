@@ -20,6 +20,9 @@ export type {
   EnrollV2Response,
   SolventSetInfo,
   SolventSetLeavesPage,
+  BuildSolventSetRequest,
+  BuildSolventSetResponse,
+  TriggerEpochResponse,
 } from "./types";
 
 // ─── Crypto Utilities ────────────────────────────────────────────────────────
@@ -40,6 +43,19 @@ export {
   verifySolventMembership,
 } from "./utils/solventSet";
 export type { SolventSetPath, SolventSetEntryTuple } from "./utils/solventSet";
+
+// ─── Membership Public Values (Privacy V2) ───────────────────────────────────
+export {
+  decodeMembershipPublicValues,
+  checkMembershipPublicValues,
+  MEMBERSHIP_PUBLIC_VALUES_LEN,
+} from "./utils/membership";
+export type {
+  MembershipPublicValues,
+  MembershipExpectation,
+  MembershipCheckResult,
+  MembershipCheckFailure,
+} from "./utils/membership";
 
 // ─── Formatting Utilities ────────────────────────────────────────────────────
 export {

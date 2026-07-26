@@ -2,6 +2,8 @@ import { useState } from "react";
 import { useAccount, useConnect, useDisconnect, useSignMessage } from "wagmi";
 import { buildEnrollmentMessage } from "@zk-proof-of-funds/sdk";
 import { apiClient } from "../services/apiClient";
+import { usePolicySelection } from "../hooks/usePolicySelection";
+import PolicyPicker from "./PolicyPicker";
 
 type Step = "connect" | "configure" | "sign" | "enroll" | "done";
 
@@ -10,9 +12,9 @@ export default function EnrollmentFlow() {
   const { connectors, connect } = useConnect();
   const { disconnect } = useDisconnect();
   const { signMessageAsync } = useSignMessage();
+  const { policyId, isValid: policyIsValid } = usePolicySelection();
 
   const [step, setStep] = useState<Step>(isConnected ? "configure" : "connect");
-  const [policyId, setPolicyId] = useState("");
   const [scope, setScope] = useState("default");
   const [nonce, setNonce] = useState(() => Math.floor(Math.random() * 1_000_000).toString());
   const [error, setError] = useState<string | null>(null);
@@ -137,15 +139,9 @@ export default function EnrollmentFlow() {
           <div className="space-y-4">
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">
-                Policy ID
+                Policy
               </label>
-              <input
-                type="text"
-                value={policyId}
-                onChange={(e) => setPolicyId(e.target.value)}
-                placeholder="0x01ab...ef (64 hex chars)"
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
-              />
+              <PolicyPicker compact />
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">
@@ -172,7 +168,7 @@ export default function EnrollmentFlow() {
             </div>
             <button
               onClick={() => setStep("sign")}
-              disabled={!policyId}
+              disabled={!policyIsValid}
               className="w-full px-4 py-3 bg-primary-600 text-white rounded-lg hover:bg-primary-700 transition-colors font-medium disabled:opacity-50 disabled:cursor-not-allowed"
             >
               Continue

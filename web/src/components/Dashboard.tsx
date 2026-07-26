@@ -2,13 +2,15 @@ import { useState } from "react";
 import { useAccount, useConnect, useDisconnect } from "wagmi";
 import type { MemberStatus, MerkleProofData } from "@zk-proof-of-funds/sdk";
 import { apiClient } from "../services/apiClient";
+import { usePolicySelection } from "../hooks/usePolicySelection";
+import PolicyPicker from "./PolicyPicker";
 
 export default function Dashboard() {
   const { address, isConnected } = useAccount();
   const { connectors, connect } = useConnect();
   const { disconnect } = useDisconnect();
+  const { policyId } = usePolicySelection();
 
-  const [policyId, setPolicyId] = useState("");
   const [memberId, setMemberId] = useState("");
   const [status, setStatus] = useState<MemberStatus | null>(null);
   const [proof, setProof] = useState<MerkleProofData | null>(null);
@@ -139,15 +141,9 @@ export default function Dashboard() {
         <div className="grid grid-cols-1 gap-4">
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">
-              Policy ID
+              Policy
             </label>
-            <input
-              type="text"
-              value={policyId}
-              onChange={(e) => setPolicyId(e.target.value)}
-              placeholder="Hex-encoded 32-byte policy ID"
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent text-sm font-mono"
-            />
+            <PolicyPicker compact />
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">

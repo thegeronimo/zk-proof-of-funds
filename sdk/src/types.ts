@@ -248,6 +248,65 @@ export interface SolventSetLeavesPage {
   entries: [string, number][];
 }
 
+/**
+ * Request body for POST /v2/admin/build_solvent_set/:policy_id.
+ *
+ * Every field is optional: the defaults are "native ETH, 1 ETH threshold,
+ * agent-selected unpredictable reference block, Stage A".
+ */
+export interface BuildSolventSetRequest {
+  /** Explicit candidate addresses to consider (hex, 0x optional). */
+  candidates?: string[];
+  /**
+   * Pin the reference block. Omit to let the agent sample a blockhash-derived
+   * unpredictable block inside the freshness window — the anti-rented-solvency
+   * behaviour, and the right default.
+   */
+  block_number?: number;
+  /** Threshold as a decimal string in wei (or token base units). */
+  threshold_wei?: string;
+  /** ERC-20 contract to measure. Omit for native ETH. */
+  token_address?: string;
+  /** With `token_address`: also discover candidates from Transfer logs. */
+  discover_from_block?: number;
+  discover_to_block?: number;
+  /** Stage B: verify a per-candidate EIP-1186 proof against the state root. */
+  proven?: boolean;
+  /** ERC-20 proven mode: the Solidity mapping slot of `balanceOf`. */
+  balance_slot?: number;
+}
+
+/** Response from POST /v2/admin/build_solvent_set/:policy_id. */
+export interface BuildSolventSetResponse {
+  policy_id: string;
+  epoch: number;
+  block_number: number;
+  root: string;
+  member_count: number;
+  /** True when built via the Stage B derivation statement. */
+  proven: boolean;
+  /** Stage B only: candidates considered before the threshold filter. */
+  candidate_count?: number;
+  /** Stage B only: the block's state root the balances were proven against. */
+  state_root?: string;
+  /** Stage B only: the previous epoch's root, binding streak continuity. */
+  prev_root?: string;
+}
+
+/** Response from POST /admin/trigger_epoch/:policy_id. */
+export interface TriggerEpochResponse {
+  epoch: number;
+  block_number: number;
+  root: string;
+  member_count: number;
+  /** Per-member balance re-reads performed by this epoch. */
+  balance_updates: {
+    member_id: string;
+    balance_wei: string;
+    solvent: boolean;
+  }[];
+}
+
 // ─── Errors ─────────────────────────────────────────────────────────────────
 
 /** Error codes returned by the SDK. */

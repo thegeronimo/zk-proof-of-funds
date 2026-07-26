@@ -14,6 +14,9 @@ import type {
   EnrollV2Response,
   SolventSetInfo,
   SolventSetLeavesPage,
+  BuildSolventSetRequest,
+  BuildSolventSetResponse,
+  TriggerEpochResponse,
 } from "./types";
 
 /** Error thrown by SDK methods with a typed error code. */
@@ -264,6 +267,43 @@ export class SolvencyClient {
    */
   async getEpochHistory(policyId: string): Promise<AdminEpochsResponse> {
     return this.get<AdminEpochsResponse>(`/admin/epochs/${policyId}`);
+  }
+
+  /**
+   * Build the next solvent set for a policy (operator only).
+   *
+   * Stage A (`proven: false`) trusts the operator's own RPC reads. Stage B
+   * (`proven: true`) verifies an EIP-1186 proof per candidate against the
+   * block's state root, so the resulting root can be published permissionlessly
+   * via `publishRootProven`. ERC-20 policies additionally need `balance_slot`.
+   *
+   * Omitting `block_number` lets the agent pick a blockhash-derived
+   * unpredictable reference block, which is what makes rented solvency
+   * expensive — prefer it over pinning a block.
+   *
+   * @param policyId Hex-encoded 32-byte policy ID.
+   * @throws {SolvencyError} INVALID_REQUEST (400), SERVER_ERROR (500 — usually
+   *   "RPC not configured")
+   */
+  async buildSolventSet(
+    policyId: string,
+    req: BuildSolventSetRequest = {}
+  ): Promise<BuildSolventSetResponse> {
+    return this.post<BuildSolventSetResponse>(
+      `/v2/admin/build_solvent_set/${policyId}`,
+      req
+    );
+  }
+
+  /**
+   * Trigger a V1 (monitored-mode) epoch: re-read every enrolled member's
+   * balance, rebuild the membership tree, and record the epoch.
+   *
+   * @param policyId Hex-encoded 32-byte policy ID.
+   * @throws {SolvencyError} SERVER_ERROR (500 — usually "RPC not configured")
+   */
+  async triggerEpoch(policyId: string): Promise<TriggerEpochResponse> {
+    return this.post<TriggerEpochResponse>(`/admin/trigger_epoch/${policyId}`, {});
   }
 
   // ─── Utility Methods ────────────────────────────────────────────────────

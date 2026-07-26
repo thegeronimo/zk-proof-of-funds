@@ -1,198 +1,413 @@
-import { useState } from "react";
-import { useAccount, useConnect, useDisconnect } from "wagmi";
-import type { SolventSetInfo, SolventSetEntryTuple, SolventSetPath } from "@zk-proof-of-funds/sdk";
-import { computeSolventSetRoot, computeSolventSetPath } from "@zk-proof-of-funds/sdk";
-import { apiClient } from "../services/apiClient";
-
 /**
- * Privacy V2 solvent-set explorer.
+ * Solvent-set explorer — the auditor's view of a published epoch.
  *
- * The solvent set is public data: every (address, streak) pair meeting the
- * policy threshold at the reference block. This panel downloads the whole
- * set and — if a wallet is connected — checks membership *locally*. The
- * connected address never leaves the browser; the agent only sees "someone
- * downloaded the set".
+ * The prove flow uses the set to build a witness; this page exists to answer
+ * "should anyone believe this set at all": does the served list hash to the
+ * served root, does that root match what the oracle stored, and was it *proven*
+ * (Stage B) or merely asserted by the operator (Stage A)?
+ *
+ * Membership can still be checked here, and as everywhere it happens locally —
+ * the full list is downloaded and searched in the browser.
  */
+
+import { useMemo, useState } from "react";
+import { useAccount, useConnect, useDisconnect } from "wagmi";
+import type { SolventSetPath } from "@zk-proof-of-funds/sdk";
+import { usePolicySelection } from "../hooks/usePolicySelection";
+import { useSolventSet, findMembership, streakHistogram } from "../hooks/useSolventSet";
+import { useOnChainSet, blocksUntilExpiry } from "../hooks/useOnChainSet";
+import { HAS_ORACLE } from "../config/contracts";
+import PolicyPicker from "./PolicyPicker";
+import {
+  Button,
+  Callout,
+  Card,
+  CopyButton,
+  DefinitionList,
+  Field,
+  Hex,
+  PageHeader,
+  Row,
+  Spinner,
+  StatusPill,
+  TextInput,
+  VerifiedPill,
+} from "./ui";
+
+const PAGE_SIZE = 25;
+
 export default function SolventSetPanel() {
+  const { policyId, isValid } = usePolicySelection();
   const { address, isConnected } = useAccount();
   const { connectors, connect } = useConnect();
   const { disconnect } = useDisconnect();
 
-  const [policyId, setPolicyId] = useState("");
-  const [info, setInfo] = useState<SolventSetInfo | null>(null);
-  const [entryCount, setEntryCount] = useState<number | null>(null);
-  const [rootVerified, setRootVerified] = useState<boolean | null>(null);
-  const [membership, setMembership] = useState<
-    | { checked: false }
-    | { checked: true; path: SolventSetPath | null }
-  >({ checked: false });
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+  const set = useSolventSet();
+  const onChain = useOnChainSet();
 
-  async function loadSet() {
-    if (!policyId) return;
-    setError(null);
-    setLoading(true);
-    setInfo(null);
-    setEntryCount(null);
-    setRootVerified(null);
-    setMembership({ checked: false });
-    try {
-      const { info: fetchedInfo, entries } = await apiClient.fetchAllSolventSetEntries(policyId);
-      setInfo(fetchedInfo);
-      setEntryCount(entries.length);
+  const [page, setPage] = useState(0);
+  const [filter, setFilter] = useState("");
+  const [membership, setMembership] = useState<SolventSetPath | null>(null);
+  const [membershipChecked, setMembershipChecked] = useState(false);
 
-      // Rebuild the Merkle root locally — trust nothing you didn't hash.
-      const localRoot = await computeSolventSetRoot(entries as SolventSetEntryTuple[]);
-      const served = fetchedInfo.root.toLowerCase().replace(/^0x/, "");
-      setRootVerified(localRoot === served);
-
-      // Local membership check: the address never leaves the browser.
-      if (address) {
-        const path = await computeSolventSetPath(entries as SolventSetEntryTuple[], address);
-        setMembership({ checked: true, path });
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load solvent set");
-    } finally {
-      setLoading(false);
+  async function load() {
+    setPage(0);
+    setMembership(null);
+    setMembershipChecked(false);
+    const result = await set.load(policyId);
+    void onChain.load(policyId);
+    if (result.info && address) {
+      setMembership(await findMembership(result.entries, address));
+      setMembershipChecked(true);
     }
   }
 
+  const filtered = useMemo(() => {
+    const needle = filter.trim().replace(/^0x/, "").toLowerCase();
+    if (!needle) return set.entries;
+    return set.entries.filter(([addr]) => addr.replace(/^0x/, "").toLowerCase().includes(needle));
+  }, [set.entries, filter]);
+
+  const histogram = useMemo(() => streakHistogram(set.entries), [set.entries]);
+  const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const visible = filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+  const expiry = blocksUntilExpiry(onChain);
+
+  function downloadJson() {
+    const blob = new Blob(
+      [JSON.stringify({ info: set.info, entries: set.entries }, null, 2)],
+      { type: "application/json" }
+    );
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `solvent-set-${set.info?.epoch ?? "unknown"}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
   return (
-    <div className="max-w-2xl mx-auto">
-      <h1 className="text-2xl font-bold mb-2">Solvent Set (Privacy V2)</h1>
-      <p className="text-gray-500 mb-6">
-        The public set of all addresses meeting the policy threshold, with
-        per-address streaks (consecutive solvent epochs). Membership is checked
-        locally — your address never leaves the browser.
-      </p>
+    <div className="max-w-4xl mx-auto">
+      <PageHeader title="Solvent set">
+        Every address meeting the policy threshold at the reference block, with the number of
+        consecutive epochs it has qualified. Public data by construction — on a transparent chain,
+        solvency already is.
+      </PageHeader>
 
-      {/* Wallet connection */}
-      <div className="bg-white rounded-lg border border-gray-200 p-6 mb-6">
-        {isConnected ? (
-          <div className="flex items-center justify-between">
-            <div className="text-sm">
-              <span className="text-gray-500">Connected: </span>
-              <span className="font-mono">{address}</span>
-            </div>
-            <button
-              onClick={() => disconnect()}
-              className="px-3 py-1.5 text-sm text-gray-600 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors"
-            >
-              Disconnect
-            </button>
+      <div className="space-y-6">
+        <Card title="Policy">
+          <PolicyPicker compact />
+          <div className="mt-4">
+            <Button onClick={load} disabled={set.loading || !isValid} full>
+              {set.loading ? "Downloading and rebuilding…" : "Load set"}
+            </Button>
           </div>
-        ) : (
-          <div className="flex items-center justify-between">
-            <span className="text-sm text-gray-500">
-              Connect a wallet to check your own membership locally (optional).
-            </span>
-            {connectors.slice(0, 1).map((connector) => (
-              <button
-                key={connector.uid}
-                onClick={() => connect({ connector })}
-                className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 transition-colors font-medium text-sm"
-              >
-                Connect Wallet
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {/* Policy input */}
-      <div className="bg-white rounded-lg border border-gray-200 p-6 mb-6">
-        <label className="block text-sm font-medium text-gray-700 mb-1">
-          Policy ID
-        </label>
-        <input
-          type="text"
-          value={policyId}
-          onChange={(e) => setPolicyId(e.target.value)}
-          placeholder="Hex-encoded 32-byte policy ID"
-          className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent text-sm font-mono mb-4"
-        />
-        <button
-          onClick={loadSet}
-          disabled={loading || !policyId}
-          className="w-full px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 transition-colors font-medium disabled:opacity-50 disabled:cursor-not-allowed text-sm"
-        >
-          {loading ? "Downloading set..." : "Load Solvent Set"}
-        </button>
-      </div>
-
-      {/* Error */}
-      {error && (
-        <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg mb-4">
-          {error}
-        </div>
-      )}
-
-      {/* Set metadata */}
-      {info && (
-        <div className="bg-white rounded-lg border border-gray-200 p-6 mb-6">
-          <h2 className="text-lg font-semibold mb-3">Current Epoch Set</h2>
-          <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
-            <dt className="text-gray-500">Epoch</dt>
-            <dd className="font-mono">{info.epoch}</dd>
-            <dt className="text-gray-500">Reference block</dt>
-            <dd className="font-mono">{info.block_number}</dd>
-            <dt className="text-gray-500">Members</dt>
-            <dd className="font-mono">{entryCount ?? info.member_count}</dd>
-            <dt className="text-gray-500">Root</dt>
-            <dd className="font-mono break-all">{info.root}</dd>
-            <dt className="text-gray-500">Root verified locally</dt>
-            <dd>
-              {rootVerified === null ? (
-                "—"
-              ) : rootVerified ? (
-                <span className="text-green-700">✓ rebuilt root matches</span>
-              ) : (
-                <span className="text-red-700">✗ MISMATCH — do not trust this set</span>
-              )}
-            </dd>
-          </dl>
-        </div>
-      )}
-
-      {/* Local membership result */}
-      {membership.checked && (
-        <div
-          className={`rounded-lg border px-4 py-3 mb-6 ${
-            membership.path
-              ? "bg-green-50 border-green-200 text-green-800"
-              : "bg-yellow-50 border-yellow-200 text-yellow-800"
-          }`}
-        >
-          {membership.path ? (
-            <div className="text-sm">
-              <p className="font-semibold mb-1">
-                Your address is in the solvent set ✓
-              </p>
-              <p>
-                Streak: <span className="font-mono">{membership.path.streak}</span>{" "}
-                consecutive epoch{membership.path.streak === 1 ? "" : "s"} · leaf index{" "}
-                <span className="font-mono">{membership.path.leafIndex}</span>
-              </p>
-              <p className="mt-1 text-green-700">
-                Use <span className="font-mono">zkpof-client prove</span> with your key to
-                generate the membership proof — this page never sees your key.
-              </p>
+          {set.error && (
+            <div className="mt-4">
+              <Callout tone="bad" title="Could not load the set">
+                {set.error}
+              </Callout>
             </div>
-          ) : (
-            <p className="text-sm">
-              Your address is not in this epoch&apos;s set (balance below the
-              threshold at the reference block).
-            </p>
           )}
+        </Card>
+
+        {set.info && (
+          <Card
+            title="Epoch summary"
+            actions={
+              <div className="flex items-center gap-2">
+                <VerifiedPill state={set.rootVerified} verifiedLabel="root rebuilt locally" />
+                <Button onClick={downloadJson} variant="ghost" size="sm">
+                  Download JSON
+                </Button>
+              </div>
+            }
+          >
+            <DefinitionList>
+              <Row label="Epoch">{set.info.epoch}</Row>
+              <Row label="Reference block">{set.info.block_number.toLocaleString()}</Row>
+              <Row label="Addresses">{set.entries.length.toLocaleString()}</Row>
+              <Row label="Served root">
+                <Hex value={set.info.root} />
+              </Row>
+              <Row label="Rebuilt root">{set.localRoot ? <Hex value={set.localRoot} /> : "—"}</Row>
+            </DefinitionList>
+            {set.rootVerified === false && (
+              <div className="mt-4">
+                <Callout tone="bad" title="Root mismatch">
+                  The entries served do not hash to the root served. Treat this set as untrusted.
+                </Callout>
+              </div>
+            )}
+          </Card>
+        )}
+
+        {set.info && (
+          <OnChainRecord onChain={onChain} servedRoot={set.info.root} expiry={expiry} />
+        )}
+
+        {set.info && histogram.length > 0 && (
+          <Card
+            title="Streak distribution"
+            subtitle="How long the set's members have been continuously solvent."
+          >
+            <div className="space-y-1.5">
+              {histogram.slice(0, 10).map(([streak, count]) => (
+                <div key={streak} className="flex items-center gap-3 text-sm">
+                  <span className="w-24 shrink-0 text-gray-500">
+                    {streak} epoch{streak === 1 ? "" : "s"}
+                  </span>
+                  <div className="flex-1 bg-gray-100 rounded-full h-2.5 overflow-hidden">
+                    <div
+                      className="bg-primary-500 h-full rounded-full"
+                      style={{ width: `${(count / set.entries.length) * 100}%` }}
+                    />
+                  </div>
+                  <span className="w-16 text-right font-mono text-xs text-gray-600">
+                    {count.toLocaleString()}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </Card>
+        )}
+
+        {set.info && (
+          <Card title="Check an address" subtitle="Searched locally against the downloaded list.">
+            {isConnected ? (
+              <div className="flex items-center justify-between gap-3 p-3 bg-green-50 rounded-lg mb-4">
+                <span className="text-sm text-green-800 font-mono break-all">{address}</span>
+                <button
+                  onClick={() => disconnect()}
+                  className="text-sm text-gray-500 hover:text-gray-700 shrink-0"
+                >
+                  Disconnect
+                </button>
+              </div>
+            ) : (
+              <div className="flex flex-wrap gap-2 mb-4">
+                {connectors.slice(0, 1).map((connector) => (
+                  <Button key={connector.uid} onClick={() => connect({ connector })} size="sm">
+                    Connect wallet
+                  </Button>
+                ))}
+              </div>
+            )}
+            <Button
+              onClick={async () => {
+                if (!address) return;
+                setMembership(await findMembership(set.entries, address));
+                setMembershipChecked(true);
+              }}
+              disabled={!address}
+              variant="ghost"
+              full
+            >
+              Check my membership
+            </Button>
+            {membershipChecked && (
+              <div className="mt-4">
+                {membership ? (
+                  <Callout tone="good" title="In the set">
+                    Streak {membership.streak} · leaf index {membership.leafIndex}. Head to
+                    “Prove” to turn this into a proof.
+                  </Callout>
+                ) : (
+                  <Callout tone="warn" title="Not in this epoch's set">
+                    Balance was below the threshold at the reference block.
+                  </Callout>
+                )}
+              </div>
+            )}
+          </Card>
+        )}
+
+        {set.entries.length > 0 && (
+          <Card
+            title="Entries"
+            subtitle={`Canonical order — leaf index is position in this list.`}
+            actions={<CopyButton value={set.entries.map(([a]) => a).join("\n")} label="Copy addresses" />}
+          >
+            <div className="mb-3">
+              <Field label="Filter by address">
+                <TextInput value={filter} onChange={(v) => { setFilter(v); setPage(0); }} placeholder="0x… or any substring" mono />
+              </Field>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left text-gray-500 border-b border-gray-200">
+                    <th className="py-2 pr-3 font-medium">#</th>
+                    <th className="py-2 pr-3 font-medium">Address</th>
+                    <th className="py-2 font-medium">Streak</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {visible.map(([addr, streak]) => {
+                    const index = set.entries.findIndex(([a]) => a === addr);
+                    const isMine =
+                      address !== undefined &&
+                      addr.replace(/^0x/, "").toLowerCase() ===
+                        address.replace(/^0x/, "").toLowerCase();
+                    return (
+                      <tr
+                        key={addr}
+                        className={`border-b border-gray-100 ${isMine ? "bg-primary-50" : ""}`}
+                      >
+                        <td className="py-2 pr-3 font-mono text-xs text-gray-400">{index}</td>
+                        <td className="py-2 pr-3 font-mono text-xs break-all">
+                          0x{addr.replace(/^0x/, "")}
+                          {isMine && <span className="ml-2 text-primary-600">← you</span>}
+                        </td>
+                        <td className="py-2 font-mono text-xs">{streak}</td>
+                      </tr>
+                    );
+                  })}
+                  {visible.length === 0 && (
+                    <tr>
+                      <td colSpan={3} className="py-6 text-center text-gray-500">
+                        No addresses match that filter.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+            {pageCount > 1 && (
+              <div className="flex items-center justify-between mt-4 text-sm">
+                <Button
+                  onClick={() => setPage((p) => Math.max(0, p - 1))}
+                  disabled={page === 0}
+                  variant="ghost"
+                  size="sm"
+                >
+                  Previous
+                </Button>
+                <span className="text-gray-500">
+                  Page {page + 1} of {pageCount} · {filtered.length.toLocaleString()} entries
+                </span>
+                <Button
+                  onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
+                  disabled={page >= pageCount - 1}
+                  variant="ghost"
+                  size="sm"
+                >
+                  Next
+                </Button>
+              </div>
+            )}
+          </Card>
+        )}
+
+        <p className="text-xs text-gray-400">
+          The agent sees only that someone downloaded the set — never a query about a particular
+          address. That is why there is no server-side path endpoint.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function OnChainRecord({
+  onChain,
+  servedRoot,
+  expiry,
+}: {
+  onChain: ReturnType<typeof useOnChainSet>;
+  servedRoot: string;
+  expiry: bigint | null;
+}) {
+  if (!HAS_ORACLE) {
+    return (
+      <Card title="On-chain record">
+        <Callout tone="neutral" title="No oracle configured">
+          Set <code className="font-mono">VITE_ORACLE_ADDRESS</code> (and optionally{" "}
+          <code className="font-mono">VITE_POLICY_REGISTRY_ADDRESS</code>) to see whether this root
+          was published, whether it was proven, and when it expires.
+        </Callout>
+      </Card>
+    );
+  }
+  if (onChain.loading) {
+    return (
+      <Card title="On-chain record">
+        <Spinner label="Reading the oracle…" />
+      </Card>
+    );
+  }
+  if (onChain.error) {
+    return (
+      <Card title="On-chain record">
+        <Callout tone="bad" title="Read failed">
+          {onChain.error}
+        </Callout>
+      </Card>
+    );
+  }
+  if (!onChain.entry) {
+    return (
+      <Card title="On-chain record">
+        <Callout tone="warn" title="No root published for this policy">
+          The agent has built a set, but nothing is on-chain, so no proof against it can be
+          verified yet.
+        </Callout>
+      </Card>
+    );
+  }
+
+  const matches =
+    onChain.entry.root.toLowerCase() === `0x${servedRoot.replace(/^0x/, "")}`.toLowerCase();
+
+  return (
+    <Card
+      title="On-chain record"
+      subtitle={`SolventSetOracle set #${onChain.setIndex}`}
+      actions={
+        onChain.entry.proven ? (
+          <StatusPill tone="good">✓ proven derivation</StatusPill>
+        ) : (
+          <StatusPill tone="warn">operator-asserted</StatusPill>
+        )
+      }
+    >
+      <DefinitionList>
+        <Row label="Published root">
+          <Hex value={onChain.entry.root} />
+        </Row>
+        <Row label="Matches agent">
+          <VerifiedPill state={matches} verifiedLabel="same root" failedLabel="DIFFERENT ROOT" />
+        </Row>
+        <Row label="Epoch">{String(onChain.entry.epoch)}</Row>
+        <Row label="Reference block">{onChain.entry.blockNumber.toLocaleString()}</Row>
+        <Row label="Members">{onChain.entry.memberCount.toLocaleString()}</Row>
+        <Row label="Published at">block {onChain.entry.publishedAt.toLocaleString()}</Row>
+        <Row label="Expires in">
+          {expiry === null ? (
+            "unknown (registry not configured)"
+          ) : expiry > 0n ? (
+            `${expiry.toLocaleString()} blocks`
+          ) : (
+            <StatusPill tone="bad">expired</StatusPill>
+          )}
+        </Row>
+        <Row label="Completeness">
+          {onChain.requiresCompleteness ? "required (Stage B.2)" : "not required"}
+        </Row>
+        <Row label="Policy scope">
+          {onChain.scopeHash ? <Hex value={onChain.scopeHash} truncate /> : "—"}
+        </Row>
+        <Row label="Membership vkey">
+          {onChain.membershipVKey ? <Hex value={onChain.membershipVKey} truncate /> : "—"}
+        </Row>
+      </DefinitionList>
+      {!onChain.entry.proven && (
+        <div className="mt-4">
+          <Callout tone="warn" title="Stage A root">
+            Published with <code className="font-mono">publishRoot</code>: the operator asserted
+            this membership list rather than proving each balance against the block's state root.
+          </Callout>
         </div>
       )}
-
-      <p className="text-xs text-gray-400">
-        Checked entirely client-side: the full set is downloaded and hashed in
-        your browser; no query about your address is ever sent to the agent.
-      </p>
-    </div>
+    </Card>
   );
 }

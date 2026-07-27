@@ -37,13 +37,13 @@ import {
 const PAGE_SIZE = 25;
 
 export default function SolventSetPanel() {
-  const { policyId, isValid } = usePolicySelection();
+  const { policyId, policy, isValid } = usePolicySelection();
   const { address, isConnected } = useAccount();
   const { connectors, connect } = useConnect();
   const { disconnect } = useDisconnect();
 
   const set = useSolventSet();
-  const onChain = useOnChainSet();
+  const onChain = useOnChainSet(policy?.chain_id);
 
   const [page, setPage] = useState(0);
   const [filter, setFilter] = useState("");
@@ -361,7 +361,9 @@ function OnChainRecord({
   return (
     <Card
       title="On-chain record"
-      subtitle={`SolventSetOracle set #${onChain.setIndex}`}
+      subtitle={`SolventSetOracle set #${onChain.setIndex}${
+        onChain.chainId ? ` · chain ${onChain.chainId}` : ""
+      }`}
       actions={
         onChain.entry.proven ? (
           <StatusPill tone="good">✓ proven derivation</StatusPill>

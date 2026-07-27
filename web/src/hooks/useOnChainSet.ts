@@ -12,6 +12,7 @@ import { useCallback, useState } from "react";
 import { usePublicClient } from "wagmi";
 import {
   ORACLE_ADDRESS,
+  ORACLE_CHAIN_ID,
   POLICY_REGISTRY_ADDRESS,
   SOLVENT_SET_ORACLE_ABI,
   POLICY_REGISTRY_ABI,
@@ -35,6 +36,8 @@ export interface OnChainSetState {
   blockNumber: bigint | null;
   /** rootTTLBlocks from the registry, when it is configured. */
   rootTTLBlocks: bigint | null;
+  /** The chain these values were actually read from. */
+  chainId: number | null;
 }
 
 const EMPTY: OnChainSetState = {
@@ -48,19 +51,43 @@ const EMPTY: OnChainSetState = {
   membershipVKey: null,
   blockNumber: null,
   rootTTLBlocks: null,
+  chainId: null,
 };
 
-export function useOnChainSet() {
-  const publicClient = usePublicClient();
+/**
+ * @param policyChainId The selected policy's chain, used when
+ *   `VITE_ORACLE_CHAIN_ID` is not set. Passing neither leaves the chain up to
+ *   wagmi, which is only correct when the wallet is already on the right one.
+ */
+export function useOnChainSet(policyChainId?: number) {
+  const targetChainId = ORACLE_CHAIN_ID ?? policyChainId;
+  // Pinning chainId makes the read independent of the connected wallet's
+  // network — without it an unconnected app silently reads wagmi's first
+  // configured chain.
+  const publicClient = usePublicClient(
+    targetChainId ? { chainId: targetChainId } : undefined
+  );
   const [state, setState] = useState<OnChainSetState>(EMPTY);
 
   const load = useCallback(
     async (policyId: string) => {
-      if (!ORACLE_ADDRESS || !publicClient) {
+      if (!ORACLE_ADDRESS) {
         setState({ ...EMPTY, configured: false });
         return;
       }
-      setState({ ...EMPTY, loading: true });
+      if (!publicClient) {
+        // wagmi has no transport for the pinned chain, so there is nothing to
+        // read from. Say which chain rather than reading the wrong one.
+        setState({
+          ...EMPTY,
+          error: targetChainId
+            ? `No RPC configured for chain ${targetChainId} — add it to the wagmi config in hooks/useWeb3.ts.`
+            : "No chain selected for on-chain reads. Set VITE_ORACLE_CHAIN_ID.",
+          chainId: targetChainId ?? null,
+        });
+        return;
+      }
+      setState({ ...EMPTY, loading: true, chainId: targetChainId ?? null });
       try {
         const oracle = { address: ORACLE_ADDRESS, abi: SOLVENT_SET_ORACLE_ABI } as const;
         const policyIdHex = policyId as `0x${string}`;
@@ -130,15 +157,17 @@ export function useOnChainSet() {
           membershipVKey,
           blockNumber,
           rootTTLBlocks,
+          chainId: targetChainId ?? null,
         });
       } catch (err) {
         setState({
           ...EMPTY,
           error: err instanceof Error ? err.message : "On-chain read failed",
+          chainId: targetChainId ?? null,
         });
       }
     },
-    [publicClient]
+    [publicClient, targetChainId]
   );
 
   return { ...state, load };

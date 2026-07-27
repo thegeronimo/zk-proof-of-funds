@@ -1056,7 +1056,10 @@ acceptable — nothing is deployed beyond dev/anvil.
       (`alloy-trie`/`eth-trie` in a dev-dependency harness, plus geth via RPC
       where available). Delete the two tests that assert the buggy behavior
       (`mpt.rs:435-447`).
-- [ ] External review of `mpt.rs` before any "proven" label returns.
+- [x] Differential fuzzing against `alloy-trie` (reth's implementation),
+      validated with negative controls.
+- [ ] **External human cryptographic review of `mpt.rs`** — cannot be done
+      in-repo; needs a third party.
 
 ### 15.2 Epoch/streak temporal enforcement (R2)
 
@@ -1069,14 +1072,14 @@ acceptable — nothing is deployed beyond dev/anvil.
       publics gain `prev_block_number` (and the circuit asserts
       `block_number > prev_block_number`), so a proof cannot reuse the same
       snapshot even off-chain.
-- [ ] Randomized reference-block sampling moves from backend convenience to
+- [x] Randomized reference-block sampling moves from backend convenience to
       normative rule: `referenceBlock = sample(policyId, epoch, entropy)` where
       entropy is a blockhash finalized **after** the epoch window closes;
       contract recomputes and checks it on the proven path. Trusted path at
       minimum enforces window containment + monotonicity.
-- [ ] Remove the admin request's explicit block-number override for proven
+- [x] Remove the admin request's explicit block-number override for proven
       builds (keep for dev seeding only, behind the dev flag).
-- [ ] Docs: state plainly that a streak is one observation per epoch — an
+- [x] Docs: state plainly that a streak is one observation per epoch — an
       economic deterrent against balance rental, not proof of continuous
       holding.
 
@@ -1144,7 +1147,7 @@ acceptable — nothing is deployed beyond dev/anvil.
       ERC-20 derivation, receipt scan; verifies each against the **deployed**
       SP1 verifier + oracle on anvil; then mutates one field at a time (proof
       byte, each public value, root, vkey, scan range) and asserts rejection.
-- [ ] Reproducible artifact manifest committed per release: guest commits,
+- [x] Reproducible artifact manifest committed per release: guest commits,
       rust/SP1 versions, ELF hashes, vkeys, verifier address + bytecode hash,
       public-values schema version, proof size, proving time/memory,
       verification gas.
@@ -1258,37 +1261,69 @@ this reason; V1 now matches. `program/Cargo.toml` was missing the empty
 `[workspace]` table its three sibling guests carry, so `cargo prove build`
 failed inside a git worktree.
 
-### Still open in Phase 15
+### Still open in Phase 15/16 (after the 2026-07-27 remainder pass)
 
-- **15.1** External cryptographic review of `mpt.rs`, and differential fuzzing
-  against a production client (geth/reth) rather than only the in-repo builder.
-- **15.2** Randomized reference-block sampling is still application policy, not
-  a normative on-chain rule; the contract enforces the window but not
-  `sample(policyId, epoch, entropy)`.
-- **15.6** The harness (`scripts/real-proof-e2e.sh`) establishes reproducible
-  guest builds, an artifact manifest (ELF hashes, versions, schema sizes), and
-  vkey derivation. All four guests build cleanly with the new statements and
-  the manifest is produced — for example:
+Only two things remain, and neither can be closed from inside the repo:
 
-  ```json
-  { "rust_version": "rustc 1.93.1", "sp1_version": "cargo-prove sp1 (f87f8d6)",
-    "public_values_schema": { "membership_bytes": 448, "derivation_bytes": 448,
-                              "scan_bytes": 224 },
-    "guests": { "program-membership": { "elf_sha256": "b1737ff0…", … } } }
-  ```
+- **15.1 — external human review of `mpt.rs`.** Differential fuzzing against
+  `alloy-trie` (reth's implementation) now covers randomized inclusion,
+  non-inclusion, the empty-proof rule, and byte-flip/truncate/duplicate
+  mutations, in both directions (`crates/common/tests/mpt_differential.rs`).
+  Notably, `alloy-trie` independently enforces the same empty-proof rule this
+  phase introduced, which is outside confirmation that the R1 fix is correct
+  semantics rather than merely stricter. Both differential tests were checked
+  with negative controls. What remains is a third-party cryptographic review,
+  which is a human task.
 
-  Steps (a)–(e) — deploy, prove, verify, and the one-field-at-a-time mutation
-  pass — are scripted as TODOs and need a machine with Docker + ~16 GB RAM or
-  a Succinct network key. **Until they run green, every surface must say
-  "protocol simulation".**
+- **15.6 — the real Groth16 leg.** `scripts/real-proof-e2e.sh` now runs green
+  end to end without Docker: reproducible guest builds, artifact manifest,
+  vkey derivation, the full contract-level publish/verify cycle with a
+  one-field-at-a-time mutation matrix (`contracts/test/E2EMutation.t.sol`,
+  27 tests), and a live deployment to anvil. What is still missing is
+  generating real Groth16 proofs and submitting them against a deployed
+  `SP1VerifierGroth16` — that needs Docker + ~16 GB RAM or a Succinct network
+  key. **Until it passes, every surface must keep saying "protocol
+  simulation": the contract logic is verified, the proof-system integration
+  is not.**
 
-  What *has* run is the emulator-level guest-vs-host equivalence suite
-  (`cargo test --test privacy_v2_integration -- --ignored`), which executes the
-  real ELFs and checks they commit byte-identical public values to the host
-  mirrors. That catches statement drift, but it is not a proof: it exercises
-  no Groth16 wrapping and no on-chain verifier.
-- **16.1** Build parameters still come from the request body rather than a
-  pinned on-chain policy version.
+### Delivered in the remainder pass (2026-07-27)
+
+**Reference-block sampling is normative and enforced (15.2).** The old
+sampler drew from the *current* block's hash, so an operator could watch the
+entropy and re-roll by waiting — the randomness was real but the choice of
+when to consume it was unconstrained. The draw is now fixed by the hash of
+the first block *after* the epoch's window:
+
+```
+reference = windowStart
+          + keccak(DOMAIN, policyConfigHash, epoch, blockhash(windowEnd))
+            % epochLengthBlocks
+```
+
+so it does not exist while balances in the window can still move, and every
+publisher computes the same answer. `publishRootProven` requires the proven
+block to equal the draw; `maxBlockAge` now bounds how long after the window
+closes a publication may land, which is the only freshness notion that
+survives a block the publisher does not choose. `sampledReferenceBlock()` is
+public so agents can compute what the chain will demand. The Rust mirror and
+the Solidity implementation are both pinned to a vector computed with an
+independent keccak implementation.
+
+**Build parameters come from the chain (16.1).** New `policy_reader` module
+reads threshold/token/slot/config-hash from the registry + oracle. Anything
+the caller sends is cross-checked and drift is a hard error; the hard-coded
+1 ETH default is gone. The `block_number` override is refused outright for
+proven builds and gated behind `ZKPOF_DEV_ALLOW_BLOCK_OVERRIDE=1` otherwise.
+
+**Web (16.2).** The silent scope fallback is gone — if the authoritative
+scope read fails the flow stops rather than deriving a guess, since a policy
+with a shared scope would otherwise bind the wrong identity namespace. The
+operator console left primary navigation for `/console/operator` behind
+`VITE_ENABLE_OPERATOR_CONSOLE=1`.
+
+**Docs.** PRIVACY_V2 §4 now states what a streak of N actually means — the
+threshold was met at N *sampled observations*, not held continuously — and
+that interfaces must not say "held for N epochs".
 
 ## Phase 16: Operational Hardening & Honest Presentation 🟠
 
@@ -1300,7 +1335,7 @@ Independent of Phase 15's contract work; can proceed in parallel.
       control plane: bearer token minimum (env-configured), designed so mTLS /
       signed requests can replace it; rate limits + audit log (who, what,
       when, result) on every operator action.
-- [ ] Build parameters come from the pinned on-chain policy version, not the
+- [x] Build parameters come from the pinned on-chain policy version, not the
       request body; remove the hard-coded 1 ETH defaults in enrollment and
       set building.
 - [x] Completeness-sensitive builds **abort** on any unresolved candidate
@@ -1322,7 +1357,7 @@ Independent of Phase 15's contract work; can proceed in parallel.
       the policy's requirement, config hash matches, chain matches. Dev
       sandbox mode keeps the current permissive behavior behind an explicit
       banner.
-- [ ] No silent scope fallback: if the authoritative on-chain scope read
+- [x] No silent scope fallback: if the authoritative on-chain scope read
       fails, the flow stops rather than deriving locally.
 - [x] Verify screen performs an actual `eth_call` (`verifyMembership` /
       staticcall of `verifyAndConsume`) against the configured oracle and
@@ -1339,7 +1374,7 @@ Independent of Phase 15's contract work; can proceed in parallel.
       address/streak table behind an "auditor" disclosure toggle.
 - [x] Enforce `policy.chainId == oracle chainid` (read-only display, no
       editable field) until a real cross-chain design exists.
-- [ ] `/operator` leaves primary navigation; it becomes a separate
+- [x] `/operator` leaves primary navigation; it becomes a separate
       authenticated console route wired to the 16.1 control plane.
 
 ### 16.3 CLI key handling (interim, until Phase 17 removes the need)

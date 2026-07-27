@@ -190,6 +190,21 @@ pub fn verify_account_state(
     }
 }
 
+/// Walk a raw trie key, returning the leaf value's inner payload.
+///
+/// Exposed for the differential test suite (`tests/mpt_differential.rs`),
+/// which builds tries with an independent implementation and needs to verify
+/// against raw keys rather than going through the account/storage wrappers
+/// that hash their input first.
+#[doc(hidden)]
+pub fn walk_trie_for_test(
+    root: &[u8; 32],
+    trie_key: &[u8; 32],
+    proof_nodes: &[Vec<u8>],
+) -> Result<Option<Vec<u8>>> {
+    walk_trie(root, trie_key, proof_nodes)
+}
+
 /// The state-trie key of an account: `keccak256(address)`.
 ///
 /// Clients can compute this locally and submit it instead of the plaintext

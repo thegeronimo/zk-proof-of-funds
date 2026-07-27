@@ -1337,7 +1337,7 @@ Independent of Phase 15's contract work; can proceed in parallel.
       "balances proven for the supplied candidate set"; EOA-only stated
       explicitly; solvent-set publication leakage disclosed on `/set`, full
       address/streak table behind an "auditor" disclosure toggle.
-- [ ] Enforce `policy.chainId == oracle chainid` (read-only display, no
+- [x] Enforce `policy.chainId == oracle chainid` (read-only display, no
       editable field) until a real cross-chain design exists.
 - [ ] `/operator` leaves primary navigation; it becomes a separate
       authenticated console route wired to the 16.1 control plane.

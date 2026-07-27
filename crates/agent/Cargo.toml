@@ -34,6 +34,11 @@ reqwest = { workspace = true }
 tiny-keccak = { workspace = true }
 alloy-rlp = { version = "0.3", default-features = false }
 
+# Secret-key handling in zkpof-client: hidden TTY entry + memory wiping, so a
+# key never reaches argv, shell history, or a core dump.
+zeroize = "1"
+rpassword = "7"
+
 [dev-dependencies]
 # alloy with node-bindings for spawning Anvil in integration tests
 # node-bindings is NOT included in alloy's "full" feature

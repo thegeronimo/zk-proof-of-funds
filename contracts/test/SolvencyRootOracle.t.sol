@@ -51,7 +51,9 @@ contract SolvencyRootOracleTest is Test {
             operator: operatorAddr,
             scope: "test-scope",
             trustedMode: true,
-            active: true
+            active: true,
+            startBlock: 0,
+            version: 1
         });
         registry.createPolicy(POLICY_ID, policy);
     }
@@ -201,7 +203,9 @@ contract SolvencyRootOracleTest is Test {
             operator: operatorAddr,
             scope: "zk-scope",
             trustedMode: false,
-            active: true
+            active: true,
+            startBlock: 0,
+            version: 1
         });
         registry.createPolicy(zkPolicyId, policy);
 
@@ -404,7 +408,9 @@ contract SolvencyRootOracleTest is Test {
             operator: operatorAddr,
             scope: "zk-scope",
             trustedMode: false,
-            active: true
+            active: true,
+            startBlock: 0,
+            version: 1
         });
         registry.createPolicy(zkPolicyId, policy);
 
@@ -445,7 +451,9 @@ contract SolvencyRootOracleTest is Test {
             operator: operatorAddr,
             scope: "zk-scope",
             trustedMode: false,
-            active: true
+            active: true,
+            startBlock: 0,
+            version: 1
         });
         registry.createPolicy(zkPolicyId, policy);
 
@@ -480,7 +488,9 @@ contract SolvencyRootOracleTest is Test {
             operator: operatorAddr,
             scope: "zk-scope",
             trustedMode: false,
-            active: true
+            active: true,
+            startBlock: 0,
+            version: 1
         });
         registry.createPolicy(zkPolicyId, policy);
 

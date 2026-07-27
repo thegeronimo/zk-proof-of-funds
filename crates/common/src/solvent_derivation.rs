@@ -12,10 +12,16 @@
 //! Private:  candidates [(address, proof)], prev_entries [(address, streak)],
 //!           token_account_proof (ERC-20 mode)
 //! Public:   state_root, prev_root, new_root, policy_id, epoch, block_number,
-//!           chain_id, threshold_wei, member_count, candidate_count,
-//!           token, balance_slot, candidates_root
+//!           prev_block_number, chain_id, threshold_wei, member_count,
+//!           candidate_count, token, balance_slot, candidates_root
 //!
-//! 1. prev_root = SolventSetRoot(prev_entries)        (zero when empty)
+//! 0. first_epoch = (prev_block_number == 0)
+//!    if !first_epoch: require block_number > prev_block_number
+//!    (a streak must be built from *distinct, advancing* observations —
+//!    external review finding R2)
+//! 1. prev_root = 0 when first_epoch (no previous publication), else
+//!    SolventSetRoot(prev_entries) — which is EMPTY_SET_ROOT if the previous
+//!    epoch existed but nobody qualified
 //! 2. ERC-20 mode: storage_root = VerifyAccountProof(state_root, token,
 //!    token_account_proof).storageRoot
 //! 3. for each candidate:
@@ -28,7 +34,7 @@
 //!        include (address, streak)
 //! 4. new_root = SolventSetRoot(included entries)     (canonical sort/dedup)
 //! 5. candidates_root = CandidatesRoot(candidate addresses)   (Stage B.2 binding)
-//! 6. commit abi.encode(... 13 words, 416 bytes ...)
+//! 6. commit abi.encode(... 14 words, 448 bytes ...)
 //! ```
 //!
 //! `SolventSetOracle.publishRootProven` verifies this proof, binds
@@ -86,6 +92,10 @@ pub struct DerivationPublicValues {
     pub policy_id: [u8; 32],
     pub epoch: u64,
     pub block_number: u64,
+    /// Source block of the previous set (zero for the first epoch). The
+    /// statement requires `block_number > prev_block_number`, so a streak
+    /// cannot be inflated by re-proving the same snapshot (review finding R2).
+    pub prev_block_number: u64,
     pub chain_id: u64,
     pub threshold_wei: u128,
     pub member_count: u32,
@@ -99,8 +109,8 @@ pub struct DerivationPublicValues {
     pub candidates_root: [u8; 32],
 }
 
-/// ABI-encoded size: thirteen 32-byte words.
-pub const DERIVATION_PUBLIC_VALUES_LEN: usize = 416;
+/// ABI-encoded size: fourteen 32-byte words.
+pub const DERIVATION_PUBLIC_VALUES_LEN: usize = 448;
 
 /// Domain separation tag for candidate-list leaves (shared with receipt_scan).
 pub const CANDIDATE_LEAF_DOMAIN: &[u8] = b"zkpof-candidate-leaf-v1";
@@ -130,7 +140,7 @@ pub fn candidates_root(addresses: &[[u8; 20]]) -> [u8; 32] {
 
 impl DerivationPublicValues {
     /// `abi.encode(bytes32, bytes32, bytes32, bytes32, uint64, uint64, uint64,
-    /// uint256, uint32, uint32, address, uint64, bytes32)` — 416 bytes.
+    /// uint64, uint256, uint32, uint32, address, uint64, bytes32)` — 448 bytes.
     pub fn abi_encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(DERIVATION_PUBLIC_VALUES_LEN);
         out.extend_from_slice(&self.state_root);
@@ -141,6 +151,8 @@ impl DerivationPublicValues {
         out.extend_from_slice(&self.epoch.to_be_bytes());
         out.extend_from_slice(&[0u8; 24]);
         out.extend_from_slice(&self.block_number.to_be_bytes());
+        out.extend_from_slice(&[0u8; 24]);
+        out.extend_from_slice(&self.prev_block_number.to_be_bytes());
         out.extend_from_slice(&[0u8; 24]);
         out.extend_from_slice(&self.chain_id.to_be_bytes());
         out.extend_from_slice(&[0u8; 16]);
@@ -157,7 +169,7 @@ impl DerivationPublicValues {
         out
     }
 
-    /// Decode and validate a 416-byte public-values blob.
+    /// Decode and validate a 448-byte public-values blob.
     pub fn abi_decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != DERIVATION_PUBLIC_VALUES_LEN {
             bail!(
@@ -169,11 +181,12 @@ impl DerivationPublicValues {
         let pad_ok = bytes[128..152] == [0u8; 24]
             && bytes[160..184] == [0u8; 24]
             && bytes[192..216] == [0u8; 24]
-            && bytes[224..240] == [0u8; 16]
-            && bytes[256..284] == [0u8; 28]
+            && bytes[224..248] == [0u8; 24]
+            && bytes[256..272] == [0u8; 16]
             && bytes[288..316] == [0u8; 28]
-            && bytes[320..332] == [0u8; 12]
-            && bytes[352..376] == [0u8; 24];
+            && bytes[320..348] == [0u8; 28]
+            && bytes[352..364] == [0u8; 12]
+            && bytes[384..408] == [0u8; 24];
         if !pad_ok {
             bail!("Invalid derivation public values: nonzero padding");
         }
@@ -184,7 +197,7 @@ impl DerivationPublicValues {
             out
         };
         let mut token = [0u8; 20];
-        token.copy_from_slice(&bytes[332..352]);
+        token.copy_from_slice(&bytes[364..384]);
         Ok(Self {
             state_root: word32(0),
             prev_root: word32(32),
@@ -192,13 +205,14 @@ impl DerivationPublicValues {
             policy_id: word32(96),
             epoch: u64::from_be_bytes(bytes[152..160].try_into().unwrap()),
             block_number: u64::from_be_bytes(bytes[184..192].try_into().unwrap()),
-            chain_id: u64::from_be_bytes(bytes[216..224].try_into().unwrap()),
-            threshold_wei: u128::from_be_bytes(bytes[240..256].try_into().unwrap()),
-            member_count: u32::from_be_bytes(bytes[284..288].try_into().unwrap()),
-            candidate_count: u32::from_be_bytes(bytes[316..320].try_into().unwrap()),
+            prev_block_number: u64::from_be_bytes(bytes[216..224].try_into().unwrap()),
+            chain_id: u64::from_be_bytes(bytes[248..256].try_into().unwrap()),
+            threshold_wei: u128::from_be_bytes(bytes[272..288].try_into().unwrap()),
+            member_count: u32::from_be_bytes(bytes[316..320].try_into().unwrap()),
+            candidate_count: u32::from_be_bytes(bytes[348..352].try_into().unwrap()),
             token,
-            balance_slot: u64::from_be_bytes(bytes[376..384].try_into().unwrap()),
-            candidates_root: word32(384),
+            balance_slot: u64::from_be_bytes(bytes[408..416].try_into().unwrap()),
+            candidates_root: word32(416),
         })
     }
 }
@@ -282,18 +296,48 @@ pub fn derive_entries(
 }
 
 /// Execute the derivation statement natively.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_derivation_statement(
     witness: &DerivationWitness,
     state_root: &[u8; 32],
     policy_id: &[u8; 32],
     epoch: u64,
     block_number: u64,
+    prev_block_number: u64,
     chain_id: u64,
     threshold_wei: u128,
     token: Option<&TokenConfig>,
 ) -> Result<DerivationPublicValues> {
     // 1. Recommit the previous set — binds streak continuity to prev_root.
-    let prev_root = SolventSet::from_entries(witness.prev_entries.clone()).root();
+    //
+    // `prev_block_number == 0` is the discriminator for "there is no previous
+    // publication", and commits `prev_root = 0` to match what the contract
+    // stores for a policy with empty history. It is deliberately distinct
+    // from "the previous set existed but was empty", which recommits to
+    // `EMPTY_SET_ROOT` — that case is a real epoch in which nobody qualified
+    // and must remain provable (review §4.5).
+    let first_epoch = prev_block_number == 0;
+    if first_epoch && !witness.prev_entries.is_empty() {
+        bail!("prev_block_number is zero (no previous set) but prev_entries is non-empty");
+    }
+    let prev_root = if first_epoch {
+        [0u8; 32]
+    } else {
+        SolventSet::from_entries(witness.prev_entries.clone()).root()
+    };
+
+    // 0. A streak is only meaningful if each epoch observes a *later* block.
+    // Without this, the same snapshot can be re-proven epoch after epoch and
+    // every streak inflates for free (external review finding R2). The chain
+    // separately checks prev_block_number against the stored previous entry,
+    // so the two must agree.
+    if !first_epoch && block_number <= prev_block_number {
+        bail!(
+            "Derivation block {} must be newer than the previous set's block {}",
+            block_number,
+            prev_block_number
+        );
+    }
 
     // 2-3. Derive and canonicalize the new set.
     let new_set =
@@ -310,6 +354,7 @@ pub fn execute_derivation_statement(
         policy_id: *policy_id,
         epoch,
         block_number,
+        prev_block_number,
         chain_id,
         threshold_wei,
         member_count: new_set.len() as u32,
@@ -576,7 +621,7 @@ mod tests {
         );
 
         let public = execute_derivation_statement(
-            &witness, &state_root, &POLICY, 1, 19_000_000, 1, ONE_ETH, None,
+            &witness, &state_root, &POLICY, 1, 19_000_000, 0, 1, ONE_ETH, None,
         )
         .unwrap();
 
@@ -600,13 +645,15 @@ mod tests {
         );
 
         let public = execute_derivation_statement(
-            &witness, &state_root, &POLICY, 1, 19_000_000, 1, ONE_ETH, None,
+            &witness, &state_root, &POLICY, 1, 19_000_000, 0, 1, ONE_ETH, None,
         )
         .unwrap();
 
         assert_eq!(public.member_count, 0);
         assert_eq!(public.candidate_count, 1);
-        assert_eq!(public.solvent_set_root, [0u8; 32]);
+        // "Nobody qualified" is a real, publishable outcome: it commits to the
+        // empty-set sentinel, not zero (which means "no root at all").
+        assert_eq!(public.solvent_set_root, crate::solvent_set::EMPTY_SET_ROOT);
     }
 
     #[test]
@@ -620,7 +667,7 @@ mod tests {
         );
 
         let result = execute_derivation_statement(
-            &witness, &state_root, &POLICY, 1, 19_000_000, 1, ONE_ETH, None,
+            &witness, &state_root, &POLICY, 1, 19_000_000, 0, 1, ONE_ETH, None,
         );
         assert!(result.is_err(), "A forged proof must abort the derivation");
     }
@@ -641,13 +688,94 @@ mod tests {
         );
 
         let public = execute_derivation_statement(
-            &witness, &state_root, &POLICY, 2, 19_000_100, 1, ONE_ETH, None,
+            &witness, &state_root, &POLICY, 2, 19_000_100, 19_000_000, 1, ONE_ETH, None,
         )
         .unwrap();
 
         assert_eq!(public.prev_root, SolventSet::from_entries(prev).root());
         let expected = SolventSet::from_entries(vec![SolventEntry { address: addr, streak: 3 }]);
         assert_eq!(public.solvent_set_root, expected.root());
+    }
+
+    #[test]
+    fn test_streak_cannot_replay_the_same_block() {
+        // Review finding R2: re-proving one snapshot must not inflate streaks.
+        let addr = [0x42; 20];
+        let (state_root, proof) = single_leaf_proof(addr, 5 * ONE_ETH);
+        let prev = vec![SolventEntry { address: addr, streak: 2 }];
+        let witness = native_witness(
+            vec![CandidateProof { address: addr, proof_nodes: proof }],
+            prev,
+        );
+
+        // Same block as the previous set → rejected.
+        let err = execute_derivation_statement(
+            &witness, &state_root, &POLICY, 2, 19_000_000, 19_000_000, 1, ONE_ETH, None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must be newer"));
+
+        // An *older* block is likewise rejected.
+        assert!(execute_derivation_statement(
+            &witness, &state_root, &POLICY, 2, 18_999_999, 19_000_000, 1, ONE_ETH, None,
+        )
+        .is_err());
+
+        // Advancing by a single block is enough to satisfy the statement.
+        assert!(execute_derivation_statement(
+            &witness, &state_root, &POLICY, 2, 19_000_001, 19_000_000, 1, ONE_ETH, None,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_first_epoch_discriminator_is_prev_block_number() {
+        // prev_block_number == 0 means "no previous publication" and commits
+        // prev_root = 0, matching what the contract stores for empty history.
+        let addr = [0x42; 20];
+        let (state_root, proof) = single_leaf_proof(addr, 5 * ONE_ETH);
+        let first = native_witness(
+            vec![CandidateProof { address: addr, proof_nodes: proof.clone() }],
+            vec![],
+        );
+        let public = execute_derivation_statement(
+            &first, &state_root, &POLICY, 1, 19_000_000, 0, 1, ONE_ETH, None,
+        )
+        .unwrap();
+        assert_eq!(public.prev_root, [0u8; 32], "no previous set → zero prev root");
+
+        // Claiming "first epoch" while supplying previous entries is
+        // incoherent: it would fabricate streak continuity out of nothing.
+        let contradictory = native_witness(
+            vec![CandidateProof { address: addr, proof_nodes: proof.clone() }],
+            vec![SolventEntry { address: addr, streak: 9 }],
+        );
+        let err = execute_derivation_statement(
+            &contradictory, &state_root, &POLICY, 1, 19_000_000, 0, 1, ONE_ETH, None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("prev_entries is non-empty"));
+    }
+
+    #[test]
+    fn test_previous_empty_set_recommits_to_sentinel() {
+        // An epoch in which nobody qualified is still a real epoch: the next
+        // epoch must chain from the sentinel, not from zero.
+        let addr = [0x42; 20];
+        let (state_root, proof) = single_leaf_proof(addr, 5 * ONE_ETH);
+        let witness = native_witness(
+            vec![CandidateProof { address: addr, proof_nodes: proof }],
+            vec![],
+        );
+        let public = execute_derivation_statement(
+            &witness, &state_root, &POLICY, 2, 19_000_100, 19_000_000, 1, ONE_ETH, None,
+        )
+        .unwrap();
+        assert_eq!(
+            public.prev_root,
+            crate::solvent_set::EMPTY_SET_ROOT,
+            "previous set existed and was empty"
+        );
     }
 
     #[test]
@@ -665,7 +793,7 @@ mod tests {
         );
 
         let public = execute_derivation_statement(
-            &witness, &state_root, &POLICY, 2, 19_000_100, 1, ONE_ETH, None,
+            &witness, &state_root, &POLICY, 2, 19_000_100, 19_000_000, 1, ONE_ETH, None,
         )
         .unwrap();
 
@@ -688,7 +816,7 @@ mod tests {
             token_account_proof: proof, // must be empty in native mode
         };
         assert!(execute_derivation_statement(
-            &witness, &state_root, &POLICY, 1, 19_000_000, 1, ONE_ETH, None,
+            &witness, &state_root, &POLICY, 1, 19_000_000, 0, 1, ONE_ETH, None,
         )
         .is_err());
     }
@@ -716,7 +844,7 @@ mod tests {
         };
 
         let public = execute_derivation_statement(
-            &witness, &state_root, &POLICY, 2, 19_000_100, 1, ONE_ETH, Some(&config),
+            &witness, &state_root, &POLICY, 2, 19_000_100, 19_000_000, 1, ONE_ETH, Some(&config),
         )
         .unwrap();
 
@@ -748,16 +876,19 @@ mod tests {
             token_account_proof,
         };
         assert!(execute_derivation_statement(
-            &witness, &state_root, &POLICY, 1, 19_000_000, 1, ONE_ETH, Some(&config),
+            &witness, &state_root, &POLICY, 1, 19_000_000, 0, 1, ONE_ETH, Some(&config),
         )
         .is_err());
     }
 
     #[test]
     fn test_erc20_wrong_slot_yields_zero_balance() {
-        // A storage proof for slot 0 cannot satisfy a slot-1 policy: the trie
-        // key differs, so verification fails (fail-closed) rather than
-        // returning a balance.
+        // A storage proof for slot 0 cannot credit a balance under a slot-1
+        // policy. The single-leaf storage trie genuinely *proves* the slot-1
+        // key absent (the leaf path diverges), so the balance reads as zero
+        // and the holder is excluded — never credited. A misconfigured slot is
+        // therefore a liveness failure (empty set), not a safety one, and
+        // `balance_slot` is committed publicly so the mismatch is detectable.
         let token = [0xEE; 20];
         let holder = [0x42; 20];
         let (state_root, token_account_proof, storage_proofs) =
@@ -772,10 +903,17 @@ mod tests {
             prev_entries: vec![],
             token_account_proof,
         };
-        let result = execute_derivation_statement(
-            &witness, &state_root, &POLICY, 1, 19_000_000, 1, ONE_ETH, Some(&wrong_slot),
+        let public = execute_derivation_statement(
+            &witness, &state_root, &POLICY, 1, 19_000_000, 0, 1, ONE_ETH, Some(&wrong_slot),
+        )
+        .unwrap();
+        assert_eq!(public.member_count, 0, "Mismatched slot must not credit a balance");
+        assert_eq!(public.balance_slot, 1, "The proven slot is committed publicly");
+        assert_eq!(
+            public.solvent_set_root,
+            SolventSet::from_entries(vec![]).root(),
+            "Set must be empty, not silently populated"
         );
-        assert!(result.is_err(), "Mismatched slot must not verify");
     }
 
     #[test]
@@ -787,6 +925,7 @@ mod tests {
             policy_id: [0x04; 32],
             epoch: 7,
             block_number: 19_500_000,
+            prev_block_number: 19_400_000,
             chain_id: 11155111,
             threshold_wei: 123 * ONE_ETH,
             member_count: 42,
@@ -799,10 +938,11 @@ mod tests {
         assert_eq!(encoded.len(), DERIVATION_PUBLIC_VALUES_LEN);
         assert_eq!(DerivationPublicValues::abi_decode(&encoded).unwrap(), public);
 
-        // Spot-check Solidity word alignment: token address word.
-        assert_eq!(&encoded[320..332], &[0u8; 12]);
-        assert_eq!(&encoded[332..352], &[0x05; 20]);
-        assert_eq!(encoded[383], 3);
+        // Spot-check Solidity word alignment: prev block and token words.
+        assert_eq!(u64::from_be_bytes(encoded[216..224].try_into().unwrap()), 19_400_000);
+        assert_eq!(&encoded[352..364], &[0u8; 12]);
+        assert_eq!(&encoded[364..384], &[0x05; 20]);
+        assert_eq!(encoded[415], 3);
     }
 
     #[test]
@@ -814,6 +954,7 @@ mod tests {
             policy_id: [0x04; 32],
             epoch: 1,
             block_number: 1,
+            prev_block_number: 0,
             chain_id: 1,
             threshold_wei: 1,
             member_count: 1,
@@ -823,7 +964,7 @@ mod tests {
             candidates_root: [0u8; 32],
         };
         let mut encoded = public.abi_encode();
-        assert!(DerivationPublicValues::abi_decode(&encoded[..415]).is_err());
+        assert!(DerivationPublicValues::abi_decode(&encoded[..447]).is_err());
         encoded[130] = 0xFF; // dirty padding
         assert!(DerivationPublicValues::abi_decode(&encoded).is_err());
     }

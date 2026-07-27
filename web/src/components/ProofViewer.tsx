@@ -9,12 +9,18 @@
  */
 
 import { useState } from "react";
+import { usePublicClient } from "wagmi";
 import {
   decodeMembershipPublicValues,
   checkMembershipPublicValues,
   type MembershipPublicValues,
   type MembershipCheckResult,
 } from "@zk-proof-of-funds/sdk";
+import {
+  ORACLE_ADDRESS,
+  ORACLE_CHAIN_ID,
+  SOLVENT_SET_ORACLE_ABI,
+} from "../config/contracts";
 import {
   Button,
   Callout,
@@ -66,8 +72,19 @@ export default function ProofViewer() {
 
 // ── Privacy V2 ──────────────────────────────────────────────────────────────
 
+/** Outcome of asking the oracle to verify the proof for real. */
+interface VerificationResult {
+  /** True only when `verifyMembership` returned without reverting. */
+  valid: boolean;
+  /** The revert reason, when it reverted. */
+  reason?: string;
+  nullifierHash?: string;
+  minStreak?: bigint;
+}
+
 function MembershipInspector() {
   const [input, setInput] = useState("");
+  const [proofInput, setProofInput] = useState("");
   const [values, setValues] = useState<MembershipPublicValues | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -75,7 +92,59 @@ function MembershipInspector() {
   const [expectedPolicy, setExpectedPolicy] = useState("");
   const [expectedChain, setExpectedChain] = useState("");
   const [requiredStreak, setRequiredStreak] = useState("");
+  const [setIndex, setSetIndex] = useState("");
   const [check, setCheck] = useState<MembershipCheckResult | null>(null);
+  const [verification, setVerification] = useState<VerificationResult | null>(null);
+  const [verifying, setVerifying] = useState(false);
+
+  const publicClient = usePublicClient(
+    ORACLE_CHAIN_ID ? { chainId: ORACLE_CHAIN_ID } : undefined
+  );
+
+  /**
+   * Ask the oracle to verify the proof, for real.
+   *
+   * Decoding tells you what a proof *claims*; only this call tells you the
+   * Groth16 proof is valid, the root is one the oracle stored, the entry is
+   * live and unrevoked, and the presentation context matches. The screen
+   * previously showed a green "meets your requirements" state for a decoded
+   * blob with no valid proof behind it at all (review §3.8).
+   */
+  async function verifyOnChain(decoded: MembershipPublicValues) {
+    if (!publicClient || !ORACLE_ADDRESS) return;
+    const index = setIndex.trim();
+    if (!index) {
+      setVerification({
+        valid: false,
+        reason: "Enter the on-chain set index this proof targets.",
+      });
+      return;
+    }
+    setVerifying(true);
+    setVerification(null);
+    try {
+      const result = await publicClient.readContract({
+        address: ORACLE_ADDRESS,
+        abi: SOLVENT_SET_ORACLE_ABI,
+        functionName: "verifyMembership",
+        args: [
+          decoded.policyId as `0x${string}`,
+          BigInt(index),
+          `0x${input.trim().replace(/^0x/, "")}` as `0x${string}`,
+          `0x${proofInput.trim().replace(/^0x/, "")}` as `0x${string}`,
+        ],
+      });
+      const [nullifierHash, minStreak] = result as [string, bigint];
+      setVerification({ valid: true, nullifierHash, minStreak });
+    } catch (err) {
+      setVerification({
+        valid: false,
+        reason: err instanceof Error ? err.message : "The oracle rejected this proof.",
+      });
+    } finally {
+      setVerifying(false);
+    }
+  }
 
   function decode() {
     setError(null);
@@ -94,6 +163,13 @@ function MembershipInspector() {
       }
       const decoded = decodeMembershipPublicValues(blob);
       setValues(decoded);
+      setVerification(null);
+      // The JSON form carries the proof bytes too; keep them for the real
+      // verification call.
+      if (trimmed.startsWith("{")) {
+        const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+        if (typeof parsed.proof_bytes === "string") setProofInput(parsed.proof_bytes);
+      }
       setCheck(
         checkMembershipPublicValues(decoded, {
           policyId: expectedPolicy.trim() || undefined,
@@ -110,13 +186,13 @@ function MembershipInspector() {
     <div className="space-y-6">
       <Card
         title="Public values"
-        subtitle="The 224-byte blob, or the whole JSON object from zkpof-client prove."
+        subtitle="The 448-byte blob, or the whole JSON object from zkpof-client prove."
       >
         <TextArea
           value={input}
           onChange={setInput}
           rows={6}
-          placeholder="0x… (224 bytes) or the zkpof-client JSON"
+          placeholder="0x… (448 bytes) or the zkpof-client JSON"
         />
         <div className="mt-3">
           <Button onClick={decode} disabled={!input.trim()} full>
@@ -186,14 +262,70 @@ function MembershipInspector() {
             </div>
           )}
 
-          <div className="mt-4">
-            <Callout tone="warn" title="Decoding is not verification">
-              These are the values the proof <em>would</em> commit to. Only
-              <code className="font-mono"> SolventSetOracle.verifyMembership</code> checks the
-              Groth16 proof itself, that the root is one the oracle stored, and that the root has
-              not expired.
-            </Callout>
+          <div className="mt-6 border-t border-slate-200 pt-4">
+            <h4 className="font-medium mb-2">Cryptographic verification</h4>
+            {!ORACLE_ADDRESS ? (
+              <Callout tone="warn" title="No oracle configured">
+                Set <code className="font-mono">VITE_ORACLE_ADDRESS</code> to check this proof
+                against the chain. Everything above is only a decode of what the blob claims.
+              </Callout>
+            ) : (
+              <>
+                <Field label="Proof bytes" hint="The Groth16 proof from zkpof-client prove.">
+                  <TextArea
+                    value={proofInput}
+                    onChange={setProofInput}
+                    rows={3}
+                    placeholder="0x…"
+                  />
+                </Field>
+                <Field
+                  label="On-chain set index"
+                  hint="Which stored entry this proof targets (getSetCount − 1 for the latest)."
+                >
+                  <TextInput value={setIndex} onChange={setSetIndex} placeholder="0" />
+                </Field>
+                <Button
+                  onClick={() => values && verifyOnChain(values)}
+                  disabled={verifying || !proofInput.trim()}
+                  full
+                >
+                  {verifying ? "Verifying…" : "Verify against the oracle"}
+                </Button>
+
+                {verification && (
+                  <div className="mt-3">
+                    {verification.valid ? (
+                      <Callout tone="good" title="✓ Cryptographically valid">
+                        The oracle accepted this proof: the Groth16 proof verifies, the root is
+                        one it stored, the entry is live and unrevoked, and the presentation
+                        context matches this verifier.
+                        <div className="mt-2 font-mono text-xs break-all">
+                          nullifier: {verification.nullifierHash}
+                          <br />
+                          minStreak: {String(verification.minStreak)}
+                        </div>
+                      </Callout>
+                    ) : (
+                      <Callout tone="bad" title="✗ The oracle rejected this proof">
+                        <span className="font-mono text-xs break-all">{verification.reason}</span>
+                      </Callout>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
           </div>
+
+          {!verification?.valid && (
+            <div className="mt-4">
+              <Callout tone="warn" title="Decoding is not verification">
+                Everything above is what the blob <em>claims</em>. Until the oracle accepts it,
+                treat it as unverified — a well-formed blob can be fabricated with no valid proof
+                behind it.
+              </Callout>
+            </div>
+          )}
         </Card>
       )}
     </div>

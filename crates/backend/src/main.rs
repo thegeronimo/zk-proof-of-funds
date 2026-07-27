@@ -30,11 +30,22 @@
 //!
 //! System:
 //!   GET /health                                   — health check
+//!
+//! ## Operator authentication
+//!
+//! Every `/admin/*` and `/v2/admin/*` route sits behind a bearer token from
+//! `ZKPOF_ADMIN_TOKEN` (see [`require_operator`]). These routes build and
+//! publish the sets that relying protocols trust, so leaving them open — as
+//! they were before the 2026-07 review — let anyone trigger epochs or
+//! reshape a policy's set. The token is the minimum bar; the control plane is
+//! designed so mTLS or signed operator requests can replace it without
+//! touching handlers. The server refuses to start with admin routes exposed
+//! and no token configured unless `ZKPOF_DEV_INSECURE_ADMIN=1` is set.
 
 use axum::{
     Router,
     extract::{Path, Query, State, Json},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -64,6 +75,75 @@ struct AppState {
     rpc_fetcher: Option<RpcFetcher>,
     proof_worker: Option<ProofWorker>,
     publisher: Option<OnChainPublisher>,
+    /// Bearer token guarding the operator control plane. `None` only in the
+    /// explicitly-acknowledged dev mode.
+    admin_token: Option<String>,
+}
+
+/// Gate an operator route on the configured bearer token.
+///
+/// Returns `Err` with the response to send when the caller is not authorized;
+/// handlers use `?`-style early return. Comparison is length-checked and
+/// constant-time-ish (the token is not a password, but there is no reason to
+/// leak its length through timing).
+fn require_operator(
+    state: &AppState,
+    headers: &HeaderMap,
+    action: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let Some(expected) = state.admin_token.as_deref() else {
+        // Dev mode: explicitly acknowledged at startup.
+        tracing::warn!(action, "Operator action served without authentication (dev mode)");
+        return Ok(());
+    };
+
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default();
+
+    let ok = presented.len() == expected.len()
+        && presented
+            .bytes()
+            .zip(expected.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0;
+
+    if ok {
+        // Audit log: who did what, when. Operator actions reshape the sets
+        // relying protocols depend on, so they are never silent.
+        tracing::info!(action, "Operator action authorized");
+        Ok(())
+    } else {
+        tracing::warn!(action, "Rejected unauthorized operator action");
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "Operator authentication required",
+                "hint": "Send 'Authorization: Bearer <ZKPOF_ADMIN_TOKEN>'"
+            })),
+        ))
+    }
+}
+
+/// Mirrors that serve a policy's snapshot, from `ZKPOF_SNAPSHOT_MIRRORS`
+/// (comma-separated base URLs).
+///
+/// A root nobody can fetch the leaves for is a root no member can prove
+/// against, so publication should always come with somewhere to get the data
+/// (review §4.4). `{policy}` and `{epoch}` are substituted if present.
+fn snapshot_mirrors(policy_id: &str, epoch: u64) -> Vec<String> {
+    std::env::var("ZKPOF_SNAPSHOT_MIRRORS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|base| {
+            base.replace("{policy}", policy_id)
+                .replace("{epoch}", &epoch.to_string())
+        })
+        .collect()
 }
 
 // ─── Request / Response types ────────────────────────────────────────────────
@@ -144,6 +224,12 @@ struct BuildSolventSetRequest {
     /// ERC-20 proven mode: the Solidity mapping slot of `balanceOf`.
     #[serde(default)]
     balance_slot: Option<u64>,
+    /// Abort rather than publish a set with unresolved candidates (default
+    /// `true`). An RPC failure is not evidence of insolvency, so silently
+    /// dropping the candidate would understate the set and give an operator
+    /// deniable censorship. Set `false` to deliberately publish a partial set.
+    #[serde(default)]
+    strict: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -619,8 +705,12 @@ async fn get_status(
 /// GET /admin/members/:policy_id — list all members for a policy
 async fn admin_list_members(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(policy_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(response) = require_operator(&state, &headers, "admin_list_members") {
+        return response;
+    }
     let policy_id = canonical_hex(&policy_id);
     let db = state.db.lock().unwrap();
 
@@ -652,8 +742,12 @@ async fn admin_list_members(
 /// GET /admin/epochs/:policy_id — list epoch history for a policy
 async fn admin_list_epochs(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(policy_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(response) = require_operator(&state, &headers, "admin_list_epochs") {
+        return response;
+    }
     let policy_id = canonical_hex(&policy_id);
     let db = state.db.lock().unwrap();
 
@@ -699,8 +793,12 @@ async fn admin_list_epochs(
 /// 5. Update member statuses
 async fn admin_trigger_epoch(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(policy_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(response) = require_operator(&state, &headers, "admin_trigger_epoch") {
+        return response;
+    }
     let policy_id = canonical_hex(&policy_id);
     let rpc = match &state.rpc_fetcher {
         Some(r) => r,
@@ -1048,16 +1146,39 @@ async fn get_solvent_set_handler(
     let db = state.db.lock().unwrap();
     let service = SolventSetService::new(&db);
     match service.get(&policy_id_hex, None) {
-        Ok(Some(row)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "policy_id": row.policy_id,
-                "epoch": row.epoch,
-                "block_number": row.block_number,
-                "root": format!("0x{}", row.root),
-                "member_count": row.member_count
-            })),
-        ),
+        Ok(Some(row)) => {
+            // Snapshot manifest: a published root is useless to members if
+            // nobody serves the leaves. Committing to the exact snapshot bytes
+            // lets a client verify what it downloaded, and lets mirrors serve
+            // it without being trusted (review §4.4).
+            let manifest = {
+                use sha2::{Digest, Sha256};
+                let snapshot = row.addresses_json.as_bytes();
+                let mut hasher = Sha256::new();
+                hasher.update(snapshot);
+                serde_json::json!({
+                    "schema": "zkpof-solvent-set-snapshot-v1",
+                    // Hash of the canonical stored entry list — the same bytes
+                    // /leaves paginates over.
+                    "content_sha256": format!("0x{}", hex::encode(hasher.finalize())),
+                    "size_bytes": snapshot.len(),
+                    "entry_count": row.member_count,
+                    "mirrors": snapshot_mirrors(&policy_id_hex, row.epoch),
+                })
+            };
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "policy_id": row.policy_id,
+                    "epoch": row.epoch,
+                    "block_number": row.block_number,
+                    "root": format!("0x{}", row.root),
+                    "member_count": row.member_count,
+                    "snapshot": manifest,
+                })),
+            )
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "No solvent set built for this policy"})),
@@ -1151,10 +1272,15 @@ async fn get_solvent_set_leaves_handler(
 /// addresses, member or not — the agent never learns who the members are.
 async fn admin_build_solvent_set_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(policy_id): Path<String>,
     Json(req): Json<BuildSolventSetRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     use std::collections::BTreeSet;
+
+    if let Err(response) = require_operator(&state, &headers, "build_solvent_set") {
+        return response;
+    }
 
     let policy_id_hex = match parse_policy_id(&policy_id) {
         Ok(p) => hex::encode(p),
@@ -1344,7 +1470,13 @@ async fn admin_build_solvent_set_handler(
 
     // ── Stage A: balance-checked build (operator-trusted) ───────────────
     // Fetch all balances before touching the DB (no lock across awaits).
+    // An RPC failure is NOT evidence of insolvency. Previously a failed fetch
+    // silently dropped the candidate, so an RPC outage was indistinguishable
+    // from "this address didn't qualify" — and gave an operator deniable
+    // censorship (review finding R8). Unresolved candidates are reported, and
+    // the build aborts outright when the caller asked for a strict set.
     let mut balances: Vec<(String, u128)> = Vec::with_capacity(candidates.len());
+    let mut unresolved: Vec<serde_json::Value> = Vec::new();
     for candidate in &candidates {
         let fetched = match &req.token_address {
             Some(token) => rpc.get_erc20_balance_at_block(token, candidate, block_number).await,
@@ -1353,9 +1485,30 @@ async fn admin_build_solvent_set_handler(
         match fetched {
             Ok(balance) => balances.push((candidate.clone(), balance)),
             Err(e) => {
-                tracing::warn!(address = %candidate, error = %e, "Balance fetch failed — excluding candidate");
+                tracing::warn!(address = %candidate, error = %e, "Balance fetch failed");
+                unresolved.push(serde_json::json!({
+                    "address": candidate,
+                    "error": format!("{}", e),
+                }));
             }
         }
+    }
+
+    if !unresolved.is_empty() && req.strict.unwrap_or(true) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": format!(
+                    "{} candidate(s) could not be resolved at block {}; refusing to \
+                     publish a set that would silently omit them",
+                    unresolved.len(),
+                    block_number
+                ),
+                "unresolved": unresolved,
+                "hint": "Retry when the RPC recovers, or pass strict=false to \
+                         publish an explicitly-partial set"
+            })),
+        );
     }
 
     let db = state.db.lock().unwrap();
@@ -1380,7 +1533,12 @@ async fn admin_build_solvent_set_handler(
                 "root": format!("0x{}", hex::encode(result.root)),
                 "member_count": result.member_count,
                 "candidate_count": candidates.len(),
-                "proven": false
+                "provenance": "operator_asserted",
+                // Always reported, never implied: this set covers the
+                // candidates supplied and resolved, not "every qualifying
+                // address" (review §4.2).
+                "resolved_candidate_count": balances.len(),
+                "unresolved": unresolved,
             })),
         ),
         Err(e) => (
@@ -1503,12 +1661,39 @@ async fn main() {
         _ => None,
     };
 
+    // Operator control plane: refuse to serve admin routes unauthenticated
+    // unless that is an explicit, acknowledged choice. These endpoints build
+    // and publish the sets relying protocols trust.
+    let admin_token = match std::env::var("ZKPOF_ADMIN_TOKEN") {
+        Ok(token) if !token.trim().is_empty() => {
+            info!("Operator control plane authenticated via ZKPOF_ADMIN_TOKEN");
+            Some(token)
+        }
+        _ => {
+            if std::env::var("ZKPOF_DEV_INSECURE_ADMIN").as_deref() == Ok("1") {
+                tracing::warn!(
+                    "ZKPOF_ADMIN_TOKEN is unset and ZKPOF_DEV_INSECURE_ADMIN=1 — \
+                     operator endpoints are UNAUTHENTICATED. Never do this outside \
+                     local development."
+                );
+                None
+            } else {
+                panic!(
+                    "ZKPOF_ADMIN_TOKEN must be set: /admin/* and /v2/admin/* can \
+                     trigger epochs and reshape published sets. Set the variable, \
+                     or set ZKPOF_DEV_INSECURE_ADMIN=1 to run without it locally."
+                );
+            }
+        }
+    };
+
     let state = Arc::new(AppState {
         db: Mutex::new(Database::open(&db_path).expect("Failed to reopen database")),
         rpc_url,
         rpc_fetcher,
         proof_worker,
         publisher,
+        admin_token,
     });
     let app = build_router(state);
 

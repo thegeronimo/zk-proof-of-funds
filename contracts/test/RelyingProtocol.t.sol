@@ -55,7 +55,9 @@ contract RelyingProtocolTest is Test {
             operator: operatorAddr,
             scope: "test-scope",
             trustedMode: true,
-            active: true
+            active: true,
+            startBlock: 0,
+            version: 1
         });
         registry.createPolicy(POLICY_ID, policy);
 
@@ -288,7 +290,9 @@ contract RelyingProtocolTest is Test {
             operator: operatorAddr,
             scope: "other-scope",
             trustedMode: true,
-            active: true
+            active: true,
+            startBlock: 0,
+            version: 1
         });
         registry.createPolicy(otherPolicyId, otherPolicy);
         RelyingProtocol otherDapp = new RelyingProtocol(address(oracle), otherPolicyId);

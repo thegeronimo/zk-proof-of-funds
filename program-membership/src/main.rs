@@ -32,7 +32,9 @@
 #![no_main]
 sp1_zkvm::entrypoint!(main);
 
-use zk_pof_common::membership::{execute_membership_statement, MembershipWitness};
+use zk_pof_common::membership::{
+    execute_membership_statement, MembershipWitness, PresentationContext,
+};
 
 pub fn main() {
     // ── 1. Read private inputs ─────────────────────────────────────────
@@ -49,12 +51,32 @@ pub fn main() {
     let min_streak: u64 = sp1_zkvm::io::read();
     let scope_hash: [u8; 32] = sp1_zkvm::io::read();
 
+    // Presentation context: where and for whom this proof may be used.
+    // Committed publicly so it cannot be replayed at another verifier or
+    // consumed by a front-runner (PRIVACY_V2.md, review finding R5).
+    let policy_config_hash: [u8; 32] = sp1_zkvm::io::read();
+    let verifier: [u8; 20] = sp1_zkvm::io::read();
+    let verifier_chain_id: u64 = sp1_zkvm::io::read();
+    let action_id: [u8; 32] = sp1_zkvm::io::read();
+    let beneficiary: [u8; 20] = sp1_zkvm::io::read();
+    let nonce: u64 = sp1_zkvm::io::read();
+    let deadline: u64 = sp1_zkvm::io::read();
+
     // ── 3. Execute the statement (panics abort the proof) ──────────────
     let witness = MembershipWitness {
         sk,
         streak,
         leaf_index,
         siblings,
+    };
+    let context = PresentationContext {
+        policy_config_hash,
+        verifier,
+        verifier_chain_id,
+        action_id,
+        beneficiary,
+        nonce,
+        deadline,
     };
     let public_values = execute_membership_statement(
         &witness,
@@ -64,6 +86,7 @@ pub fn main() {
         chain_id,
         min_streak,
         &scope_hash,
+        &context,
     )
     .expect("membership statement not satisfied");
 

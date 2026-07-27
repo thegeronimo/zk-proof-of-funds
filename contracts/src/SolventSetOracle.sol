@@ -99,6 +99,10 @@ contract SolventSetOracle is Ownable {
     /// @dev Window served by EIP-2935.
     uint256 internal constant HISTORY_SERVE_WINDOW = 8191;
 
+    /// @dev Domain tag for reference-block sampling.
+    bytes32 internal constant REFERENCE_BLOCK_SAMPLE_DOMAIN =
+        keccak256("zkpof-refblock-sample-v2");
+
     /// @dev `sha256("zkpof-empty-solvent-set-v1")` — the root of a set in
     ///      which nobody qualified. A real, publishable outcome, kept
     ///      distinct from `bytes32(0)` which means "no root at all"
@@ -224,6 +228,9 @@ contract SolventSetOracle is Ownable {
     error InvalidScanRange(uint64 startBlock, uint64 endBlock, uint64 numBlocks);
     error ScanRangeNotContiguous(uint64 expectedStart, uint64 actualStart);
     error ScanEndBlockUnavailable(uint64 endBlock);
+    error EpochWindowStillOpen(uint64 windowEnd);
+    error SamplingEntropyUnavailable(uint64 windowEnd);
+    error ReferenceBlockNotSampled(uint64 expected, uint64 actual);
 
     // --- Constructor ---
 
@@ -541,6 +548,9 @@ contract SolventSetOracle is Ownable {
 
         // Epoch schedule + streak continuity bound to our stored history.
         _validateEpochSchedule(policyId, d.epoch, d.blockNumber, policy);
+        // ...and, on the permissionless path, the reference block must be the
+        // one the sampling rule names — not one the publisher preferred.
+        _validateSampledReferenceBlock(policyId, d.epoch, d.blockNumber, policy);
         bytes32 expectedPrevRoot = bytes32(0);
         uint64 expectedPrevBlock = 0;
         uint256 setCount = _setHistory[policyId].length;
@@ -929,6 +939,85 @@ contract SolventSetOracle is Ownable {
         uint256 windowEnd = windowStart + policy.epochLengthBlocks;
         if (blockNumber < windowStart || blockNumber >= windowEnd) {
             revert ReferenceBlockOutsideEpoch(blockNumber, epoch);
+        }
+    }
+
+    /// @notice The reference block epoch `epoch` must be proven against.
+    ///
+    /// @dev A streak is only an anti-rental deterrent if the holder cannot
+    ///      know, while deciding whether to hold funds, which block will be
+    ///      sampled. So the sample is derived from the hash of the first block
+    ///      **after** the epoch's window — entropy that does not exist until
+    ///      the window has closed and every balance in it is already settled:
+    ///
+    ///        windowStart = startBlock + epoch * epochLengthBlocks
+    ///        windowEnd   = windowStart + epochLengthBlocks   (exclusive)
+    ///        entropy     = blockhash(windowEnd)
+    ///        reference   = windowStart
+    ///                    + keccak(DOMAIN, configHash, epoch, entropy)
+    ///                      % epochLengthBlocks
+    ///
+    ///      The previous scheme derived the sample from the *current* block,
+    ///      which an operator could watch and re-roll by simply waiting — the
+    ///      randomness was real but the choice of when to consume it was not
+    ///      constrained (review finding R2). Here the answer is fixed the
+    ///      moment the window closes, and identical for every publisher.
+    ///
+    ///      Reverts if the window has not closed yet, or if the entropy block
+    ///      is outside the served hash window.
+    function sampledReferenceBlock(bytes32 policyId, uint64 epoch)
+        public
+        view
+        returns (uint64)
+    {
+        PolicyRegistry.Policy memory policy = policyRegistry.getPolicy(policyId);
+        return _sampledReferenceBlock(policyId, epoch, policy);
+    }
+
+    function _sampledReferenceBlock(
+        bytes32 policyId,
+        uint64 epoch,
+        PolicyRegistry.Policy memory policy
+    ) internal view returns (uint64) {
+        uint256 windowStart =
+            uint256(policy.startBlock) + uint256(epoch) * uint256(policy.epochLengthBlocks);
+        uint256 windowEnd = windowStart + policy.epochLengthBlocks;
+
+        // The window must be closed: sampling from an open window would let a
+        // holder see the draw while they can still move funds.
+        if (block.number <= windowEnd) revert EpochWindowStillOpen(uint64(windowEnd));
+
+        bytes32 entropy = _blockhash(uint64(windowEnd));
+        if (entropy == bytes32(0)) revert SamplingEntropyUnavailable(uint64(windowEnd));
+
+        uint256 offset = uint256(
+            keccak256(
+                abi.encode(REFERENCE_BLOCK_SAMPLE_DOMAIN, policyConfigHash(policyId), epoch, entropy)
+            )
+        ) % policy.epochLengthBlocks;
+
+        return uint64(windowStart + offset);
+    }
+
+    /// @dev Require the proven reference block to equal the sampled one, and
+    ///      the publication to land within `maxBlockAge` of the window closing.
+    function _validateSampledReferenceBlock(
+        bytes32 policyId,
+        uint64 epoch,
+        uint64 blockNumber,
+        PolicyRegistry.Policy memory policy
+    ) internal view {
+        uint64 expected = _sampledReferenceBlock(policyId, epoch, policy);
+        if (blockNumber != expected) {
+            revert ReferenceBlockNotSampled(expected, blockNumber);
+        }
+        uint256 windowEnd = uint256(policy.startBlock)
+            + uint256(epoch + 1) * uint256(policy.epochLengthBlocks);
+        // `maxBlockAge` now means "how long after the window closes you may
+        // still publish", which is the only freshness notion that survives a
+        // sampled reference block: the block itself is whatever the draw said.
+        if (block.number - windowEnd > policy.maxBlockAge) {
+            revert StaleReferenceBlock(block.number, blockNumber, policy.maxBlockAge);
         }
     }
 

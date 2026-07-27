@@ -423,10 +423,24 @@ Stage C (light-client-verified state enumeration) remains open.
   the cost of new trust; out of scope.
 - **Non-encumbrance**: proving funds aren't borrowed, key-shared, or pledged
   elsewhere is not possible on a transparent account chain. The economic
-  mitigation — streak solvency with blockhash-randomized reference blocks
-  (§4.1) — landed in Phase 11 and raises the cost of rented solvency to
-  roughly the cost of real solvency over the streak window, but it is a price,
-  not a proof.
+  mitigation — streak solvency with randomized reference blocks (§4.1) —
+  landed in Phase 11 and was made temporally sound in Phase 15, but it is a
+  price, not a proof.
+
+  **What a streak of N actually means.** The address met the threshold at
+  **N sampled blocks, one per epoch** — not continuously, and not at any
+  block in between. Phase 15 guarantees those N observations are genuinely
+  distinct and ordered (sequential epochs, strictly advancing reference
+  blocks inside their own windows, each bound to the previous entry on-chain),
+  which is what stops one funded snapshot being replayed into an arbitrarily
+  long streak. It does **not** turn N samples into continuous holding: funds
+  can leave and return between samples. Because the sample points are drawn
+  from entropy the holder cannot predict in advance, evading them means
+  holding the balance most of the time anyway — that is the deterrent, and it
+  is economic, not cryptographic.
+
+  Interfaces must not describe a streak as "held for N epochs". The accurate
+  phrasing is "met the threshold at N sampled observations".
 
 ---
 

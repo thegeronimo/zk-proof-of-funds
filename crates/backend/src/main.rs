@@ -78,6 +78,9 @@ struct AppState {
     /// Bearer token guarding the operator control plane. `None` only in the
     /// explicitly-acknowledged dev mode.
     admin_token: Option<String>,
+    /// Reads authoritative policy parameters from the chain. `None` leaves the
+    /// backend in unpinned dev mode, where a build must state its own terms.
+    policy_reader: Option<zk_pof_agent::policy_reader::PolicyReader>,
 }
 
 /// Gate an operator route on the configured bearer token.
@@ -133,6 +136,17 @@ fn require_operator(
 /// A root nobody can fetch the leaves for is a root no member can prove
 /// against, so publication should always come with somewhere to get the data
 /// (review §4.4). `{policy}` and `{epoch}` are substituted if present.
+fn parse_address_bytes(value: &str) -> anyhow::Result<[u8; 20]> {
+    let clean = value.strip_prefix("0x").unwrap_or(value);
+    let bytes = hex::decode(clean).map_err(|e| anyhow::anyhow!("not hex: {e}"))?;
+    if bytes.len() != 20 {
+        anyhow::bail!("expected 20 bytes, got {}", bytes.len());
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
 fn snapshot_mirrors(policy_id: &str, epoch: u64) -> Vec<String> {
     std::env::var("ZKPOF_SNAPSHOT_MIRRORS")
         .unwrap_or_default()
@@ -1282,8 +1296,8 @@ async fn admin_build_solvent_set_handler(
         return response;
     }
 
-    let policy_id_hex = match parse_policy_id(&policy_id) {
-        Ok(p) => hex::encode(p),
+    let policy_bytes = match parse_policy_id(&policy_id) {
+        Ok(p) => p,
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -1291,6 +1305,7 @@ async fn admin_build_solvent_set_handler(
             );
         }
     };
+    let policy_id_hex = hex::encode(policy_bytes);
 
     let rpc = match &state.rpc_fetcher {
         Some(r) => r,
@@ -1302,9 +1317,35 @@ async fn admin_build_solvent_set_handler(
         }
     };
 
-    let threshold_wei: u128 = match &req.threshold_wei {
+    // ── Policy parameters: the chain decides, not the request body ──────
+    //
+    // These used to come straight from the request, defaulting to a
+    // hard-coded 1 ETH. An operator could therefore build a set against terms
+    // that had nothing to do with what the relying contract checks (review
+    // finding R8). The registry is authoritative; anything the caller sends is
+    // cross-checked against it and a disagreement is a hard error rather than
+    // a silent override.
+    let on_chain_policy = match &state.policy_reader {
+        Some(reader) => match reader.fetch(&policy_bytes).await {
+            Ok(p) => Some(p),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error": format!("Could not read the on-chain policy: {}", e),
+                        "hint": "Build parameters are taken from the registry. Fix the \
+                                 RPC/registry configuration, or unset \
+                                 POLICY_REGISTRY_ADDRESS to run in unpinned dev mode."
+                    })),
+                );
+            }
+        },
+        None => None,
+    };
+
+    let requested_threshold: Option<u128> = match &req.threshold_wei {
         Some(t) => match t.parse() {
-            Ok(v) => v,
+            Ok(v) => Some(v),
             Err(e) => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -1312,13 +1353,88 @@ async fn admin_build_solvent_set_handler(
                 );
             }
         },
-        None => 1_000_000_000_000_000_000, // 1 ETH (TODO: read from policy)
+        None => None,
     };
 
-    // Reference block: explicit, or an unpredictable blockhash-derived sample
-    // within the freshness window (anti-rented-solvency; PRIVACY_V2.md §4.5).
+    let requested_token: Option<[u8; 20]> = match &req.token_address {
+        Some(t) => match parse_address_bytes(t) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Invalid token_address: {}", e)})),
+                );
+            }
+        },
+        None => None,
+    };
+
+    let (threshold_wei, effective_slot) = match &on_chain_policy {
+        Some(policy) => {
+            if let Err(e) = zk_pof_agent::policy_reader::reject_param_drift(
+                policy,
+                requested_threshold,
+                requested_token.as_ref(),
+                req.balance_slot,
+            ) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("{}", e)})),
+                );
+            }
+            if !policy.active {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Policy is not active on-chain"})),
+                );
+            }
+            (policy.threshold_wei, policy.balance_slot)
+        }
+        None => {
+            // Unpinned dev mode: no registry configured. Requiring an explicit
+            // threshold is better than silently assuming 1 ETH.
+            match requested_threshold {
+                Some(t) => (t, req.balance_slot.unwrap_or(0)),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "No on-chain policy configured and no threshold_wei given",
+                            "hint": "Set POLICY_REGISTRY_ADDRESS + SOLVENT_SET_ORACLE_ADDRESS \
+                                     so parameters come from the chain, or pass threshold_wei \
+                                     explicitly for a dev build."
+                        })),
+                    );
+                }
+            }
+        }
+    };
+
+    // ── Reference block: sampled, not chosen ────────────────────────────
+    //
+    // Letting the operator name the block is exactly the lever that makes a
+    // "streak" cheap to fake — pick the block you were funded at, every time.
+    // The block is therefore derived from chain entropy the operator does not
+    // control. The explicit override survives only behind ZKPOF_DEV_ALLOW_
+    // BLOCK_OVERRIDE, and never for proven builds.
+    let dev_block_override = std::env::var("ZKPOF_DEV_ALLOW_BLOCK_OVERRIDE").as_deref() == Ok("1");
+    if req.block_number.is_some() && (!dev_block_override || req.proven) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": if req.proven {
+                    "block_number cannot be supplied for a proven build: the reference \
+                     block must be sampled from chain entropy, not chosen"
+                } else {
+                    "block_number override is disabled. Set \
+                     ZKPOF_DEV_ALLOW_BLOCK_OVERRIDE=1 for local dev seeding."
+                }
+            })),
+        );
+    }
+
     let block_number = match req.block_number {
-        Some(b) => b,
+        Some(b) => b, // dev-only, non-proven, explicitly enabled above
         None => {
             let latest = match rpc.get_block_number().await {
                 Ok(b) => b,
@@ -1371,33 +1487,31 @@ async fn admin_build_solvent_set_handler(
 
     // ── Stage B: EIP-1186-proven build (native ETH or ERC-20) ───────────
     if req.proven {
-        // ERC-20 proven mode needs the pinned balanceOf mapping slot.
-        let token_config = match (&req.token_address, req.balance_slot) {
-            (Some(token_hex), Some(slot)) => {
-                let clean = token_hex.strip_prefix("0x").unwrap_or(token_hex);
-                let bytes = match hex::decode(clean) {
-                    Ok(b) if b.len() == 20 => b,
-                    _ => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(serde_json::json!({"error": "Invalid token_address (must be 20 bytes hex)"})),
-                        );
-                    }
-                };
-                let mut address = [0u8; 20];
-                address.copy_from_slice(&bytes);
+        // The asset a proven build is derived against comes from the chain
+        // whenever a registry is configured: the oracle checks the proof's
+        // token and slot against the pinned values, so building from anything
+        // else would only produce an unpublishable root.
+        let (effective_token, effective_balance_slot) = match &on_chain_policy {
+            Some(policy) => (policy.token_address, policy.balance_slot),
+            None => (requested_token, effective_slot),
+        };
+
+        let token_config = match effective_token {
+            Some(address) => {
+                if effective_balance_slot == 0 && on_chain_policy.is_none() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "ERC-20 proven mode requires balance_slot (the balanceOf mapping slot)"
+                        })),
+                    );
+                }
                 Some(zk_pof_common::solvent_derivation::TokenConfig {
                     address,
-                    balance_slot: slot,
+                    balance_slot: effective_balance_slot,
                 })
             }
-            (Some(_), None) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "ERC-20 proven mode requires balance_slot (the balanceOf mapping slot)"})),
-                );
-            }
-            (None, _) => None,
+            None => None,
         };
 
         let chain_id = match rpc.get_chain_id().await {
@@ -1687,6 +1801,16 @@ async fn main() {
         }
     };
 
+    let policy_reader = zk_pof_agent::policy_reader::PolicyReader::from_env();
+    if policy_reader.is_some() {
+        info!("Build parameters will be read from the on-chain PolicyRegistry");
+    } else {
+        tracing::warn!(
+            "POLICY_REGISTRY_ADDRESS / SOLVENT_SET_ORACLE_ADDRESS unset — builds run in \
+             unpinned dev mode and must state their own threshold"
+        );
+    }
+
     let state = Arc::new(AppState {
         db: Mutex::new(Database::open(&db_path).expect("Failed to reopen database")),
         rpc_url,
@@ -1694,6 +1818,7 @@ async fn main() {
         proof_worker,
         publisher,
         admin_token,
+        policy_reader,
     });
     let app = build_router(state);
 

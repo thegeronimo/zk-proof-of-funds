@@ -22,6 +22,7 @@ pub mod rpc_fetcher;
 pub mod mpt_verifier;
 pub mod proof_worker;
 pub mod chain_publisher;
+pub mod policy_reader;
 pub mod merkle_service;
 pub mod enrollment;
 pub mod epoch_processor;

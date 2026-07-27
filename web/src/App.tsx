@@ -12,15 +12,25 @@ import { findPolicy } from "./config/policies";
  * Navigation is ordered by the V2 flow: prove first, then the set it was
  * proven against, then identity, then the relying party's view. Monitored mode
  * sits last because it is the legacy path.
+ *
+ * The operator console is deliberately **not** here. It builds and publishes
+ * the sets relying protocols trust, and its endpoints require operator
+ * authentication (`ZKPOF_ADMIN_TOKEN`); listing it beside the user-facing
+ * tabs invited anyone to click into it and implied it was part of the same
+ * trust surface (external review §11). It lives at `/console/operator`,
+ * reachable only by URL and gated behind an explicit build flag.
  */
 const NAV = [
   { to: "/", label: "Prove" },
   { to: "/set", label: "Solvent set" },
   { to: "/identity", label: "Identity" },
   { to: "/verify", label: "Verify" },
-  { to: "/operator", label: "Operator" },
   { to: "/monitored", label: "Monitored" },
 ];
+
+/** Whether this build exposes the operator console at all. */
+const OPERATOR_CONSOLE_ENABLED =
+  import.meta.env.VITE_ENABLE_OPERATOR_CONSOLE === "1";
 
 function NavLink({ to, children }: { to: string; children: React.ReactNode }) {
   const { pathname } = useLocation();
@@ -82,9 +92,13 @@ export default function App() {
           <Route path="/set" element={<SolventSetPanel />} />
           <Route path="/identity" element={<IdentityPanel />} />
           <Route path="/verify" element={<ProofViewer />} />
-          <Route path="/operator" element={<OperatorPanel />} />
           <Route path="/monitored" element={<MonitoredMode />} />
+          {/* Operator console: separate route, opt-in build flag, never in NAV. */}
+          {OPERATOR_CONSOLE_ENABLED && (
+            <Route path="/console/operator" element={<OperatorPanel />} />
+          )}
           {/* Old paths from the V1-first app. */}
+          <Route path="/operator" element={<Navigate to="/console/operator" replace />} />
           <Route path="/solvent-set" element={<Navigate to="/set" replace />} />
           <Route path="/dashboard" element={<Navigate to="/monitored" replace />} />
           <Route path="/proof" element={<Navigate to="/verify" replace />} />

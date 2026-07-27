@@ -230,12 +230,35 @@ contract SolventSetOracleTest is Test {
 
     /// @dev Roll forward and prepare a provable reference block for `epoch`:
     ///      header + registered blockhash. Returns (refBlock, headerRlp).
+    /// @dev Prepare a provable reference block for `epoch` on the *proven*
+    ///      path. The block is not ours to choose: the oracle recomputes the
+    ///      sample from the hash of the first block after the epoch's window,
+    ///      so the harness registers that entropy, asks the oracle which block
+    ///      it drew, and provides a header for exactly that block.
     function _prepareProvenBlock(bytes32 stateRoot, uint64 epoch)
         internal
         returns (uint64, bytes memory)
     {
-        uint64 refBlock = _epochBlock(epoch);
-        vm.roll(refBlock + 50); // inside maxBlockAge (256)
+        uint64 windowEnd = (epoch + 1) * EPOCH_LEN;
+        vm.roll(windowEnd + 50); // window closed, inside maxBlockAge (256)
+        oracle.setBlockhash(windowEnd, keccak256(abi.encodePacked("entropy", epoch)));
+
+        uint64 refBlock = oracle.sampledReferenceBlock(POLICY_ID, epoch);
+        bytes memory headerRlp = _buildHeader(stateRoot);
+        oracle.setBlockhash(refBlock, keccak256(headerRlp));
+        return (refBlock, headerRlp);
+    }
+
+    /// @dev As above but for a policy other than POLICY_ID.
+    function _prepareProvenBlockFor(bytes32 policyId, bytes32 stateRoot, uint64 epoch)
+        internal
+        returns (uint64, bytes memory)
+    {
+        uint64 windowEnd = (epoch + 1) * EPOCH_LEN;
+        vm.roll(windowEnd + 50);
+        oracle.setBlockhash(windowEnd, keccak256(abi.encodePacked("entropy", epoch)));
+
+        uint64 refBlock = oracle.sampledReferenceBlock(policyId, epoch);
         bytes memory headerRlp = _buildHeader(stateRoot);
         oracle.setBlockhash(refBlock, keccak256(headerRlp));
         return (refBlock, headerRlp);
@@ -414,6 +437,131 @@ contract SolventSetOracleTest is Test {
         assertEq(oracle.getSetEntry(POLICY_ID, 2).blockNumber, _epochBlock(3));
     }
 
+    // --- Reference-block sampling (review finding R2) ---
+
+    /// The publisher does not get to choose the reference block. Any block
+    /// other than the drawn one is rejected, which is what stops "prove at the
+    /// block I happened to be funded at" from being a viable strategy.
+    function test_PublishRootProven_RejectsUnsampledReferenceBlock() public {
+        uint64 windowEnd = 2 * EPOCH_LEN;
+        vm.roll(windowEnd + 50);
+        oracle.setBlockhash(windowEnd, keccak256("entropy"));
+        uint64 sampled = oracle.sampledReferenceBlock(POLICY_ID, 1);
+
+        // A different, still-in-window block the publisher would have preferred.
+        uint64 preferred = sampled == EPOCH_LEN ? sampled + 1 : sampled - 1;
+        bytes memory headerRlp = _buildHeader(STATE_ROOT);
+        oracle.setBlockhash(preferred, keccak256(headerRlp));
+
+        bytes memory pv = _derivationValues(
+            STATE_ROOT, bytes32(0), SET_ROOT, 1, preferred, 0, uint64(block.chainid), THRESHOLD
+        );
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SolventSetOracle.ReferenceBlockNotSampled.selector, sampled, preferred
+            )
+        );
+        oracle.publishRootProven(POLICY_ID, headerRlp, pv, hex"");
+    }
+
+    /// The draw must not be knowable while the window is open — otherwise a
+    /// holder could see which block matters and fund only that one.
+    function test_SampledReferenceBlock_RevertsWhileWindowOpen() public {
+        vm.roll(EPOCH_LEN + 10); // inside epoch 1's window [100, 200)
+        vm.expectRevert(
+            abi.encodeWithSelector(SolventSetOracle.EpochWindowStillOpen.selector, uint64(200))
+        );
+        oracle.sampledReferenceBlock(POLICY_ID, 1);
+    }
+
+    function test_SampledReferenceBlock_RevertsWithoutEntropy() public {
+        vm.roll(2 * EPOCH_LEN + 50); // window closed, but no hash registered
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SolventSetOracle.SamplingEntropyUnavailable.selector, uint64(200)
+            )
+        );
+        oracle.sampledReferenceBlock(POLICY_ID, 1);
+    }
+
+    /// The sample always lands inside its own epoch window, and is stable —
+    /// two reads of the same epoch give the same answer.
+    function test_SampledReferenceBlock_InWindowAndDeterministic() public {
+        for (uint64 epoch = 1; epoch <= 5; epoch++) {
+            uint64 windowEnd = (epoch + 1) * EPOCH_LEN;
+            vm.roll(windowEnd + 10);
+            oracle.setBlockhash(windowEnd, keccak256(abi.encodePacked("e", epoch)));
+
+            uint64 drawn = oracle.sampledReferenceBlock(POLICY_ID, epoch);
+            assertGe(drawn, epoch * EPOCH_LEN, "sample below its window");
+            assertLt(drawn, (epoch + 1) * EPOCH_LEN, "sample above its window");
+            assertEq(drawn, oracle.sampledReferenceBlock(POLICY_ID, epoch), "not deterministic");
+        }
+    }
+
+    /// Different entropy draws a different block: the sample is genuinely a
+    /// function of chain randomness, not a fixed offset.
+    function test_SampledReferenceBlock_VariesWithEntropy() public {
+        uint64 windowEnd = 2 * EPOCH_LEN;
+        vm.roll(windowEnd + 10);
+
+        uint64 seen;
+        bool varied;
+        for (uint256 i = 0; i < 20; i++) {
+            oracle.setBlockhash(windowEnd, keccak256(abi.encodePacked("seed", i)));
+            uint64 drawn = oracle.sampledReferenceBlock(POLICY_ID, 1);
+            if (i == 0) seen = drawn;
+            else if (drawn != seen) varied = true;
+        }
+        assertTrue(varied, "sample must depend on the entropy block");
+    }
+
+    /// Two policies drawing from the same entropy block must not move in
+    /// lockstep — the config hash separates them. Checked across several
+    /// epochs, since any single epoch can coincide by chance (1-in-100 here).
+    function test_SampledReferenceBlock_SeparatedByPolicy() public {
+        _createErc20Policy();
+
+        uint256 divergences;
+        for (uint64 epoch = 1; epoch <= 8; epoch++) {
+            uint64 windowEnd = (epoch + 1) * EPOCH_LEN;
+            vm.roll(windowEnd + 10);
+            oracle.setBlockhash(windowEnd, keccak256(abi.encodePacked("shared", epoch)));
+
+            uint64 a = oracle.sampledReferenceBlock(POLICY_ID, epoch);
+            uint64 b = oracle.sampledReferenceBlock(ERC20_POLICY_ID, epoch);
+            // Offsets within their own windows are what must differ.
+            if (a - epoch * EPOCH_LEN != b - epoch * EPOCH_LEN) divergences++;
+        }
+        assertGt(divergences, 0, "distinct policies must draw independently");
+    }
+
+    /// The Solidity draw must equal the Rust mirror's, or the agent would
+    /// fetch balances at a block the oracle then rejects. Both are checked
+    /// against the same independently-computed vector
+    /// (`test_sampled_reference_block_matches_independent_vector` in
+    /// crates/agent/src/solvent_set_service.rs).
+    function test_SampledReferenceBlock_MatchesCrossLanguageVector() public {
+        bytes32 SAMPLE_DOMAIN = keccak256("zkpof-refblock-sample-v2");
+        bytes32 configHash = bytes32(
+            0xC0C0C0C0C0C0C0C0C0C0C0C0C0C0C0C0C0C0C0C0C0C0C0C0C0C0C0C0C0C0C0C0
+        );
+        bytes32 entropy = bytes32(
+            0xE7E7E7E7E7E7E7E7E7E7E7E7E7E7E7E7E7E7E7E7E7E7E7E7E7E7E7E7E7E7E7E7
+        );
+        uint64 epoch = 7;
+        uint64 startBlock = 1_000_000;
+        uint64 epochLen = 100;
+
+        uint256 offset = uint256(
+            keccak256(abi.encode(SAMPLE_DOMAIN, configHash, epoch, entropy))
+        ) % epochLen;
+        uint64 drawn = uint64(startBlock + epoch * epochLen + offset);
+
+        assertEq(offset, 53, "offset must match the independent vector");
+        assertEq(drawn, 1_000_753, "draw must match the Rust mirror");
+    }
+
     // --- publishRootProven (Stage B) ---
 
     function test_PublishRootProven_FirstEpoch_Permissionless() public {
@@ -522,28 +670,37 @@ contract SolventSetOracleTest is Test {
         oracle.publishRootProven(POLICY_ID, headerRlp, pv, hex"");
     }
 
-    function test_PublishRootProven_RevertsOnStaleReferenceBlock() public {
-        // Reference block far enough back to exceed maxBlockAge = 256.
-        uint64 staleBlock = _epochBlock(1);
-        vm.roll(staleBlock + 300);
+    /// `maxBlockAge` now bounds how long *after the epoch window closes* a
+    /// publication may land — the reference block itself is whatever the draw
+    /// chose, so its age is not the publisher's to control.
+    function test_PublishRootProven_RevertsWhenPublishedTooLateAfterWindow() public {
+        uint64 windowEnd = 2 * EPOCH_LEN;
+        vm.roll(windowEnd + 300); // beyond maxBlockAge = 256
+        oracle.setBlockhash(windowEnd, keccak256("entropy"));
+        uint64 refBlock = oracle.sampledReferenceBlock(POLICY_ID, 1);
         bytes memory headerRlp = _buildHeader(STATE_ROOT);
-        oracle.setBlockhash(staleBlock, keccak256(headerRlp));
+        oracle.setBlockhash(refBlock, keccak256(headerRlp));
         bytes memory pv = _derivationValues(
-            STATE_ROOT, bytes32(0), SET_ROOT, 1, staleBlock, 0, uint64(block.chainid), THRESHOLD
+            STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock, 0, uint64(block.chainid), THRESHOLD
         );
 
         vm.expectRevert(
             abi.encodeWithSelector(
                 SolventSetOracle.StaleReferenceBlock.selector,
-                uint256(staleBlock + 300), staleBlock, uint64(256)
+                uint256(windowEnd + 300), refBlock, uint64(256)
             )
         );
         oracle.publishRootProven(POLICY_ID, headerRlp, pv, hex"");
     }
 
     function test_PublishRootProven_RevertsOnMissingBlockhash() public {
-        uint64 refBlock = _epochBlock(1);
-        vm.roll(refBlock + 50); // no blockhash registered in the harness
+        // Window closed and entropy available, so sampling succeeds — but the
+        // sampled block's own hash is withheld, so the header cannot be bound.
+        uint64 windowEnd = 2 * EPOCH_LEN;
+        vm.roll(windowEnd + 50);
+        oracle.setBlockhash(windowEnd, keccak256("entropy"));
+        uint64 refBlock = oracle.sampledReferenceBlock(POLICY_ID, 1);
+
         bytes memory headerRlp = _buildHeader(STATE_ROOT);
         bytes memory pv = _derivationValues(
             STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock, 0, uint64(block.chainid), THRESHOLD
@@ -584,8 +741,10 @@ contract SolventSetOracleTest is Test {
     }
 
     function test_PublishRootProven_RevertsOnMalformedHeader() public {
-        uint64 refBlock = _epochBlock(1);
-        vm.roll(refBlock + 50);
+        uint64 windowEnd = 2 * EPOCH_LEN;
+        vm.roll(windowEnd + 50);
+        oracle.setBlockhash(windowEnd, keccak256("entropy"));
+        uint64 refBlock = oracle.sampledReferenceBlock(POLICY_ID, 1);
         bytes memory badHeader = abi.encodePacked(hex"f90200", hex"80"); // not a 32-byte item
         oracle.setBlockhash(refBlock, keccak256(badHeader));
         bytes memory pv = _derivationValues(
@@ -633,7 +792,8 @@ contract SolventSetOracleTest is Test {
         vm.prank(operatorAddr);
         oracle.setBalanceSlot(ERC20_POLICY_ID, 9);
 
-        (uint64 refBlock, bytes memory headerRlp) = _prepareProvenBlock(STATE_ROOT, 1);
+        (uint64 refBlock, bytes memory headerRlp) =
+            _prepareProvenBlockFor(ERC20_POLICY_ID, STATE_ROOT, 1);
         bytes memory pv = _derivationValuesFor(
             ERC20_POLICY_ID, STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock, 0,
             uint64(block.chainid), THRESHOLD, TOKEN, 9
@@ -670,7 +830,8 @@ contract SolventSetOracleTest is Test {
         vm.prank(operatorAddr);
         oracle.setBalanceSlot(ERC20_POLICY_ID, 9);
 
-        (uint64 refBlock, bytes memory headerRlp) = _prepareProvenBlock(STATE_ROOT, 1);
+        (uint64 refBlock, bytes memory headerRlp) =
+            _prepareProvenBlockFor(ERC20_POLICY_ID, STATE_ROOT, 1);
         bytes memory pv = _derivationValuesFor(
             ERC20_POLICY_ID, STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock, 0,
             uint64(block.chainid), THRESHOLD, TOKEN, 3 // proof against the wrong slot
@@ -715,7 +876,8 @@ contract SolventSetOracleTest is Test {
         vm.prank(operatorAddr);
         oracle.setBalanceSlot(ERC20_POLICY_ID, 9);
 
-        (uint64 refBlock, bytes memory headerRlp) = _prepareProvenBlock(STATE_ROOT, 1);
+        (uint64 refBlock, bytes memory headerRlp) =
+            _prepareProvenBlockFor(ERC20_POLICY_ID, STATE_ROOT, 1);
         bytes memory pv = _derivationValuesFor(
             ERC20_POLICY_ID, STATE_ROOT, bytes32(0), SET_ROOT, 1, refBlock, 0,
             uint64(block.chainid), THRESHOLD, TOKEN, 9

@@ -140,15 +140,33 @@ export default function ProveFlow() {
    * and meet the policy's provenance requirement. The sandbox escape hatch is
    * opt-in via `VITE_ALLOW_UNVERIFIED_PROVENANCE=1`, and says so loudly.
    */
-  const gate = useMemo(
-    () => provenanceGate(onChain, set.info?.root ?? null, set.rootVerified),
-    [onChain, set.info, set.rootVerified]
-  );
+  const gate = useMemo(() => {
+    const base = provenanceGate(onChain, set.info?.root ?? null, set.rootVerified);
+    // Without the authoritative scope we cannot know which identity namespace
+    // the proof must bind to, so the flow stops rather than guessing.
+    if (onChain.configured && onChain.scopeHash === null && !onChain.loading) {
+      return {
+        ok: false,
+        reasons: [
+          ...base.reasons,
+          "The policy's scope could not be read from the oracle; a proof built on a guessed scope would bind the wrong identity.",
+        ],
+      };
+    }
+    return base;
+  }, [onChain, set.info, set.rootVerified]);
   const sandboxMode = import.meta.env.VITE_ALLOW_UNVERIFIED_PROVENANCE === "1";
   const mayProceed = gate.ok || sandboxMode;
 
-  // The scope the nullifier binds to. The contract is authoritative when it is
-  // reachable; otherwise the policy's default derivation is what the CLI uses.
+  // The scope the nullifier binds to.
+  //
+  // The contract is authoritative, full stop. Falling back to the local
+  // derivation when the on-chain read fails looks harmless — the default is
+  // usually right — but a policy configured with a *shared* scope would
+  // silently produce a proof bound to the wrong identity namespace, which
+  // then fails on-chain or, worse, verifies as a different member (review
+  // finding R7). So the derived value is only ever used as a display hint,
+  // and the flow is gated on the authoritative read having succeeded.
   const derivedScope = useMemo(() => {
     if (!isValid) return null;
     try {
@@ -157,6 +175,7 @@ export default function ProveFlow() {
       return null;
     }
   }, [policyId, isValid]);
+  const scopeIsAuthoritative = onChain.scopeHash !== null;
   const effectiveScope = onChain.scopeHash ?? derivedScope;
   const scopeIsCustom =
     onChain.scopeHash !== null &&
@@ -268,7 +287,10 @@ export default function ProveFlow() {
         policyId,
         epoch: set.info?.epoch,
         chainId: chainId ? Number(chainId) : undefined,
-        scopeHash: effectiveScope ?? undefined,
+        // Only the authoritative scope is worth cross-checking against.
+        // Checking a locally-derived guess would turn a real mismatch into a
+        // green tick.
+        scopeHash: scopeIsAuthoritative ? (effectiveScope ?? undefined) : undefined,
         requiredMinStreak: minStreak ? Number(minStreak) : undefined,
       });
       setDecoded(values);

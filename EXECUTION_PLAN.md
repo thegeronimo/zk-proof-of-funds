@@ -954,6 +954,25 @@ matched no row and returned an empty result rather than an error — an empty
 member list read as "no members" instead of "wrong format". The V2 routes
 already normalized via `parse_policy_id`; all routes now do (`canonical_hex`).
 
+### Post-phase follow-ups (landed after the initial commit)
+
+- **On-chain read path verified against a live deployment.** The oracle panels
+  had only ever been exercised in their "not configured" state. Deploying
+  `SolventSetOracle` + `PolicyRegistry` to anvil and publishing the seeded
+  agent's exact root confirmed every field (root match, epoch, member count,
+  TTL from the registry, scope hash, membership vkey), both the
+  operator-asserted and proven badge states, and that the generated
+  `verifyMembership` / `verifyAndConsume` selectors match the implementation.
+- **Bug this surfaced:** reads resolved their RPC via `usePublicClient()` with
+  no chain, so they followed wagmi's first configured chain rather than the
+  oracle's. Fixed by pinning `VITE_ORACLE_CHAIN_ID` (falling back to the
+  policy's `chain_id`), plus a warning when a proof's committed chainId
+  disagrees with the oracle's — that combination reverts on-chain.
+- **Docs and integrator parity.** `USER_GUIDE.md` now leads with the
+  no-enrollment flow, has corrected navigation, and documents all 12 API
+  routes (was 6, none of them V2). Added `ISolventSetOracle` and a worked
+  `SolventSetGatedAirdrop` example + TypeScript script.
+
 ### Known gaps (unchanged by this phase)
 
 - Proof generation stays in `zkpof-client`: SP1 cannot prove in a browser.

@@ -48,6 +48,12 @@ contract DeployScript is Script {
         );
         console.log("SolventSetOracle deployed at:", address(solventSetOracle));
 
+        // The oracle freezes a policy's semantics at its first publication, so
+        // it must be authorized to do so. Without this, every publication
+        // reverts — wire it here rather than leaving it as a manual step.
+        registry.setFreezer(address(solventSetOracle));
+        console.log("PolicyRegistry freezer set to the SolventSetOracle");
+
         vm.stopBroadcast();
     }
 }

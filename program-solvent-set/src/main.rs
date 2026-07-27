@@ -14,11 +14,12 @@
 //! Candidate completeness (censorship) remains operator-side — see
 //! PRIVACY_V2.md §4.4.
 //!
-//! Public values committed as one ABI blob (320 bytes):
+//! Public values committed as one ABI blob (448 bytes):
 //!   abi.encode(bytes32 stateRoot, bytes32 prevRoot, bytes32 newRoot,
 //!              bytes32 policyId, uint64 epoch, uint64 blockNumber,
-//!              uint64 chainId, uint256 thresholdWei,
-//!              uint32 memberCount, uint32 candidateCount)
+//!              uint64 prevBlockNumber, uint64 chainId, uint256 thresholdWei,
+//!              uint32 memberCount, uint32 candidateCount, address token,
+//!              uint64 balanceSlot, bytes32 candidatesRoot)
 //!
 //! The statement is implemented once, in `zk_pof_common::solvent_derivation`,
 //! shared byte-for-byte with the host-side mirror used for input building and
@@ -40,6 +41,9 @@ pub fn main() {
     let policy_id: [u8; 32] = sp1_zkvm::io::read();
     let epoch: u64 = sp1_zkvm::io::read();
     let block_number: u64 = sp1_zkvm::io::read();
+    // Source block of the previous set; the statement requires the new block
+    // to be strictly newer, so streaks cannot be replayed (review R2).
+    let prev_block_number: u64 = sp1_zkvm::io::read();
     let chain_id: u64 = sp1_zkvm::io::read();
     let threshold_wei: u128 = sp1_zkvm::io::read();
     // ERC-20 mode: (token address, balanceOf mapping slot); None = native ETH.
@@ -76,6 +80,7 @@ pub fn main() {
         &policy_id,
         epoch,
         block_number,
+        prev_block_number,
         chain_id,
         threshold_wei,
         token.as_ref(),

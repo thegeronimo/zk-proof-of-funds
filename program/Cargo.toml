@@ -19,3 +19,8 @@ serde = { version = "1", features = ["derive"] }
 # MPT verification (Phase 2) — keccak256 for Ethereum state trie, RLP decoding for proof nodes
 tiny-keccak = { version = "2", features = ["keccak"] }
 alloy-rlp = { version = "0.3", default-features = false }
+
+# Standalone: not part of the root workspace (also listed in its `exclude`).
+# The explicit empty table keeps `cargo prove build` working even when the
+# checkout is nested inside another workspace (e.g. git worktrees).
+[workspace]

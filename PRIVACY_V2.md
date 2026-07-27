@@ -24,6 +24,40 @@
 > cross-policy shared identity an opt-in configuration. Membership public
 > values are 224 bytes (adds `scopeHash`). Stage B.2 composition is enforced
 > on-chain by `publishRootProvenComplete` (§4.3-§4.4).
+>
+> **Phase 15 amendments** (normative, supersede the sizes above — external
+> review remediation, see EXECUTION_PLAN.md "External Review (2026-07)"):
+>
+> - **Membership public values are 448 bytes.** They add a *presentation
+>   context* — `policyConfigHash`, `verifier`, `verifierChainId`, `actionId`,
+>   `beneficiary`, `nonce`, `deadline`. Without it a proof is a bearer token:
+>   replayable at another verifier and front-runnable out of the mempool.
+>   `verifyAndConsume` requires `beneficiary == msg.sender`, and nullifier
+>   consumption is namespaced by `(consumer, policyConfigHash, actionId)`
+>   rather than shared across every caller of a policy.
+> - **Derivation public values are 448 bytes**, adding `prevBlockNumber`. The
+>   statement requires `blockNumber > prevBlockNumber`, and the contract binds
+>   `prevBlockNumber` to the stored previous entry — so a streak can no longer
+>   be manufactured by re-proving one snapshot across many epochs. Epochs must
+>   be sequential and each reference block must fall inside its own window,
+>   derived from the new `Policy.startBlock`.
+> - **Scan public values are 224 bytes**, adding `startBlock`/`endBlock`. The
+>   range is *proven* from header item 8 (block number), not asserted, and is
+>   stored on-chain. `endBlockHash` is bound through EIP-2935 (8191 blocks)
+>   instead of `blockhash(block.number - 1)`.
+> - **`proven: bool` is replaced by an immutable `Provenance` enum**
+>   (`OperatorAsserted` / `BalancesProven` / `RangeScanProven`). Completeness
+>   is always *relative to a recorded block range*; no surface may call a root
+>   simply "complete".
+> - **Roots pin their own semantics**: each `SetEntry` stores
+>   `policyConfigHash`, both vkey hashes, and an immutable `validUntil`
+>   computed from the source block. Policies freeze on first publication.
+> - **An empty set has a root**: `SHA256("zkpof-empty-solvent-set-v1")`, so an
+>   epoch where nobody qualified is publishable. `bytes32(0)` still means "no
+>   root at all", and `prevBlockNumber == 0` is the first-epoch discriminator.
+> - **The MPT verifier no longer treats an empty proof as proof of absence**
+>   against an arbitrary root — the flaw that allowed silent censorship from a
+>   root advertised as complete.
 
 ---
 

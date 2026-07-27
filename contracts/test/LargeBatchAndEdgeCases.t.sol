@@ -46,7 +46,9 @@ contract LargeBatchAndEdgeCasesTest is Test {
             operator: operatorAddr,
             scope: "test-scope",
             trustedMode: true,
-            active: true
+            active: true,
+            startBlock: 0,
+            version: 1
         });
         registry.createPolicy(POLICY_ID, policy);
     }
@@ -371,7 +373,9 @@ contract LargeBatchAndEdgeCasesTest is Test {
                 operator: operatorAddr,
                 scope: string(abi.encodePacked("scope-", i)),
                 trustedMode: true,
-                active: true
+                active: true,
+                startBlock: 0,
+                version: 1
             });
             registry.createPolicy(pid, pol);
         }
@@ -432,7 +436,9 @@ contract LargeBatchAndEdgeCasesTest is Test {
             operator: operatorAddr,
             scope: "short-epoch",
             trustedMode: true,
-            active: true
+            active: true,
+            startBlock: 0,
+            version: 1
         });
         registry.createPolicy(policyShort, shortPol);
 
@@ -446,7 +452,9 @@ contract LargeBatchAndEdgeCasesTest is Test {
             operator: operatorAddr,
             scope: "long-epoch",
             trustedMode: true,
-            active: true
+            active: true,
+            startBlock: 0,
+            version: 1
         });
         registry.createPolicy(policyLong, longPol);
 

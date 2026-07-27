@@ -31,6 +31,30 @@ use sha2::{Digest, Sha256};
 /// Domain separation tag for solvent-set leaves (v2: streak-aware).
 pub const SOLVENT_LEAF_DOMAIN: &[u8] = b"zkpof-solvent-leaf-v2";
 
+/// Domain separation tag for the empty-set sentinel root.
+pub const EMPTY_SET_DOMAIN: &[u8] = b"zkpof-empty-solvent-set-v1";
+
+/// Root of an empty solvent set: `SHA256("zkpof-empty-solvent-set-v1")`.
+///
+/// A distinct nonzero value so "nobody qualified this epoch" is publishable
+/// and provable, while `bytes32(0)` stays reserved for "no root at all".
+/// SHA-256 is not const-evaluable, so this literal is checked against
+/// [`empty_set_root`] by `test_empty_set_root_matches_domain`.
+pub const EMPTY_SET_ROOT: [u8; 32] = [
+    0xd8, 0xbf, 0x5d, 0x04, 0xd1, 0x44, 0xb2, 0xf5, 0x16, 0xe9, 0xe3, 0x85, 0x27, 0x29, 0x48,
+    0xb5, 0x4f, 0x53, 0x48, 0x76, 0x04, 0x72, 0x51, 0xf8, 0x7a, 0x3a, 0xaa, 0x17, 0x1b, 0x83,
+    0x78, 0x4d,
+];
+
+/// Compute the empty-set sentinel root from its domain tag.
+pub fn empty_set_root() -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(EMPTY_SET_DOMAIN);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&hasher.finalize());
+    out
+}
+
 /// One address in the solvent set with its consecutive-epoch streak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SolventEntry {
@@ -114,8 +138,17 @@ impl SolventSet {
         self.entries.is_empty()
     }
 
-    /// The Merkle root over the set (zero root for an empty set).
+    /// The Merkle root over the set.
+    ///
+    /// An empty set hashes to [`EMPTY_SET_ROOT`], not zero: both publication
+    /// paths reject a zero root as malformed, so a legitimate epoch in which
+    /// nobody qualified was previously unpublishable (review §4.5). The
+    /// sentinel is domain-separated, so it can never collide with a real
+    /// single-leaf root.
     pub fn root(&self) -> [u8; 32] {
+        if self.leaves.is_empty() {
+            return EMPTY_SET_ROOT;
+        }
         merkle::compute_root(&self.leaves)
     }
 
@@ -193,8 +226,29 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_set_zero_root() {
-        assert_eq!(SolventSet::new(vec![]).root(), [0u8; 32]);
+    fn test_empty_set_uses_sentinel_root() {
+        // "Nobody qualified" must be publishable: the publication paths reject
+        // a zero root, so an empty set gets a domain-separated sentinel.
+        let root = SolventSet::new(vec![]).root();
+        assert_eq!(root, EMPTY_SET_ROOT);
+        assert_ne!(root, [0u8; 32], "zero stays reserved for 'no root at all'");
+    }
+
+    #[test]
+    fn test_empty_set_root_matches_domain() {
+        assert_eq!(
+            EMPTY_SET_ROOT,
+            empty_set_root(),
+            "the hardcoded sentinel must equal SHA256(EMPTY_SET_DOMAIN)"
+        );
+    }
+
+    #[test]
+    fn test_empty_sentinel_cannot_collide_with_a_real_set() {
+        // A one-entry set's root is its leaf, which is domain-separated
+        // differently, so no real set can produce the sentinel.
+        let single = SolventSet::new(vec![addr(1)]).root();
+        assert_ne!(single, EMPTY_SET_ROOT);
     }
 
     #[test]

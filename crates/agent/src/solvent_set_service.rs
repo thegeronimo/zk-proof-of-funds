@@ -81,6 +81,17 @@ impl<'a> SolventSetService<'a> {
         }
     }
 
+    /// Source block of the previous set (zero when there is none). The
+    /// derivation statement requires the new block to be strictly newer, so
+    /// a streak can never be built from a re-proven snapshot (review R2).
+    fn previous_block_number(&self, policy_id: &str, epoch: u64) -> Result<u64> {
+        Ok(self
+            .db
+            .get_latest_solvent_set_before(policy_id, epoch)?
+            .map(|row| row.block_number)
+            .unwrap_or(0))
+    }
+
     /// Build a solvent set from already-fetched `(address_hex, balance_wei)`
     /// pairs, chaining streaks from the previous epoch. Pure with respect to
     /// the network — used by tests and by [`Self::build_from_candidates`].
@@ -180,9 +191,10 @@ impl<'a> SolventSetService<'a> {
         };
 
         // Native pre-check: exactly what the SP1 program will prove.
+        let prev_block_number = self.previous_block_number(policy_id, epoch)?;
         let public_values = execute_derivation_statement(
             &witness, state_root, &parse_policy_bytes(policy_id)?, epoch, block_number,
-            chain_id, threshold_wei, token,
+            prev_block_number, chain_id, threshold_wei, token,
         )?;
 
         let entries = derive_entries(&witness, state_root, threshold_wei, token)?;
@@ -591,14 +603,18 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_set_has_zero_root() {
+    fn test_empty_set_uses_sentinel_root() {
+        // Nobody qualifying is a real epoch, and it must be publishable: both
+        // publication paths reject a zero root, so an empty set commits to the
+        // domain-separated sentinel instead.
         let db = Database::open_in_memory().unwrap();
         let service = SolventSetService::new(&db);
         let result = service
             .build_from_balances(POLICY, 1, 19_000_000, ONE_ETH, &[(addr_hex(1), 1)])
             .unwrap();
         assert_eq!(result.member_count, 0);
-        assert_eq!(result.root, [0u8; 32]);
+        assert_eq!(result.root, zk_pof_common::solvent_set::EMPTY_SET_ROOT);
+        assert_ne!(result.root, [0u8; 32]);
     }
 
     #[test]

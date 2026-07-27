@@ -6,16 +6,23 @@
 //! agent sees only public data (nullifier + DLEQ, or nothing at all in the
 //! solvent-set flow).
 //!
+//! ## Secret-key handling
+//!
+//! The key is **never** accepted as a command-line argument — argv leaks into
+//! shell history, `ps`, scrollback, and crash reports. Supply it via the
+//! hidden prompt (default), `--sk-stdin`, or `--sk-env <VAR>`; it is held in
+//! zeroizing buffers. Passing `--sk` is a hard error with instructions.
+//!
 //! Subcommands:
 //!   (every subcommand accepts an optional --scope <hex32> to bind the
 //!    nullifier to a shared scope instead of the policy's default)
 //!
-//!   nullifier --sk <hex32> --policy <hex32>
+//!   nullifier --policy <hex32>
 //!       Compute the deterministic nullifier + DLEQ proof; prints the JSON
 //!       body for POST /v2/enroll.
-//!   enroll    --sk <hex32> --policy <hex32> --agent <url>
+//!   enroll    --policy <hex32> --agent <url>
 //!       Compute and submit a V2 enrollment.
-//!   witness   --sk <hex32> --policy <hex32> --agent <url>
+//!   witness   --policy <hex32> --agent <url>
 //!       Download the public solvent set, locate the caller's address
 //!       locally, and print the membership witness (leaf index, streak,
 //!       siblings) plus the set metadata.
@@ -24,17 +31,25 @@
 //!       Stage B.2: rebuild the receipts tries for a block range (self-
 //!       verified against each header's receiptsRoot), then run the
 //!       receipt-scan program to produce the completeness commitment.
-//!   prove     --sk <hex32> --policy <hex32> --agent <url>
+//!   prove     --policy <hex32> --agent <url>
+//!             --verifier <hex20> --beneficiary <hex20> --deadline <block>
+//!             --config-hash <hex32> [--action <hex32>] [--nonce <n>]
+//!             [--verifier-chain-id <n>]
 //!             [--min-streak <n>] [--chain-id <n>] [--execute-only]
 //!       Build the witness and run the SP1 membership program: with
 //!       --execute-only (default when no proving stack) emulate and print the
 //!       public values; otherwise generate a Groth16 proof for
 //!       SolventSetOracle.verifyMembership.
+//!
+//!       The verifier/beneficiary/deadline/config-hash group is the
+//!       *presentation context* and is mandatory: without it the resulting
+//!       proof is a bearer token that anyone can replay or front-run.
 
 use anyhow::{bail, Context, Result};
+use zeroize::Zeroizing;
 use zk_pof_agent::enrollment::parse_policy_id;
 use zk_pof_agent::membership_prover;
-use zk_pof_common::membership::MembershipWitness;
+use zk_pof_common::membership::{MembershipWitness, PresentationContext};
 use zk_pof_common::plume;
 use zk_pof_common::solvent_set::{SolventEntry, SolventSet};
 
@@ -60,8 +75,59 @@ fn parse_hex32(value: &str, what: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
+fn parse_hex20(value: &str, what: &str) -> Result<[u8; 20]> {
+    let clean = value.strip_prefix("0x").unwrap_or(value);
+    let bytes = hex::decode(clean).with_context(|| format!("Invalid hex in {what}"))?;
+    if bytes.len() != 20 {
+        bail!("Invalid {what} length: expected 20 bytes, got {}", bytes.len());
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+/// Read the secret key without ever accepting it on the command line.
+///
+/// A key passed as `--sk <hex>` leaks into shell history, `ps` output,
+/// terminal scrollback, screen shares, and crash reports — the external
+/// review flagged this, and ERC-7524 itself says pasting a private key into
+/// a prover should not be normal user behaviour. So argv is refused outright
+/// and the key comes from a hidden TTY prompt, stdin, or an env var, held in
+/// a `Zeroizing` buffer that is wiped on drop.
+fn read_secret_key(args: &[String]) -> Result<Zeroizing<[u8; 32]>> {
+    if has_flag(args, "--sk") {
+        bail!(
+            "Refusing to read a secret key from the command line: it would leak \
+             into shell history and process listings.\n\
+             Use one of:\n  \
+             --sk-stdin           (pipe or type the hex key on stdin)\n  \
+             --sk-env ZKPOF_SK    (read from the named environment variable)\n  \
+             (no flag)            (interactive hidden prompt)"
+        );
+    }
+
+    let raw: Zeroizing<String> = if has_flag(args, "--sk-stdin") {
+        let mut buf = String::new();
+        std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut buf)
+            .context("Failed to read the secret key from stdin")?;
+        Zeroizing::new(buf)
+    } else if let Some(var) = arg_value(args, "--sk-env") {
+        Zeroizing::new(
+            std::env::var(&var)
+                .with_context(|| format!("Environment variable {var} is not set"))?,
+        )
+    } else {
+        Zeroizing::new(
+            rpassword::prompt_password("Secret key (hex, input hidden): ")
+                .context("Failed to read the secret key from the terminal")?,
+        )
+    };
+
+    Ok(Zeroizing::new(parse_hex32(raw.trim(), "secret key")?))
+}
+
 struct Common {
-    sk: [u8; 32],
+    sk: Zeroizing<[u8; 32]>,
     policy_id: [u8; 32],
     policy_hex: String,
     /// Scope the nullifier binds to — the policy default unless `--scope`
@@ -70,10 +136,7 @@ struct Common {
 }
 
 fn common_args(args: &[String]) -> Result<Common> {
-    let sk = parse_hex32(
-        &arg_value(args, "--sk").context("--sk <hex32> is required")?,
-        "--sk",
-    )?;
+    let sk = read_secret_key(args)?;
     let policy_arg = arg_value(args, "--policy").context("--policy <hex32> is required")?;
     let policy_id = parse_policy_id(&policy_arg)?;
     let scope_hash = match arg_value(args, "--scope") {
@@ -85,6 +148,55 @@ fn common_args(args: &[String]) -> Result<Common> {
         policy_id,
         policy_hex: hex::encode(policy_id),
         scope_hash,
+    })
+}
+
+/// Parse the presentation context a membership proof is bound to.
+///
+/// These are not optional in production: a proof without them is a bearer
+/// token any observer can replay or front-run (review finding R5). The
+/// relying application supplies these values in its proof request.
+fn presentation_context(args: &[String]) -> Result<PresentationContext> {
+    let verifier = match arg_value(args, "--verifier") {
+        Some(v) => parse_hex20(&v, "--verifier")?,
+        None => bail!(
+            "--verifier <hex20> is required: a proof must name the contract it \
+             may be submitted to, or it can be replayed elsewhere"
+        ),
+    };
+    let beneficiary = match arg_value(args, "--beneficiary") {
+        Some(v) => parse_hex20(&v, "--beneficiary")?,
+        None => bail!(
+            "--beneficiary <hex20> is required: a proof must name who may \
+             consume it, or it can be front-run out of the mempool"
+        ),
+    };
+    let deadline: u64 = match arg_value(args, "--deadline") {
+        Some(v) => v.parse().context("--deadline must be a block number")?,
+        None => bail!("--deadline <block> is required: proofs must expire"),
+    };
+    Ok(PresentationContext {
+        policy_config_hash: match arg_value(args, "--config-hash") {
+            Some(v) => parse_hex32(&v, "--config-hash")?,
+            None => bail!("--config-hash <hex32> is required (read it from the oracle)"),
+        },
+        verifier,
+        verifier_chain_id: arg_value(args, "--verifier-chain-id")
+            .map(|v| v.parse())
+            .transpose()
+            .context("--verifier-chain-id must be a number")?
+            .unwrap_or(1),
+        action_id: match arg_value(args, "--action") {
+            Some(v) => parse_hex32(&v, "--action")?,
+            None => [0u8; 32],
+        },
+        beneficiary,
+        nonce: arg_value(args, "--nonce")
+            .map(|v| v.parse())
+            .transpose()
+            .context("--nonce must be a number")?
+            .unwrap_or(0),
+        deadline,
     })
 }
 
@@ -176,7 +288,7 @@ async fn build_witness(
     };
 
     let witness = MembershipWitness {
-        sk: common.sk,
+        sk: *common.sk,
         streak,
         leaf_index: leaf_index as u64,
         siblings,
@@ -243,6 +355,7 @@ async fn main() -> Result<()> {
                 .context("Invalid --chain-id")?
                 .unwrap_or(1);
 
+            let context = presentation_context(&args)?;
             let (witness, meta) = build_witness(&agent, &common).await?;
             let epoch = meta["epoch"].as_u64().unwrap();
             let root_hex = meta["root"].as_str().unwrap_or_default();
@@ -252,7 +365,7 @@ async fn main() -> Result<()> {
             if has_flag(&args, "--execute-only") {
                 let public_values = membership_prover::execute_membership_program(
                     elf, &witness, &root, &common.policy_id, epoch, chain_id, min_streak,
-                    &common.scope_hash,
+                    &common.scope_hash, &context,
                 )?;
                 println!(
                     "{}",
@@ -267,7 +380,7 @@ async fn main() -> Result<()> {
             } else {
                 let (proof_bytes, public_values) = membership_prover::prove_membership(
                     elf, &witness, &root, &common.policy_id, epoch, chain_id, min_streak,
-                    &common.scope_hash,
+                    &common.scope_hash, &context,
                 )?;
                 println!(
                     "{}",

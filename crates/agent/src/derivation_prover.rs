@@ -46,6 +46,7 @@ pub fn build_derivation_stdin(
     policy_id: &[u8; 32],
     epoch: u64,
     block_number: u64,
+    prev_block_number: u64,
     chain_id: u64,
     threshold_wei: u128,
     token: Option<&TokenConfig>,
@@ -56,6 +57,7 @@ pub fn build_derivation_stdin(
     stdin.write(policy_id);
     stdin.write(&epoch);
     stdin.write(&block_number);
+    stdin.write(&prev_block_number);
     stdin.write(&chain_id);
     stdin.write(&threshold_wei);
     let token_raw: Option<([u8; 20], u64)> = token.map(|c| (c.address, c.balance_slot));
@@ -85,6 +87,7 @@ pub fn execute_derivation_program(
     policy_id: &[u8; 32],
     epoch: u64,
     block_number: u64,
+    prev_block_number: u64,
     chain_id: u64,
     threshold_wei: u128,
     token: Option<&TokenConfig>,
@@ -92,7 +95,8 @@ pub fn execute_derivation_program(
     let client = ProverClient::builder().cpu().build();
     let elf = Elf::Static(Box::leak(elf_bytes.into_boxed_slice()));
     let stdin = build_derivation_stdin(
-        witness, state_root, policy_id, epoch, block_number, chain_id, threshold_wei, token,
+        witness, state_root, policy_id, epoch, block_number, prev_block_number, chain_id,
+        threshold_wei, token,
     );
 
     let (public_values, report) = client
@@ -120,6 +124,7 @@ pub fn prove_derivation(
     policy_id: &[u8; 32],
     epoch: u64,
     block_number: u64,
+    prev_block_number: u64,
     chain_id: u64,
     threshold_wei: u128,
     token: Option<&TokenConfig>,
@@ -127,7 +132,8 @@ pub fn prove_derivation(
     let client = ProverClient::builder().cpu().build();
     let elf = Elf::Static(Box::leak(elf_bytes.into_boxed_slice()));
     let stdin = build_derivation_stdin(
-        witness, state_root, policy_id, epoch, block_number, chain_id, threshold_wei, token,
+        witness, state_root, policy_id, epoch, block_number, prev_block_number, chain_id,
+        threshold_wei, token,
     );
 
     let pk = client

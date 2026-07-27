@@ -528,16 +528,31 @@ against the list already in memory — nothing is sent anywhere. You'll see your
 **5. Generate the proof.** This step runs on your machine, not in the browser:
 zero-knowledge proving needs a native toolchain, and the nullifier needs raw
 key access that wallets deliberately never grant. The app writes the exact
-command for you with everything filled in but your key:
+command for you:
 
 ```bash
 zkpof-client prove \
-  --sk <YOUR_32_BYTE_HEX_KEY> \
   --policy 0x…01 \
   --agent http://localhost:3000 \
   --min-streak 3 \
-  --chain-id 31337
+  --chain-id 31337 \
+  --verifier 0x…oracle \
+  --config-hash 0x…policyConfigHash \
+  --beneficiary 0x…yourAddress \
+  --deadline 19500300
 ```
+
+**The command contains no key.** `zkpof-client` refuses `--sk` on the command
+line outright — argv leaks into shell history, `ps` output, scrollback, and
+crash reports. It prompts for the key on a hidden terminal prompt instead (or
+reads `--sk-stdin` / `--sk-env VAR`), and holds it in memory that is wiped on
+exit.
+
+The `--verifier` / `--config-hash` / `--beneficiary` / `--deadline` group is
+the **presentation context**, and it is mandatory. It binds the proof to one
+verifier contract, one beneficiary, and an expiry. Without it, a proof is a
+bearer token: anyone who sees it can present it elsewhere, and a mempool
+watcher can front-run your transaction and burn your nullifier.
 
 Paste the JSON it prints back into the page. The app decodes it and re-checks
 every field against what it already verified — a stale or mismatched proof
@@ -1262,7 +1277,8 @@ solvent-set proving flow needs no enrollment at all.
 }
 ```
 
-Generate this body with `zkpof-client nullifier --sk <key> --policy <id>`, or
+Generate this body with `zkpof-client nullifier --policy <id>` (it prompts for
+the key; `--sk` on argv is refused), or
 in JS via `buildEnrollV2Request()` from `@zk-proof-of-funds/sdk/plume`. The
 secret key never leaves the caller.
 

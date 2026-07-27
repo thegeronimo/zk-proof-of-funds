@@ -18,8 +18,13 @@
 | 11 | Privacy V2 Completion | Proven set derivation (Stage B), streak solvency, client tooling | 3-5 days | ✅ DONE |
 | 12 | Privacy V2 Follow-ups | ERC-20 proven builds, Stage B.2 completeness, wallet crypto, vkeys | 3-5 days | ✅ DONE |
 | 13 | Privacy V2 Closeout | ERC-7524 nullifiers + scopes, on-chain completeness, witness tooling | 3-5 days | ✅ DONE |
+| 14 | Front-End Parity | Guided V2 prove flow, identity, on-chain provenance in the app | 3-5 days | ✅ DONE |
+| 15 | Protocol Soundness | External-review release blockers: MPT, streaks, scan pinning, config versioning, proof binding, real E2E | 10-15 days | 🔴 NEXT |
+| 16 | Ops Hardening & Honest Presentation | Authenticated control plane, fail-closed UI, real verification, copy audit | 5-8 days | 🟠 ∥ 15 |
+| 17 | User-Proof Boundary Rework | Mode A/B split, browser-prover spike (gate G1), demo restructure | 8-12 days | 🟡 after 15 |
+| 18 | Strategic Prototypes | Direct EIP-1186 state proof (gate G2), deferred capabilities | 8-12 days | 🟢 after 15-16 |
 
-**Total estimated effort: 28-46 days**
+**Total estimated effort: 28-46 days (through Phase 14) + 31-47 days (Phases 15-18)**
 
 ---
 
@@ -980,3 +985,462 @@ already normalized via `parse_policy_id`; all routes now do (`canonical_hex`).
   cannot be consumed without the ERC-7524 format adapter.
 - The end-to-end run below was verified against a seeded agent; a real Groth16
   proof was not generated, as that needs the SP1 toolchain and a built ELF.
+
+---
+
+## External Review (2026-07) — Findings Assessment
+
+An external protocol review of the Phase 10–14 system was received 2026-07-27.
+Its findings were verified against the code before planning Phases 15–18. All
+security-critical claims check out:
+
+| # | Finding | Verified at | Status |
+|---|---------|-------------|--------|
+| R1 | MPT verifier accepts an empty proof as proof-of-absence against **any** nonempty root → zero balance | `crates/common/src/mpt.rs:231` (`walk_trie` returns `Ok(None)` before checking root ≟ `EMPTY_TRIE_ROOT`); `verify_account_state`/`verify_storage_value` map `None` → 0 | **Confirmed — critical.** Enables censoring qualifying accounts from a "complete" Stage B.2 root |
+| R2 | Streaks not tied to distinct/ordered source blocks; epochs only `>` not `+1` | `SolventSetOracle.sol:572` (`epoch <= lastEpoch` is the only check); `solvent_derivation.rs:271` (streak = prev + 1, no block constraint) | **Confirmed — critical.** One balance observation can be replayed into an N-epoch streak |
+| R3 | Stage B.2 scan range unpinned (`numBlocks` decoded then ignored, no start block) and `endBlockHash == blockhash(block.number-1)` makes full-history scans unpublishable in practice | `SolventSetOracle.sol:303,316-317` | **Confirmed — critical** |
+| R4 | Policies/scopes/slots/vkeys mutable with no per-root pinning; operator can rewrite the whole policy incl. `active`; `updatePolicy` skips creation-time checks | `PolicyRegistry.sol:75-85`; `SolventSetOracle.sol` `SetEntry` stores no config/vkey hash; TTL read from *current* `rootTTLBlocks` at `:433` | **Confirmed — critical** |
+| R5 | Membership proofs carry no verifier/action/nonce/deadline/beneficiary → replayable, copyable, front-runnable; nullifier namespace `[policyId][hash]` shared across all consumers | `crates/common/src/membership.rs:53-62`; `SolventSetOracle.sol:477-495` | **Confirmed — high** |
+| R6 | No real Groth16 E2E ever ran (guest ELF → proof → deployed verifier → oracle) | Phase 14 "Known gaps" above | **Confirmed — high** |
+| R7 | UI fails open on on-chain provenance (`void onChain.load(...)`; Continue gated only on local-root mismatch); Verify screen decodes without verifying | `web/src/components/ProveFlow.tsx:168-174,355`; `ProofViewer.tsx` | **Confirmed — high** |
+| R8 | Admin/build routes unauthenticated; RPC failures silently excluded from sets | `crates/backend/src/main.rs:1395-1414` (no auth middleware anywhere) | **Confirmed — high** |
+| R9 | Empty solvent set unrepresentable (`ZeroRoot` rejects); inline MPT children rejected (liveness for small tries); `chainId` editable though verifier chain == source chain; "reveals nothing" / "all qualifying addresses" copy overstated; EIP-2935 treated as future though live since Pectra (May 2025) | various, incl. `SolventSetOracle.sol:248,363,522`, `mpt.rs:275,326` | **Confirmed — medium** |
+
+Review recommendations **adopted**: everything in Phases 15–16 (protocol
+soundness + operational hardening); the Mode A / Mode B split (basic proof of
+control should not require PLUME); CLI key-handling hardening; honest product
+copy ("private threshold-balance attestation", not "solvency").
+
+Adopted **as decision-gated spikes, not commitments**: the Noir/Barretenberg
+browser membership prover and the direct EIP-1186 state-proof architecture
+(Phases 17–18). Both are plausible but carry real unknowns (mobile proving
+perf, Keccak/MPT circuit cost, a second proof system to maintain, a possible
+Merkle-hash migration off SHA-256). Benchmarks decide, not preference.
+
+**Deferred / rejected for now**:
+- Full Stage B.2 recursive-accumulator redesign is deferred; the near-term fix
+  is to *demote the completeness claim* (it is currently false) and pin scan
+  ranges. The incremental-checkpoint redesign happens only if ERC-20
+  completeness proves to be a product requirement (Phase 18 gate).
+- Repo/product rename: copy changes only; no repo rename.
+- Multisig + timelock governance: required before any mainnet deployment, but
+  tracked under Phase 9 (production hardening), not blocking testnet work.
+
+## Phase 15: Protocol Soundness — Release Blockers 🔴
+
+Nothing in this phase is optional; until it lands, the system must be labeled
+a **protocol simulation**, and no root may be described as "proven" or
+"complete" in any surface. Contract changes here are breaking; that is
+acceptable — nothing is deployed beyond dev/anvil.
+
+### 15.1 MPT verifier correctness (R1) — do first, it's the worst bug
+
+- [x] `walk_trie`: empty `proof_nodes` is valid **only** when
+      `root == EMPTY_TRIE_ROOT`; any other root with an empty proof is an
+      error, not absence. Fix `verify_account_state` / `verify_storage_value`
+      / `verify_account_balance_with_key` accordingly.
+- [x] Support embedded (inline, <32-byte) child nodes in branches and
+      extensions — currently `bail!`ed, which breaks valid proofs in small
+      storage tries. An inline child is the RLP list itself, not a hash ref;
+      recurse into it without a hash check but count it against the node list.
+- [x] Enforce that a leaf consumes the **entire** remaining key (assert
+      `key_offset == 64` on acceptance) and that branch-terminated absence
+      paths are well-formed non-inclusion (diverging leaf/extension is also
+      valid absence — handle it explicitly rather than erroring).
+- [x] Enforce canonical RLP and canonical hex-prefix encoding (reject
+      non-minimal lengths, bad HP flags).
+- [x] Test battery: (a) real mainnet `eth_getProof` vectors — inclusion,
+      non-inclusion via empty branch child, non-inclusion via diverging leaf,
+      small storage tries with embedded nodes; (b) malformed RLP corpus;
+      (c) differential fuzz vs a reference implementation
+      (`alloy-trie`/`eth-trie` in a dev-dependency harness, plus geth via RPC
+      where available). Delete the two tests that assert the buggy behavior
+      (`mpt.rs:435-447`).
+- [ ] External review of `mpt.rs` before any "proven" label returns.
+
+### 15.2 Epoch/streak temporal enforcement (R2)
+
+- [x] Normative epoch scheme in `PolicyRegistry`: add `startBlock`; define
+      `epoch = (referenceBlock - startBlock) / epochLengthBlocks` and enforce
+      on-chain: `epoch == lastEpoch + 1` (or explicit gap with streak reset
+      semantics), `referenceBlock > lastReferenceBlock`, and
+      `referenceBlock` inside epoch `epoch`'s window.
+- [x] Bind the previous source block into the derivation statement: derivation
+      publics gain `prev_block_number` (and the circuit asserts
+      `block_number > prev_block_number`), so a proof cannot reuse the same
+      snapshot even off-chain.
+- [ ] Randomized reference-block sampling moves from backend convenience to
+      normative rule: `referenceBlock = sample(policyId, epoch, entropy)` where
+      entropy is a blockhash finalized **after** the epoch window closes;
+      contract recomputes and checks it on the proven path. Trusted path at
+      minimum enforces window containment + monotonicity.
+- [ ] Remove the admin request's explicit block-number override for proven
+      builds (keep for dev seeding only, behind the dev flag).
+- [ ] Docs: state plainly that a streak is one observation per epoch — an
+      economic deterrent against balance rental, not proof of continuous
+      holding.
+
+### 15.3 Stage B.2 honesty + scan-range pinning (R3)
+
+- [x] Stop storing scan results as bare `proven=true`. Replace the bool with
+      an immutable provenance enum on `SetEntry`:
+      `OPERATOR_ASSERTED | BALANCES_PROVEN | RANGE_SCAN_PROVEN` (full
+      completeness tier reserved for the future redesign).
+- [x] Pin the scan range: contract decodes and **stores** `startBlock`,
+      `endBlock`, `numBlocks`, and requires
+      `numBlocks == endBlock - startBlock + 1`; continuity check against the
+      previous entry's scan range when one exists.
+- [x] Replace `endBlockHash == blockhash(block.number - 1)` with a lookup
+      through EIP-2935 (`_blockhash` already virtual — route through the
+      system contract at `0x0000F90827F1C53a10cb7A02335B175320002935` with
+      `blockhash` fallback), giving ~8191 blocks (~27h) of publication
+      headroom instead of one block.
+- [x] UI/docs: no surface may say "complete" for `RANGE_SCAN_PROVEN`; the
+      badge says "balances proven for scanned range N–M".
+
+### 15.4 Policy/config immutability + per-root pinning (R4)
+
+- [x] Define `policyConfigHash = keccak256(abi.encode(threshold, token,
+      chainId, epochLength, maxBlockAge, rootTTL, scopeHash, balanceSlot,
+      provenance requirement, startBlock, version))`. A policy's config
+      becomes immutable once its first root is published; changes require a
+      new `version` (new policyId or `policyId+version` key).
+- [x] `SetEntry` gains `policyConfigHash`, `membershipVKeyHash`,
+      `derivationVKeyHash` (scan vkey when applicable), and an immutable
+      `validUntil` computed at publication from the **source block** + the
+      TTL in force at publication. `verifyMembership` checks
+      `block.number <= validUntil` and takes an expected `policyConfigHash`
+      the relying app pins.
+- [x] `updatePolicy`: owner-only; restricted to operator rotation and
+      `active`; re-run all creation-time validation. Operator loses the
+      ability to rewrite policy or flip `active`; `setScopeHash` /
+      `setBalanceSlot` / `setRequiresCompleteness` become one-time-before-
+      first-publication (then frozen into the config hash).
+- [x] Vkey rotation (`setMembershipVKey` etc.) only affects **future**
+      publications; verification uses the entry's pinned vkey hash. Add
+      per-root revocation (`revokeRoot(policyId, index)`, owner) and keep
+      global pause.
+
+### 15.5 Proof context binding + nullifier namespacing (R5)
+
+- [x] Membership publics gain a presentation context:
+      `verifierContract`, `verifierChainId`, `actionId`, `beneficiary`,
+      `nonce`, `deadline`, `policyConfigHash`. Circuit commits to all of
+      them; `verifyMembership`/`verifyAndConsume` check
+      `verifierContract == address(this)` (or registered consumer),
+      `verifierChainId == block.chainid`, `block.number <= deadline`.
+- [x] Nullifier consumption keyed
+      `[consumer][policyConfigHash][actionId][nullifierHash]` so one dApp
+      cannot burn another's namespace, and front-running a proof tx no longer
+      denies the legitimate user (the proof is bound to `beneficiary`).
+- [x] Update `zkpof-client`, SDK decoder (public-values ABI grows —
+      version the schema), cross-language vectors, and the web calldata
+      generators.
+
+### 15.6 Real cryptographic end-to-end (R6)
+
+- [ ] CI job (self-hosted or Succinct network) that builds every guest ELF,
+      generates real Groth16 proofs for: membership, native-ETH derivation,
+      ERC-20 derivation, receipt scan; verifies each against the **deployed**
+      SP1 verifier + oracle on anvil; then mutates one field at a time (proof
+      byte, each public value, root, vkey, scan range) and asserts rejection.
+- [ ] Reproducible artifact manifest committed per release: guest commits,
+      rust/SP1 versions, ELF hashes, vkeys, verifier address + bytecode hash,
+      public-values schema version, proof size, proving time/memory,
+      verification gas.
+- [ ] Until this passes: all demo surfaces label proofs "simulation".
+
+### Exit criteria
+
+`cargo test` + `forge test` green including the new adversarial suites; one
+full real-proof E2E on record; no UI surface overstating provenance.
+
+### Delivered (2026-07-27)
+
+**15.1 — MPT verifier.** `walk_trie` was rewritten around an explicit `Step`
+state machine. An empty proof is now valid **only** against `EMPTY_TRIE_ROOT`;
+against any other root it is an error, closing R1. Embedded (<32-byte) child
+nodes are walked inline rather than rejected, leaves must consume the full
+64-nibble key, non-inclusion is handled explicitly (empty branch child *or*
+diverging leaf/extension), trailing proof nodes are rejected, and RLP/HP
+encodings must be canonical (no leading-zero integers, valid HP flag, zero
+padding nibble, no trailing bytes after a node). The two tests that asserted
+the buggy behaviour are gone; in their place are inclusion/non-inclusion tests
+over constructed tries, an embedded-node test, canonical-encoding rejections,
+and a seeded randomized round-trip that builds tries of up to 200 random keys,
+extracts each proof, and checks that absent keys are provably absent and that
+truncating any proof makes absence *un*provable.
+
+**15.2 — Epoch/streak.** `DerivationPublicValues` gained `prev_block_number`
+(ABI 416 → 448 bytes) and the statement asserts `block_number >
+prev_block_number`. On-chain, `_validateEpochSchedule` replaces
+`_validateEpochIncreasing`: epochs must be sequential (`last + 1`), reference
+blocks must strictly advance, and each reference block must fall inside its own
+epoch window derived from the new `Policy.startBlock` / `epochLengthBlocks`.
+The contract binds the proof's `prevBlockNumber` to the stored previous
+entry's block, so a publisher cannot supply an invented older block to satisfy
+the circuit inequality while re-proving one snapshot. Stage A is held to the
+same schedule — it previously stored an arbitrary operator-supplied block.
+
+**15.3 — Stage B.2.** `proven: bool` became an immutable `Provenance` enum
+(`OperatorAsserted` / `BalancesProven` / `RangeScanProven`). Scan public values
+gained `start_block` / `end_block` (224 bytes), and the range is now *proven*
+rather than asserted: `parse_header` reads header item 8 (block number) and the
+statement checks each header's number is contiguous, so the committed range
+describes the blocks actually scanned. On-chain the range is stored, validated
+for internal consistency, and checked for contiguity with the previous entry.
+`_blockhash` routes through the EIP-2935 history contract (8191-block window)
+with a BLOCKHASH fallback, replacing the `blockhash(block.number - 1)` rule
+that made a historical scan unpublishable in practice.
+
+**15.4 — Config pinning.** `PolicyRegistry` gained `configHash`, `startBlock`,
+`version`, and freeze-on-first-publication (the oracle is the authorized
+freezer). `updatePolicy` is owner-only, re-runs all creation-time validation
+(it previously skipped the operator/epoch/TTL checks entirely), and post-freeze
+permits only operator rotation. `SetEntry` now pins `policyConfigHash`, both
+vkey hashes, and an immutable `validUntil` computed from the *source* block —
+verification no longer reads the policy's mutable current TTL. Added per-root
+`revokeRoot` and per-policy `setPublicationPaused`; `setScopeHash` /
+`setBalanceSlot` / `setRequiresCompleteness` are now rejected once any root
+exists.
+
+**15.5 — Proof context.** Membership publics gained a `PresentationContext`
+(policyConfigHash, verifier, verifierChainId, actionId, beneficiary, nonce,
+deadline), taking the blob to 448 bytes. `verifyMembership` checks the verifier
+is this contract, the chain matches, the deadline has not passed, and the
+config hash equals the entry's. `verifyAndConsume` additionally requires
+`beneficiary == msg.sender`, which is what defeats mempool front-running, and
+consumption is keyed by `(consumer, policyConfigHash, actionId)` so one dApp
+can no longer exhaust another's namespace.
+
+**16.1 — Backend.** All four operator routes sit behind a `ZKPOF_ADMIN_TOKEN`
+bearer check with audit logging; the server refuses to start unauthenticated
+unless `ZKPOF_DEV_INSECURE_ADMIN=1`. Balance-fetch failures are no longer
+silently dropped — unresolved candidates are reported and, by default, abort
+the build (an RPC outage is not evidence of insolvency). `/v2/solvent_set`
+serves a snapshot manifest (schema, content SHA-256, size, entry count,
+mirrors from `ZKPOF_SNAPSHOT_MIRRORS`). An empty set now hashes to a
+domain-separated `EMPTY_SET_ROOT` sentinel, mirrored as a Solidity constant, so
+"nobody qualified" is publishable while `bytes32(0)` stays reserved for "no
+root at all". The first-epoch discriminator moved to `prev_block_number == 0`
+so the sentinel does not collide with "no previous publication".
+
+**16.2 — Web.** `provenanceGate` centralizes the fail-closed decision; the
+prove flow now *awaits* the on-chain read (it previously fired it unawaited and
+advanced) and blocks progression unless served root, locally-rebuilt root, and
+on-chain entry all agree and the entry is live, unrevoked, and meets the
+policy's provenance requirement. The sandbox escape is opt-in via
+`VITE_ALLOW_UNVERIFIED_PROVENANCE=1` and labelled. The Verify screen performs a
+real `verifyMembership` `eth_call` and only shows a green state when the oracle
+accepts; decoding is explicitly labelled as not verification. The generated CLI
+command no longer contains a `--sk <KEY>` placeholder and now carries the
+presentation-context flags. Copy audit: "Prove solvency" → "Prove a threshold
+balance", the exact statement is spelled out on the result step, provenance
+badges distinguish balances-proven from range-scanned, unlinkability is scoped
+correctly, and the set page discloses its targeting-artefact nature.
+
+**16.3 — CLI.** `zkpof-client` refuses `--sk` on argv outright with
+instructions, reading the key from a hidden TTY prompt, `--sk-stdin`, or
+`--sk-env`, held in `Zeroizing` buffers.
+
+**§4.7 — chain model made explicit.** `policy.chainId == block.chainid` is now
+enforced at publication, and the web app's chain field is read-only whenever
+the oracle's chain is known. The source chain and the verifier chain *are* the
+same chain — the state root is bound through this chain's own block hashes —
+so an editable field implied a cross-chain capability that does not exist.
+Real cross-chain verification needs a light client or checkpoint oracle
+(Phase 18).
+
+**Fixed in passing.** `crates/agent/src/proof_worker.rs` loaded its guest ELF
+with compile-time `include_bytes!`, so the whole workspace failed to build
+without a prebuilt ELF — the V2 provers already load at runtime for exactly
+this reason; V1 now matches. `program/Cargo.toml` was missing the empty
+`[workspace]` table its three sibling guests carry, so `cargo prove build`
+failed inside a git worktree.
+
+### Still open in Phase 15
+
+- **15.1** External cryptographic review of `mpt.rs`, and differential fuzzing
+  against a production client (geth/reth) rather than only the in-repo builder.
+- **15.2** Randomized reference-block sampling is still application policy, not
+  a normative on-chain rule; the contract enforces the window but not
+  `sample(policyId, epoch, entropy)`.
+- **15.6** The harness (`scripts/real-proof-e2e.sh`) establishes reproducible
+  guest builds, an artifact manifest (ELF hashes, versions, schema sizes), and
+  vkey derivation. All four guests build cleanly with the new statements and
+  the manifest is produced — for example:
+
+  ```json
+  { "rust_version": "rustc 1.93.1", "sp1_version": "cargo-prove sp1 (f87f8d6)",
+    "public_values_schema": { "membership_bytes": 448, "derivation_bytes": 448,
+                              "scan_bytes": 224 },
+    "guests": { "program-membership": { "elf_sha256": "b1737ff0…", … } } }
+  ```
+
+  Steps (a)–(e) — deploy, prove, verify, and the one-field-at-a-time mutation
+  pass — are scripted as TODOs and need a machine with Docker + ~16 GB RAM or
+  a Succinct network key. **Until they run green, every surface must say
+  "protocol simulation".**
+
+  What *has* run is the emulator-level guest-vs-host equivalence suite
+  (`cargo test --test privacy_v2_integration -- --ignored`), which executes the
+  real ELFs and checks they commit byte-identical public values to the host
+  mirrors. That catches statement drift, but it is not a proof: it exercises
+  no Groth16 wrapping and no on-chain verifier.
+- **16.1** Build parameters still come from the request body rather than a
+  pinned on-chain policy version.
+
+## Phase 16: Operational Hardening & Honest Presentation 🟠
+
+Independent of Phase 15's contract work; can proceed in parallel.
+
+### 16.1 Backend (R8)
+
+- [x] Split operator routes (`/v2/admin/*`, `/admin/*`) onto an authenticated
+      control plane: bearer token minimum (env-configured), designed so mTLS /
+      signed requests can replace it; rate limits + audit log (who, what,
+      when, result) on every operator action.
+- [ ] Build parameters come from the pinned on-chain policy version, not the
+      request body; remove the hard-coded 1 ETH defaults in enrollment and
+      set building.
+- [x] Completeness-sensitive builds **abort** on any unresolved candidate
+      (RPC failure ≠ insolvent); Stage A builds report excluded candidates in
+      the build result instead of logging silently.
+- [x] Snapshot data availability: publish a content-addressed snapshot
+      manifest (schema version, SHA-256, size, entry count, mirror URLs)
+      alongside each root; `/v2/solvent_set` serves the manifest; the SDK
+      verifies content hash before rebuilding the root.
+- [x] Empty-set representability: domain-separated sentinel root
+      `SHA256("zkpof-empty-solvent-set-v1")` accepted by both publish paths,
+      understood by SDK/web.
+
+### 16.2 Web app fail-closed + real verification (R7)
+
+- [x] Production mode (default when an oracle is configured): the prove flow
+      **awaits** the on-chain read and blocks progression unless agent root ==
+      locally rebuilt root == on-chain root, entry unexpired, provenance meets
+      the policy's requirement, config hash matches, chain matches. Dev
+      sandbox mode keeps the current permissive behavior behind an explicit
+      banner.
+- [ ] No silent scope fallback: if the authoritative on-chain scope read
+      fails, the flow stops rather than deriving locally.
+- [x] Verify screen performs an actual `eth_call` (`verifyMembership` /
+      staticcall of `verifyAndConsume`) against the configured oracle and
+      reports distinct states: decodes / context matches / **cryptographically
+      valid** / root recognized+unexpired / nullifier unused. The raw decoder
+      moves to an "Inspect raw public values" advanced section. No green
+      check without a verifier call.
+- [x] Copy audit (R9): "solvency" → "threshold-balance attestation" in user
+      surfaces; exact statement ("controlled an account meeting X at
+      historical snapshot(s)") shown on the prove and verify screens; "cannot
+      be linked" → scoped-unlinkability wording; "all qualifying addresses" →
+      "balances proven for the supplied candidate set"; EOA-only stated
+      explicitly; solvent-set publication leakage disclosed on `/set`, full
+      address/streak table behind an "auditor" disclosure toggle.
+- [ ] Enforce `policy.chainId == oracle chainid` (read-only display, no
+      editable field) until a real cross-chain design exists.
+- [ ] `/operator` leaves primary navigation; it becomes a separate
+      authenticated console route wired to the 16.1 control plane.
+
+### 16.3 CLI key handling (interim, until Phase 17 removes the need)
+
+- [x] `zkpof-client` refuses `--sk` via argv: hidden TTY prompt or
+      `--sk-stdin` / `--sk-env` only; zeroize key material
+      (`zeroize` crate), disable core dumps on supported platforms, never log
+      key-bearing state; web app stops generating commands containing key
+      placeholders (prompts instead).
+
+## Phase 17: User-Proof Boundary Rework 🟡
+
+The review's central product point, accepted: basic proof-of-control (Mode A)
+must not require PLUME, a raw key, or a terminal. PLUME becomes an optional
+uniqueness capability (Mode B).
+
+### 17.1 Mode split (protocol + product)
+
+- [ ] Policy capability flag: `requiresUniqueness`. Mode A membership
+      statement drops the nullifier: witness = ordinary wallet ECDSA signature
+      over the Phase 15.5 presentation context + Merkle path + streak;
+      publics = context + root + policyConfigHash (no stable identity
+      revealed, replay prevented by nonce/deadline, not nullifier).
+- [ ] Mode B (existing PLUME path) is requested by the relying policy only;
+      `/identity` disappears from the default flow and becomes an advanced
+      screen shown for Mode B policies.
+- [ ] Wallet UX: Mode A signs a structured EIP-712 `ProofRequest`
+      (domain, action, nonce, deadline, "does not transfer funds") — works
+      with hardware wallets today.
+
+### 17.2 Browser prover spike (decision gate G1)
+
+- [ ] Prototype the Mode A membership circuit in Noir/Barretenberg
+      (UltraHonk, Keccak transcript): secp256k1 ECDSA verify, address
+      derivation, Merkle path, streak ≥ min, context binding. Generate the
+      Solidity verifier.
+- [ ] Benchmark on desktop Chrome/Safari, iPhone Safari, Android Chrome,
+      single-thread + low-memory fallback: proving time, peak memory, proof
+      size, verification gas.
+- [ ] Evaluate the Merkle-hash question: SHA-256 path cost in-circuit vs a
+      dual-commitment tree (Poseidon membership root + SHA-256 snapshot hash,
+      cross-linked in the derivation program). Prototype both before choosing.
+- [ ] **Gate G1**: ship browser proving if mobile proof time is acceptable
+      (< ~30s target on a current phone) and the second proof system's
+      maintenance cost is justified; otherwise ship a signed, reproducible
+      native companion app (not a CLI) and keep the circuit for later.
+- [ ] Privacy boundary: the prover runs on a dedicated origin (installed PWA /
+      extension / native), receiving a public `ProofRequest` via deep link/QR
+      and returning only proof + publics — the relying page never sees
+      address, signature, or path. (This is the §10 fix; the wagmi wallet
+      connection moves out of relying-party-controlled JS.)
+
+### 17.3 Demo restructure (after G1)
+
+- [ ] Single-transaction demo: proof request screen (plain-language statement,
+      revealed/hidden lists, validity) → trusted prover → verified result
+      unlocking a real gated action (the existing `SolventSetGatedAirdrop` or
+      a lending-quote example). Advanced drawer holds roots, hashes, vkeys,
+      gas. `/set` becomes the separate auditor console.
+
+## Phase 18: Strategic Prototypes & Decision Gates 🟢
+
+Only after Phases 15–16 land. Purpose: choose the long-term default
+architecture with data.
+
+### 18.1 Direct EIP-1186 state-proof prototype (decision gate G2)
+
+- [ ] Circuit (SP1 guest first — the fixed Phase 15.1 MPT code is reusable
+      as-is): canonical header → state root → account/storage path → balance ≥
+      threshold → wallet-signature control → presentation context; optional
+      K randomized historical samples via EIP-2935.
+- [ ] Compare against the solvent-set mode on: proving time/memory, RPC
+      address-privacy story (user RPC / own node / relay), operator trust,
+      download size, mobile viability, gas, integration complexity.
+- [ ] **Gate G2**: pick the default mode per use case using the review's
+      decision matrix (set mode for high-volume shared-policy gating; direct
+      mode for one-off pure proof of funds). Expose both as policy
+      capabilities rather than replacing one with the other.
+
+### 18.2 Deferred capabilities (unblocked by G1/G2 outcomes)
+
+- [ ] Stage B.2 incremental checkpoint redesign (range proofs chained via
+      recursion, EIP-2935 headroom, pinned deployment-block checkpoint) — only
+      if ERC-20 completeness is a confirmed product requirement.
+- [ ] ERC-7524 wallet integration + action-scoped nullifiers (Mode B polish).
+- [ ] ERC-1271 / Safe / 4337 adapters (zkVM `isValidSignature` execution).
+- [ ] Token adapters (proxy/codehash pinning, rebase handling, zkVM
+      `balanceOf` execution for non-mapping tokens).
+- [ ] Cross-chain source verification (light client / checkpoint oracle) —
+      until then `sourceChainId == verifierChainId` stays enforced.
+- [ ] Governance hardening for mainnet: multisig + timelock owner, emergency
+      pause, separately governed revocation (with Phase 9).
+
+### Sequencing summary
+
+```
+Phase 15 (protocol blockers)  ──┬──►  Phase 17 (mode split + G1 spike)
+Phase 16 (ops + honesty, ∥ 15) ─┘         │
+                                          ▼
+                              Phase 18 (direct-state G2, deferred caps)
+```
+
+Rule of thumb throughout: **fix soundness before polishing the interface, and
+let benchmarks — not architectural preference — pick the user-proof boundary.**

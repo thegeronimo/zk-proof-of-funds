@@ -33,7 +33,9 @@ contract PolicyRegistryTest is Test {
             operator: operator,
             scope: "test-scope",
             trustedMode: true,
-            active: true
+            active: true,
+            startBlock: 0,
+            version: 1
         });
     }
 
@@ -138,16 +140,91 @@ contract PolicyRegistryTest is Test {
         assertFalse(stored.trustedMode);
     }
 
-    function test_updatePolicy_byOperator() public {
+    /// The operator used to be able to rewrite the entire policy — including
+    /// the threshold every published root attests to, and `active`, which let
+    /// it reactivate a policy the owner had deactivated. Owner-only now
+    /// (external review finding R4).
+    function test_updatePolicy_operatorCannotRewritePolicy() public {
         PolicyRegistry.Policy memory policy = _defaultPolicy();
         registry.createPolicy(POLICY_ID, policy);
 
         policy.thresholdWei = 3 ether;
         vm.prank(operator);
+        vm.expectRevert();
+        registry.updatePolicy(POLICY_ID, policy);
+
+        assertEq(registry.getPolicy(POLICY_ID).thresholdWei, 1 ether, "unchanged");
+    }
+
+    function test_updatePolicy_byOwnerBeforeFreeze() public {
+        PolicyRegistry.Policy memory policy = _defaultPolicy();
+        registry.createPolicy(POLICY_ID, policy);
+
+        // Before any root exists the policy is still malleable.
+        policy.thresholdWei = 3 ether;
         registry.updatePolicy(POLICY_ID, policy);
 
         PolicyRegistry.Policy memory stored = registry.getPolicy(POLICY_ID);
         assertEq(stored.thresholdWei, 3 ether);
+    }
+
+    function test_updatePolicy_revertsOnSemanticChangeAfterFreeze() public {
+        PolicyRegistry.Policy memory policy = _defaultPolicy();
+        registry.createPolicy(POLICY_ID, policy);
+        registry.freezePolicy(POLICY_ID);
+
+        policy.thresholdWei = 3 ether;
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PolicyRegistry.SemanticsChangeRequiresVersionBump.selector, POLICY_ID
+            )
+        );
+        registry.updatePolicy(POLICY_ID, policy);
+    }
+
+    function test_updatePolicy_allowsOperatorRotationAfterFreeze() public {
+        PolicyRegistry.Policy memory policy = _defaultPolicy();
+        registry.createPolicy(POLICY_ID, policy);
+        registry.freezePolicy(POLICY_ID);
+
+        address newOperator = makeAddr("newOperator");
+        policy.operator = newOperator;
+        registry.updatePolicy(POLICY_ID, policy);
+
+        assertEq(registry.getPolicy(POLICY_ID).operator, newOperator);
+    }
+
+    function test_configHash_changesWithSemanticsAndVersion() public {
+        PolicyRegistry.Policy memory policy = _defaultPolicy();
+        registry.createPolicy(POLICY_ID, policy);
+        bytes32 before = registry.configHash(POLICY_ID);
+
+        // Rotating the operator does not change what a root *means*.
+        policy.operator = makeAddr("rotated");
+        assertEq(registry.configHashOf(policy), before, "operator is not semantics");
+
+        // A threshold change does, and so does a version bump.
+        policy.thresholdWei = 5 ether;
+        assertTrue(registry.configHashOf(policy) != before);
+        policy.thresholdWei = 1 ether;
+        policy.version = 2;
+        assertTrue(registry.configHashOf(policy) != before, "version is part of identity");
+    }
+
+    function test_updatePolicy_revalidatesFields() public {
+        PolicyRegistry.Policy memory policy = _defaultPolicy();
+        registry.createPolicy(POLICY_ID, policy);
+
+        // updatePolicy used to skip these checks entirely, so a zero operator
+        // or zero TTL could be installed after creation.
+        policy.operator = address(0);
+        vm.expectRevert(PolicyRegistry.InvalidOperator.selector);
+        registry.updatePolicy(POLICY_ID, policy);
+
+        policy = _defaultPolicy();
+        policy.rootTTLBlocks = 0;
+        vm.expectRevert(PolicyRegistry.ZeroRootTTL.selector);
+        registry.updatePolicy(POLICY_ID, policy);
     }
 
     function test_updatePolicy_emitsEvent() public {
@@ -164,7 +241,7 @@ contract PolicyRegistryTest is Test {
         registry.createPolicy(POLICY_ID, policy);
 
         vm.prank(unauthorized);
-        vm.expectRevert(PolicyRegistry.NotAuthorized.selector);
+        vm.expectRevert(); // OwnableUnauthorizedAccount — updates are owner-only
         registry.updatePolicy(POLICY_ID, policy);
     }
 

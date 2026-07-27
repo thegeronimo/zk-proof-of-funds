@@ -103,7 +103,7 @@ export default function ProveFlow() {
   const [furthest, setFurthest] = useState(0);
 
   const set = useSolventSet();
-  const onChain = useOnChainSet();
+  const onChain = useOnChainSet(policy?.chain_id);
 
   // Step 3 — local membership lookup.
   const [manualAddress, setManualAddress] = useState("");
@@ -589,7 +589,9 @@ function OnChainPanel({
   return (
     <Card
       title="On-chain record"
-      subtitle={`SolventSetOracle set #${onChain.setIndex}`}
+      subtitle={`SolventSetOracle set #${onChain.setIndex}${
+        onChain.chainId ? ` · chain ${onChain.chainId}` : ""
+      }`}
       actions={
         onChain.entry.proven ? (
           <StatusPill tone="good">✓ proven derivation</StatusPill>
@@ -763,9 +765,20 @@ function ProofResult({
 
             {ORACLE_ADDRESS && (
               <p className="text-xs text-gray-500">
-                Send to <span className="font-mono">{ORACLE_ADDRESS}</span> on chain{" "}
-                {String(values.chainId)}.
+                Send to <span className="font-mono">{ORACLE_ADDRESS}</span>
+                {onChain.chainId ? ` on chain ${onChain.chainId}` : ""}.
               </p>
+            )}
+
+            {/* verifyMembership reverts unless the proof's committed chainId
+                equals block.chainid, so a mismatch here is a guaranteed
+                failed call rather than a cosmetic difference. */}
+            {onChain.chainId !== null && Number(values.chainId) !== onChain.chainId && (
+              <Callout tone="bad" title="Chain mismatch — this call will revert">
+                The proof commits to chain {String(values.chainId)}, but the oracle you would
+                submit to is on chain {onChain.chainId}. Re-run the prove command with{" "}
+                <code className="font-mono">--chain-id {onChain.chainId}</code>.
+              </Callout>
             )}
           </div>
         </Card>

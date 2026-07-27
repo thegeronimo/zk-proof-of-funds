@@ -23,6 +23,22 @@ export const POLICY_REGISTRY_ADDRESS = envAddress(
   import.meta.env.VITE_POLICY_REGISTRY_ADDRESS
 );
 
+/**
+ * The chain the oracle above is deployed on.
+ *
+ * An address alone is ambiguous: the same bytes are a different contract on
+ * every chain. Without pinning this, reads follow whatever chain the wallet
+ * happens to be on — which fails when the user is on the wrong network, and
+ * silently reads an unrelated contract when some *other* deployment shares the
+ * address. Unset falls back to the selected policy's own `chain_id`.
+ */
+export const ORACLE_CHAIN_ID: number | null = (() => {
+  const raw = import.meta.env.VITE_ORACLE_CHAIN_ID;
+  if (!raw) return null;
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+})();
+
 /** Whether on-chain reads are possible at all in this deployment. */
 export const HAS_ORACLE = ORACLE_ADDRESS !== null;
 

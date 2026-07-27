@@ -24,11 +24,30 @@
 
 **What it solves**: DeFi protocols that need to verify "does this user have >= X ETH?" face a dilemma — on-chain balance checks are public, gas-expensive, and require the user to reveal their identity. ZK Proof of Funds lets users enroll once, after which an agent continuously monitors their balance and publishes Merkle roots that any smart contract can verify cheaply (~10k gas).
 
+**Two models.** The system offers two ways to prove solvency. They produce the
+**same identity** to a relying protocol, so a policy can use either:
+
+| | **Solvent-set mode** (Privacy V2) | **Monitored mode** |
+|---|---|---|
+| Enrollment | none | one-time, signed |
+| Agent learns your address | **no** | yes |
+| Identity | nullifier hash (deterministic, per-policy) | `SHA256(signature)` |
+| Anonymity set | every solvent address on the chain | enrolled members |
+| Time dimension | proves a streak of consecutive solvent epochs | single snapshot |
+| Verification | SP1 Groth16 (~270k gas) | Merkle proof (~10k gas) |
+
+Solvent-set mode works because on a transparent chain, *solvency is already
+public*: the set of addresses above a threshold is derivable by anyone. The
+agent commits to that whole set each epoch; you download it, find yourself
+locally, and prove membership in zero knowledge. Nobody — including the agent
+— learns which member you are.
+
 **Key properties**:
-- **Privacy**: A `memberId` is computed as `SHA256(signature)` — unlinkable to the wallet address
+- **Privacy**: In solvent-set mode nothing about you is ever sent to the agent. In monitored mode a `memberId` (`SHA256(signature)`) is unlinkable to the wallet address on-chain.
 - **Non-custodial**: The agent only reads balances via RPC, never holds funds
-- **Cheap verification**: ~10k gas per on-chain proof check (log₂(N) SHA-256 hashes)
+- **Cheap verification**: ~10k gas per monitored-mode proof check (log₂(N) SHA-256 hashes)
 - **Batch efficiency**: One on-chain transaction covers all members for a given epoch
+- **Resistant to rented solvency**: Streaks and unpredictable reference blocks make borrowing funds for one sampled block roughly as expensive as being genuinely solvent
 
 ---
 
@@ -93,15 +112,20 @@ There are three distinct actors in the system:
 ### Member / User
 **Who**: End users who want to prove they hold a minimum balance to access a gated dApp.
 
-**Responsibilities**:
+**Responsibilities** — *solvent-set mode*:
+- Keeps their wallet funded above the policy threshold (that is the whole setup)
+- Downloads the public solvent set and generates a membership proof locally with `zkpof-client` when they want to prove something
+
+**Responsibilities** — *monitored mode*:
 - Connects their wallet and signs an enrollment message (one-time, per policy)
 - Keeps their enrolled wallet funded above the policy threshold
 - Fetches Merkle proofs when submitting transactions to gated dApps
 
 **Privacy properties**:
-- The agent learns the wallet address (watch target) but this is never exposed on-chain or via the public API
-- All on-chain interactions use the privacy-preserving `memberId` (`SHA256(signature)`)
-- A member's wallet is unlinkable to their `memberId` by any party that only sees on-chain data
+- In **solvent-set mode** the agent never learns the wallet address at all. The member downloads the entire set — so the agent sees only that *somebody* fetched it — and the proof reveals nothing but a nullifier hash. The anonymity set is every solvent address on the chain.
+- In **monitored mode** the agent learns the wallet address (watch target), but this is never exposed on-chain or via the public API
+- All on-chain interactions use a privacy-preserving identity: a nullifier hash (V2) or `memberId = SHA256(signature)` (monitored). These are the same value for a given key and policy, so relying protocols cannot tell the modes apart
+- A member's wallet is unlinkable to that identity by any party that only sees on-chain data
 
 ---
 
@@ -109,10 +133,14 @@ There are three distinct actors in the system:
 **Who**: A developer or team building a dApp that wants to gate access behind solvency checks.
 
 **Responsibilities**:
-- Imports the `ISolvencyOracle` interface into their Solidity contracts
-- Calls `oracle.isMemberSolvent()` before granting privileged access
-- Uses the TypeScript SDK to fetch proofs from the agent for their users
+- Imports `ISolvencyOracle` (monitored mode) or `ISolventSetOracle` (solvent-set mode) into their Solidity contracts
+- Calls `oracle.isMemberSolvent()`, or `oracle.verifyMembership()` / `verifyAndConsume()`, before granting privileged access
+- In solvent-set mode, checks the returned `minStreak` against their own requirement — the oracle enforces that the proof attests to *some* minimum, but cannot know theirs
+- Uses the TypeScript SDK to fetch proofs (monitored) or to decode and cross-check proof public values (solvent-set)
 - Decides which policy (and therefore which threshold and operator) to trust
+
+See `examples/` for worked contracts in both models, and the comparison table
+at the top of `examples/README.md` for choosing between them.
 
 ---
 
@@ -287,10 +315,19 @@ cd web
 # Install dependencies
 npm install
 
-# Create local environment file
+# Create local environment file.
+#
+# VITE_ORACLE_ADDRESS / VITE_ORACLE_CHAIN_ID are optional but recommended:
+# they turn on the on-chain panels, which show whether a solvent-set root was
+# actually published, whether it was proven or merely operator-asserted, and
+# when it expires. Always set the chain id alongside the address — an address
+# on its own is ambiguous, and reads would otherwise follow whatever network
+# the wallet happens to be on.
 cat > .env.local << 'EOF'
 VITE_AGENT_URL=http://localhost:3000
 VITE_CHAIN_ID=31337
+VITE_ORACLE_ADDRESS=<SolventSetOracle address from Step 3>
+VITE_ORACLE_CHAIN_ID=31337
 EOF
 
 # Start the development server
@@ -449,28 +486,86 @@ Watch logs for:
 
 ### Member / User Guide
 
-As a member, you enroll once and then use your `memberId` and Merkle proofs to interact with solvency-gated dApps.
+There are two ways to prove solvency, and the app leads with the newer one.
 
-#### Using the React App
+| | **Prove** (solvent-set mode) | **Monitored** mode |
+|---|---|---|
+| Enrollment | none | one-time, signed |
+| Agent learns your address | **no** | yes |
+| What you run | `zkpof-client` locally | nothing after enrolling |
+| Time dimension | proves a streak of consecutive solvent epochs | single snapshot |
 
-**1. Open the app**
+Prefer **Prove** unless you're on a trusted-mode policy that requires
+enrollment. It never reveals your address to anyone, and it needs no setup —
+if your wallet already qualifies, you can prove it today.
 
-Navigate to the app URL (locally: http://localhost:5173).
+The app's navigation reflects this: `Prove` is the landing page,
+`Solvent set` inspects the published data, `Identity` derives your nullifier,
+`Verify` decodes a proof, and `Monitored` holds the legacy enrollment flow and
+its dashboard.
 
-**2. Connect your wallet**
+#### A. Proving without enrolling (recommended)
+
+**1. Open the app** at http://localhost:5173. You land on **Prove**.
+
+**2. Pick a policy** from the catalog — you'll see its threshold, asset, chain,
+and scope.
+
+**3. Download the solvent set.** The app fetches the *entire* public set and
+rebuilds its Merkle root in your browser, showing a ✓ when the rebuilt root
+matches the one served. Downloading everything is what keeps the lookup
+private: asking "am I in the set?" would reveal who you are.
+
+> If an oracle address is configured, this step also reads the chain and tells
+> you whether the root was actually published, and whether it was **proven**
+> (each balance verified against the block's state root) or merely
+> **operator-asserted**.
+
+**4. Find yourself.** Connect a wallet or paste an address. The search runs
+against the list already in memory — nothing is sent anywhere. You'll see your
+**streak**: how many consecutive epochs you've stayed above the threshold.
+
+**5. Generate the proof.** This step runs on your machine, not in the browser:
+zero-knowledge proving needs a native toolchain, and the nullifier needs raw
+key access that wallets deliberately never grant. The app writes the exact
+command for you with everything filled in but your key:
+
+```bash
+zkpof-client prove \
+  --sk <YOUR_32_BYTE_HEX_KEY> \
+  --policy 0x…01 \
+  --agent http://localhost:3000 \
+  --min-streak 3 \
+  --chain-id 31337
+```
+
+Paste the JSON it prints back into the page. The app decodes it and re-checks
+every field against what it already verified — a stale or mismatched proof
+gives you a readable error here instead of a failed transaction later. When
+it checks out you get `verifyMembership` / `verifyAndConsume` calldata to hand
+to the dApp.
+
+> Your key never leaves your machine, and the agent only ever saw that
+> *somebody* downloaded the set.
+
+#### B. Monitored mode (enrollment)
+
+Use this for trusted-mode policies. Go to the **Monitored** tab → **Enroll**.
+
+**1. Connect your wallet**
 
 Click **"Connect Wallet"** and select your wallet from the list. The app supports MetaMask, Rabby, Frame, and any injected browser wallet.
 
 > 💡 You must connect the wallet address you want to prove solvency for — this is the address the agent will monitor.
 
-**3. Configure the policy**
+**2. Configure the policy**
 
 Fill in:
-- **Policy ID**: The `bytes32` identifier for the policy you want to enroll in. Get this from the dApp or operator. Example: `0x0101...0101`
+- **Policy**: Pick from the catalog dropdown, or choose "Custom policy ID…" and paste a `bytes32` ID you got from the dApp or operator. Your choice persists across every tab in the app.
 - **Scope**: The policy's scope string (provided by the operator alongside the Policy ID). Example: `defi-protocol-v1`
 - **Nonce**: A unique random value. The app pre-fills a random nonce — you can leave it as-is.
 
-**4. Sign the enrollment message**
+**3. Sign the enrollment message**
 
 The app shows you the message you'll sign:
 
@@ -482,7 +577,7 @@ Click **"Sign Message"** — your wallet will prompt you to sign. This is a free
 
 > 🔒 The signature never leaves your device; it's used only to compute your `memberId = SHA256(signature)` and to prove wallet control.
 
-**5. Submit enrollment**
+**4. Submit enrollment**
 
 Click **"Enroll"**. The app sends your address and signature to the agent for verification. On success you'll see:
 
@@ -495,9 +590,9 @@ Policy ID: 0x0101...0101
 
 **Save your Member ID!** You'll need it to fetch proofs and interact with gated dApps. Copy it to a secure note.
 
-**6. Check your status**
+**5. Check your status**
 
-Click the **Dashboard** tab. Enter your Policy ID and Member ID to see:
+Go to the **Monitored** tab → **Dashboard**. Enter your Member ID (the policy carries over from your selection) to see:
 - Current status: `solvent` / `insolvent` / `pending`
 - Last observed balance
 - Last checked block
@@ -1097,6 +1192,143 @@ Check a member's current solvency status.
 
 ---
 
+### Solvent-Set Endpoints (Privacy V2)
+
+> All IDs accept `0x`-prefixed or bare hex, in any case.
+
+#### `GET /v2/solvent_set/{policyId}`
+
+Metadata for the latest published solvent set.
+
+**Response `200 OK`**:
+```json
+{
+  "policy_id": "0000...0001",
+  "epoch": 4,
+  "block_number": 19000400,
+  "root": "0x5c36...fda6",
+  "member_count": 31
+}
+```
+
+**Errors**: `404` no set built for this policy yet, `400` invalid hex
+
+---
+
+#### `GET /v2/solvent_set/{policyId}/leaves`
+
+One page of the public entry list. **Download all of it.** Requesting a
+specific address is not supported by design — the query itself would reveal
+who is asking. Fetching everything is what makes the lookup oblivious.
+
+**Query**: `epoch` (defaults to latest), `offset` (default 0), `limit` (default 10000)
+
+**Response `200 OK`**:
+```json
+{
+  "policy_id": "0000...0001",
+  "epoch": 4,
+  "block_number": 19000400,
+  "root": "0x5c36...fda6",
+  "total": 31,
+  "offset": 0,
+  "limit": 10000,
+  "addresses": ["1111...1111", "dead...0001"],
+  "entries": [["1111...1111", 4], ["dead...0001", 3]]
+}
+```
+
+`entries` pairs each address with its **streak** (consecutive solvent epochs).
+The order is canonical — leaf index is position in this list, so do not
+re-sort it. The SDK's `fetchAllSolventSetEntries()` handles the paging.
+
+---
+
+#### `POST /v2/enroll`
+
+Optional nullifier enrollment, for policies that also run monitored mode. The
+solvent-set proving flow needs no enrollment at all.
+
+**Request**:
+```json
+{
+  "policy_id": "0x0000...0001",
+  "scope_hash": "0x4d31...39f4",
+  "public_key": "03079264...d722",
+  "nullifier": "0306bfaa...b3e0",
+  "dleq_a": "0270c958...b037",
+  "dleq_b": "03a2a0e2...b89b",
+  "dleq_s": "4dfb2b2e...2e92"
+}
+```
+
+Generate this body with `zkpof-client nullifier --sk <key> --policy <id>`, or
+in JS via `buildEnrollV2Request()` from `@zk-proof-of-funds/sdk/plume`. The
+secret key never leaves the caller.
+
+**Response `200 OK`**:
+```json
+{
+  "member_id": "07fa2273...63a5",
+  "status": "enrolled",
+  "effective_epoch": 1,
+  "mode": "nullifier"
+}
+```
+
+`member_id` is `SHA256(nullifier)` — the same value a membership proof commits
+to as its nullifier hash.
+
+**Errors**: `400` malformed input or failed DLEQ verification, `409` already enrolled
+
+---
+
+#### `POST /v2/admin/build_solvent_set/{policyId}`
+
+Build the next solvent set (operator). Requires the agent to have `RPC_URL` set.
+
+**Request** (every field optional):
+```json
+{
+  "candidates": ["0xabc...", "0xdef..."],
+  "block_number": 19000400,
+  "threshold_wei": "1000000000000000000",
+  "token_address": "0xA0b8...eB48",
+  "discover_from_block": 19000000,
+  "discover_to_block": 19000400,
+  "proven": false,
+  "balance_slot": 9
+}
+```
+
+Omit `block_number` to let the agent sample a blockhash-derived unpredictable
+reference block — that is the anti-rented-solvency default and should be
+preferred over pinning. Set `proven: true` for a **Stage B** build, which
+verifies an EIP-1186 proof per candidate against the block's state root so the
+result can be published permissionlessly; ERC-20 proven builds additionally
+require `balance_slot`.
+
+**Response `200 OK`**:
+```json
+{
+  "policy_id": "0000...0001",
+  "epoch": 5,
+  "block_number": 19000500,
+  "root": "0xabcd...",
+  "member_count": 31,
+  "proven": true,
+  "candidate_count": 40,
+  "state_root": "0x...",
+  "prev_root": "0x..."
+}
+```
+
+`candidate_count`, `state_root`, and `prev_root` appear only for proven builds.
+
+**Errors**: `400` invalid input or missing `balance_slot`, `500` RPC not configured
+
+---
+
 ### Admin Endpoints
 
 #### `GET /admin/members/{policyId}`
@@ -1141,6 +1373,65 @@ Get the latest epoch record for a policy.
 ```
 
 `latest_epoch` is `null` if no epochs have been published yet.
+
+---
+
+#### `POST /admin/trigger_epoch/{policyId}`
+
+Run a monitored-mode epoch now: re-read every enrolled member's balance,
+rebuild the membership tree, and record the epoch. Requires `RPC_URL`.
+
+**Response `200 OK`**:
+```json
+{
+  "epoch": 43,
+  "block_number": 19500100,
+  "root": "0xeeee...",
+  "member_count": 3,
+  "balance_updates": [
+    { "member_id": "0xf47a...9c12", "balance_wei": "1500000000000000000", "solvent": true }
+  ]
+}
+```
+
+**Errors**: `500` RPC not configured
+
+---
+
+#### `POST /submit_proof/{policyId}/{memberId}`
+
+Submit an EIP-1186 state proof for a monitored-mode member, so the agent can
+verify the balance against the block's state root rather than trusting its own
+RPC read.
+
+**Request**:
+```json
+{
+  "trie_key": "0x<keccak256(address)>",
+  "proof_nodes": ["0xf90211...", "0xf871..."],
+  "block_number": 19500000
+}
+```
+
+Send `trie_key` — `keccak256(address)`, computed client-side via
+`computeTrieKey()` in `@zk-proof-of-funds/sdk/plume` — so the plaintext address
+never transits the agent. (A `wallet_address` field is rejected by default;
+`ZKPOF_ALLOW_PLAINTEXT_ADDRESS=1` re-enables it for un-migrated integrators.)
+
+**Response `200 OK`**:
+```json
+{
+  "member_id": "f47a...9c12",
+  "policy_id": "0101...0101",
+  "epoch": 42,
+  "block_number": 19500000,
+  "balance_wei": "1500000000000000000",
+  "is_solvent": true,
+  "status": "solvent"
+}
+```
+
+**Errors**: `404` member not found, `400` proof verification failed
 
 ---
 

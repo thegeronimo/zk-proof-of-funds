@@ -43,8 +43,15 @@ command -v forge >/dev/null || fail "forge not found (Foundry)"
 if ! cargo prove --version >/dev/null 2>&1; then
   fail "SP1 toolchain not found. Install: curl -L https://sp1up.succinct.xyz | bash && sp1up"
 fi
+# Docker gates only the Groth16 legs. Everything else — builds, manifest,
+# vkeys, the mutation matrix, deployment — runs without it, and those are the
+# parts that catch unbound fields. Degrade rather than refuse.
+CAN_PROVE=1
 if [ "${SP1_PROVER:-cpu}" = "cpu" ] && ! docker info >/dev/null 2>&1; then
-  fail "Docker is required for local Groth16 wrapping. Start Docker, or set SP1_PROVER=network."
+  CAN_PROVE=0
+  printf '\033[33mNOTE: Docker is not running, so real Groth16 proofs cannot be\n'
+  printf '      generated locally. Running every other leg. Start Docker, or set\n'
+  printf '      SP1_PROVER=network with NETWORK_PRIVATE_KEY, for the full run.\033[0m\n'
 fi
 
 # ── 1. Build every guest, recording exactly what was built ──────────────────
@@ -96,44 +103,92 @@ cat "${MANIFEST}"
 
 # ── 2. Verification keys ────────────────────────────────────────────────────
 
-step "Deriving verification keys"
 # print-vkeys reads the built ELFs and prints the vkeys the oracle must be
 # configured with. A vkey mismatch is the single most common cause of a
 # "valid" proof being rejected on-chain, so it is derived here, never assumed.
-cargo run --quiet --bin print-vkeys > "${OUT}/vkeys.env" || fail "print-vkeys failed"
-cat "${OUT}/vkeys.env"
-
-# ── 3. Real proofs ──────────────────────────────────────────────────────────
 #
-# Each of these must produce a Groth16 proof and have it accepted by the
-# deployed verifier. They are ordered cheapest-first so a broken toolchain
-# fails fast.
+# SP1 setup is minutes per program, so this is skippable when you only want
+# the fast legs (mutation matrix, deployment).
+if [ "${SKIP_VKEYS:-0}" = "1" ]; then
+  step "Skipping vkey derivation (SKIP_VKEYS=1)"
+else
+  step "Deriving verification keys (SP1 setup — minutes per program)"
+  cargo run --quiet --bin print-vkeys > "${OUT}/vkeys.env" || fail "print-vkeys failed"
+  cat "${OUT}/vkeys.env"
+fi
 
-step "TODO: generate + verify real proofs"
+# ── 3. Real Groth16 proofs (requires Docker or the prover network) ──────────
+
+if [ "${CAN_PROVE}" = "1" ]; then
+  step "Generating real Groth16 proofs"
+  echo "TODO: wire prove_derivation / prove_membership / prove_scan here and"
+  echo "      submit them against a deployed SP1VerifierGroth16."
+  echo "      Tracked as the remaining half of Phase 15.6."
+else
+  step "Skipping real Groth16 proofs (no Docker / prover network)"
+fi
+
+# ── 4. Contract-level end-to-end + mutation matrix ──────────────────────────
+#
+# Runs without Docker: every binding the contract performs is exercised, with
+# only the SNARK itself mocked. The mutation matrix is the part that matters —
+# it walks the public-values blob one field at a time and requires each
+# mutation to be rejected, which is what distinguishes a real verifier from a
+# stub. Validated with negative controls: removing a single binding in the
+# contract makes exactly the corresponding mutation test fail.
+
+step "Contract-level E2E + mutation matrix"
+(cd "${ROOT}/contracts" && forge test --match-contract E2EMutationTest -vv) \
+  || fail "mutation matrix failed — a public value is not actually bound"
+
+step "Full contract suite"
+(cd "${ROOT}/contracts" && forge test) || fail "contract suite failed"
+
+# ── 5. Live deployment smoke test on anvil ──────────────────────────────────
+
+step "Deploying to a throwaway anvil"
+if ! command -v anvil >/dev/null; then
+  echo "anvil not found — skipping the live deployment leg"
+else
+  anvil --silent --port 8545 &
+  ANVIL_PID=$!
+  trap 'kill ${ANVIL_PID} 2>/dev/null || true' EXIT
+  # Wait for readiness rather than sleeping a fixed amount.
+  for _ in $(seq 1 50); do
+    cast block-number --rpc-url http://127.0.0.1:8545 >/dev/null 2>&1 && break
+    sleep 0.2
+  done
+
+  # anvil's first well-known dev key. Safe to hard-code: it is a published
+  # test key on a throwaway local chain, never a real account.
+  export DEPLOYER_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+  (cd "${ROOT}/contracts" && forge script script/Deploy.s.sol \
+      --rpc-url http://127.0.0.1:8545 \
+      --broadcast) \
+    || fail "deployment to anvil failed"
+  echo "Deployment succeeded (registry + oracle wired, freezer authorized)."
+fi
+
+# ── 6. What is still missing ────────────────────────────────────────────────
+
+step "Remaining work for a full real-proof E2E"
 cat <<'NOTES'
-Remaining work to finish Phase 15.6 (tracked in EXECUTION_PLAN.md):
+DONE here:
+  - reproducible guest builds + artifact manifest (ELF hashes, toolchain)
+  - verification keys derived from the built ELFs (unless SKIP_VKEYS=1)
+  - contract-level publish/verify with a one-field-at-a-time mutation matrix
+  - live deployment to anvil
 
-  a. Start anvil and deploy SP1VerifierGroth16 + PolicyRegistry +
-     SolventSetOracle, configured with the vkeys printed above.
-  b. Generate a real derivation proof against a forked mainnet block and
-     submit publishRootProven; assert the tx succeeds and the stored entry
-     matches the committed public values field for field.
-  c. Generate a real membership proof against that root, with a full
-     presentation context, and call verifyMembership; assert it returns the
-     expected nullifier and minStreak.
-  d. Generate a real receipt-scan proof and submit publishRootProvenComplete;
-     assert the stored scan range matches the proven headers.
-  e. Mutation pass — for each of the following, flip one value and assert the
-     call REVERTS:
-       proof byte, root, epoch, prevBlockNumber, blockNumber, stateRoot,
-       chainId, threshold, token, balanceSlot, candidatesRoot, scanStartBlock,
-       scanEndBlock, vkey, scopeHash, policyConfigHash, verifier, beneficiary,
-       deadline, nonce
-     A mutation that still succeeds means that field is not actually bound.
+STILL REQUIRED for the real-Groth16 claim (needs Docker + ~16 GB RAM, or
+SP1_PROVER=network with a NETWORK_PRIVATE_KEY):
+  - generate real Groth16 proofs for membership / derivation / receipt scan
+  - deploy SP1VerifierGroth16 and configure the oracle with the derived vkeys
+  - submit publishRootProven + verifyMembership against that real verifier
+  - re-run the mutation matrix against real proofs, where a mutated public
+    value must fail SNARK verification rather than a contract check
 
-This script currently establishes the reproducible build + vkey derivation
-half. Until (a)-(e) run green in CI, the demo must be labelled a protocol
-simulation, not a working ZK proof-of-funds deployment.
+Until that passes, the demo is a PROTOCOL SIMULATION: the contract logic is
+verified, the proof system integration is not.
 NOTES
 
 step "Artifact manifest written to ${MANIFEST}"

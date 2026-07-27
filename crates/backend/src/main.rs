@@ -274,6 +274,8 @@ async fn submit_proof_handler(
     Path((policy_id, member_id)): Path<(String, String)>,
     Json(req): Json<SubmitProofRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let (policy_id, member_id) = (canonical_hex(&policy_id), canonical_hex(&member_id));
+
     // 1. Verify member exists
     {
         let db = state.db.lock().unwrap();
@@ -471,6 +473,7 @@ async fn get_proof(
     State(state): State<Arc<AppState>>,
     Path((policy_id, member_id)): Path<(String, String)>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let (policy_id, member_id) = (canonical_hex(&policy_id), canonical_hex(&member_id));
     let db = state.db.lock().unwrap();
 
     // 1. Look up the member
@@ -578,6 +581,7 @@ async fn get_status(
     State(state): State<Arc<AppState>>,
     Path((policy_id, member_id)): Path<(String, String)>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let (policy_id, member_id) = (canonical_hex(&policy_id), canonical_hex(&member_id));
     let db = state.db.lock().unwrap();
 
     match db.get_member(&member_id) {
@@ -617,6 +621,7 @@ async fn admin_list_members(
     State(state): State<Arc<AppState>>,
     Path(policy_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let policy_id = canonical_hex(&policy_id);
     let db = state.db.lock().unwrap();
 
     match db.get_members_for_policy(&policy_id) {
@@ -649,6 +654,7 @@ async fn admin_list_epochs(
     State(state): State<Arc<AppState>>,
     Path(policy_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let policy_id = canonical_hex(&policy_id);
     let db = state.db.lock().unwrap();
 
     match db.get_latest_epoch(&policy_id) {
@@ -695,6 +701,7 @@ async fn admin_trigger_epoch(
     State(state): State<Arc<AppState>>,
     Path(policy_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let policy_id = canonical_hex(&policy_id);
     let rpc = match &state.rpc_fetcher {
         Some(r) => r,
         None => return (
@@ -878,6 +885,16 @@ async fn admin_trigger_epoch(
 }
 
 // ─── Privacy V2 Handlers ────────────────────────────────────────────────────
+
+/// Canonicalize a hex path parameter: drop an optional `0x` prefix, lowercase.
+///
+/// IDs are stored as lowercase unprefixed hex, but callers legitimately send
+/// either form — the V2 routes already accept both via `parse_policy_id`.
+/// Without this, a `0x`-prefixed ID matches no row and the handler returns an
+/// empty result, which reads as "no such member" rather than "wrong format".
+fn canonical_hex(value: &str) -> String {
+    value.strip_prefix("0x").unwrap_or(value).to_lowercase()
+}
 
 /// Decode a fixed-length hex field (0x prefix optional).
 fn decode_hex_array<const N: usize>(field: &str, value: &str) -> Result<[u8; N], String> {

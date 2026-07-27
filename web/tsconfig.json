@@ -16,9 +16,11 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
     "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
     "paths": {
       "@zk-proof-of-funds/sdk": ["../sdk/src/index.ts"],
-      "@zk-proof-of-funds/sdk/plume": ["../sdk/src/plume.ts"]
+      "@zk-proof-of-funds/sdk/plume": ["../sdk/src/plume.ts"],
+      "@zkpof/policies.json": ["../config/policies.json"]
     }
   },
   "include": ["src", "vite-env.d.ts"]

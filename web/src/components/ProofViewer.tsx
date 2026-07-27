@@ -1,6 +1,208 @@
-import { useState } from "react";
+/**
+ * Proof inspector — the relying party's view.
+ *
+ * A dApp receives `(proofBytes, publicValues)` from a user with no other
+ * context and has to decide whether to honour it. This page decodes the
+ * statement so that decision is made on visible facts, and lets the operator's
+ * side check a V1 Merkle proof too. The two protocols are kept in separate
+ * modes because they attest to genuinely different things.
+ */
 
-interface ProofInput {
+import { useState } from "react";
+import {
+  decodeMembershipPublicValues,
+  checkMembershipPublicValues,
+  type MembershipPublicValues,
+  type MembershipCheckResult,
+} from "@zk-proof-of-funds/sdk";
+import {
+  Button,
+  Callout,
+  Card,
+  DefinitionList,
+  Field,
+  Hex,
+  PageHeader,
+  Row,
+  StatusPill,
+  TextArea,
+  TextInput,
+} from "./ui";
+
+type Mode = "v2" | "v1";
+
+export default function ProofViewer() {
+  const [mode, setMode] = useState<Mode>("v2");
+
+  return (
+    <div className="max-w-3xl mx-auto">
+      <PageHeader title="Inspect a proof">
+        Decode what a proof actually claims before acting on it.
+      </PageHeader>
+
+      <div className="flex gap-1 mb-6 bg-gray-100 p-1 rounded-lg w-fit">
+        {(
+          [
+            ["v2", "Membership (Privacy V2)"],
+            ["v1", "Merkle proof (monitored mode)"],
+          ] as [Mode, string][]
+        ).map(([value, label]) => (
+          <button
+            key={value}
+            onClick={() => setMode(value)}
+            className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
+              mode === value ? "bg-white shadow-sm text-gray-900" : "text-gray-600 hover:text-gray-900"
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {mode === "v2" ? <MembershipInspector /> : <MerkleInspector />}
+    </div>
+  );
+}
+
+// ── Privacy V2 ──────────────────────────────────────────────────────────────
+
+function MembershipInspector() {
+  const [input, setInput] = useState("");
+  const [values, setValues] = useState<MembershipPublicValues | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // What the relying party independently requires.
+  const [expectedPolicy, setExpectedPolicy] = useState("");
+  const [expectedChain, setExpectedChain] = useState("");
+  const [requiredStreak, setRequiredStreak] = useState("");
+  const [check, setCheck] = useState<MembershipCheckResult | null>(null);
+
+  function decode() {
+    setError(null);
+    setValues(null);
+    setCheck(null);
+    try {
+      // Accept either the raw hex blob or the whole zkpof-client JSON object.
+      const trimmed = input.trim();
+      let blob = trimmed;
+      if (trimmed.startsWith("{")) {
+        const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+        if (typeof parsed.public_values_abi !== "string") {
+          throw new Error("JSON has no `public_values_abi` field.");
+        }
+        blob = parsed.public_values_abi;
+      }
+      const decoded = decodeMembershipPublicValues(blob);
+      setValues(decoded);
+      setCheck(
+        checkMembershipPublicValues(decoded, {
+          policyId: expectedPolicy.trim() || undefined,
+          chainId: expectedChain.trim() ? Number(expectedChain) : undefined,
+          requiredMinStreak: requiredStreak.trim() ? Number(requiredStreak) : undefined,
+        })
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not decode");
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      <Card
+        title="Public values"
+        subtitle="The 224-byte blob, or the whole JSON object from zkpof-client prove."
+      >
+        <TextArea
+          value={input}
+          onChange={setInput}
+          rows={6}
+          placeholder="0x… (224 bytes) or the zkpof-client JSON"
+        />
+        <div className="mt-3">
+          <Button onClick={decode} disabled={!input.trim()} full>
+            Decode
+          </Button>
+        </div>
+        {error && <p className="text-sm text-red-600 mt-3">{error}</p>}
+      </Card>
+
+      <Card
+        title="Your requirements"
+        subtitle="Optional — anything you fill in is checked against the statement."
+      >
+        <div className="grid gap-4 sm:grid-cols-3">
+          <Field label="Policy ID">
+            <TextInput value={expectedPolicy} onChange={setExpectedPolicy} placeholder="0x…" mono />
+          </Field>
+          <Field label="Chain ID">
+            <TextInput value={expectedChain} onChange={setExpectedChain} placeholder="1" mono />
+          </Field>
+          <Field label="Minimum streak">
+            <TextInput value={requiredStreak} onChange={setRequiredStreak} placeholder="3" mono />
+          </Field>
+        </div>
+      </Card>
+
+      {values && (
+        <Card
+          title="What this proof claims"
+          actions={
+            check?.ok ? (
+              <StatusPill tone="good">✓ meets your requirements</StatusPill>
+            ) : check && check.failures.length > 0 ? (
+              <StatusPill tone="bad">✗ does not meet them</StatusPill>
+            ) : null
+          }
+        >
+          <DefinitionList>
+            <Row label="Prover identity">
+              <Hex value={values.nullifierHash} />
+            </Row>
+            <Row label="Solvent-set root">
+              <Hex value={values.solventSetRoot} truncate />
+            </Row>
+            <Row label="Policy">
+              <Hex value={values.policyId} truncate />
+            </Row>
+            <Row label="Epoch">{String(values.epoch)}</Row>
+            <Row label="Chain ID">{String(values.chainId)}</Row>
+            <Row label="Streak proven">≥ {String(values.minStreak)} epochs</Row>
+            <Row label="Scope">
+              <Hex value={values.scopeHash} truncate />
+            </Row>
+          </DefinitionList>
+
+          {check && check.failures.length > 0 && (
+            <div className="mt-4">
+              <Callout tone="bad" title="Mismatches">
+                <ul className="mt-1 space-y-1">
+                  {check.failures.map((failure) => (
+                    <li key={failure.field} className="font-mono text-xs break-all">
+                      {failure.field}: expected {failure.expected}, got {failure.actual}
+                    </li>
+                  ))}
+                </ul>
+              </Callout>
+            </div>
+          )}
+
+          <div className="mt-4">
+            <Callout tone="warn" title="Decoding is not verification">
+              These are the values the proof <em>would</em> commit to. Only
+              <code className="font-mono"> SolventSetOracle.verifyMembership</code> checks the
+              Groth16 proof itself, that the root is one the oracle stored, and that the root has
+              not expired.
+            </Callout>
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+// ── Monitored mode (V1) ─────────────────────────────────────────────────────
+
+interface MerkleProofInput {
   memberId: string;
   status: number;
   epoch: number;
@@ -9,9 +211,9 @@ interface ProofInput {
   root: string;
 }
 
-export default function ProofViewer() {
+function MerkleInspector() {
   const [jsonInput, setJsonInput] = useState("");
-  const [proofData, setProofData] = useState<ProofInput | null>(null);
+  const [proofData, setProofData] = useState<MerkleProofInput | null>(null);
   const [parseError, setParseError] = useState<string | null>(null);
 
   function parseProof() {
@@ -35,74 +237,48 @@ export default function ProofViewer() {
   const gasEstimate = treeDepth * 84 + 5000; // ~84 gas per SHA-256 level + base
 
   return (
-    <div className="max-w-3xl mx-auto">
-      <h1 className="text-2xl font-bold mb-2">Proof Viewer</h1>
-      <p className="text-gray-500 mb-6">
-        Visualize a Merkle inclusion proof. Paste the JSON response from{" "}
-        <code className="text-sm bg-gray-100 px-1 rounded">
-          GET /proof/:policyId/:memberId
-        </code>
-        .
-      </p>
-
-      {/* JSON input */}
-      <div className="bg-white rounded-lg border border-gray-200 p-6 mb-6">
-        <label className="block text-sm font-medium text-gray-700 mb-2">
-          Proof JSON
-        </label>
-        <textarea
+    <div className="space-y-6">
+      <Card
+        title="Merkle proof JSON"
+        subtitle="The response from GET /proof/:policyId/:memberId."
+      >
+        <TextArea
           value={jsonInput}
-          onChange={(e) => setJsonInput(e.target.value)}
-          placeholder='{"member_id": "...", "status": 1, "epoch": 42, "merkle_proof": [...], "root": "..."}'
+          onChange={setJsonInput}
           rows={6}
-          className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent text-sm font-mono"
+          placeholder='{"member_id": "…", "status": 1, "epoch": 42, "merkle_proof": [...], "root": "…"}'
         />
-        {parseError && (
-          <p className="text-red-600 text-sm mt-2">{parseError}</p>
-        )}
-        <button
-          onClick={parseProof}
-          disabled={!jsonInput.trim()}
-          className="mt-3 px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 transition-colors font-medium disabled:opacity-50 text-sm"
-        >
-          Visualize
-        </button>
-      </div>
+        {parseError && <p className="text-red-600 text-sm mt-2">{parseError}</p>}
+        <div className="mt-3">
+          <Button onClick={parseProof} disabled={!jsonInput.trim()} full>
+            Visualize
+          </Button>
+        </div>
+      </Card>
 
-      {/* Visualization */}
       {proofData && (
-        <div className="space-y-6">
-          {/* Summary */}
-          <div className="bg-white rounded-lg border border-gray-200 p-6">
-            <h2 className="text-lg font-semibold mb-4">Proof Summary</h2>
+        <>
+          <Card title="Proof summary">
             <div className="grid grid-cols-3 gap-4">
               <div className="text-center p-3 bg-gray-50 rounded-lg">
-                <p className="text-2xl font-bold text-primary-600">
-                  {treeDepth}
-                </p>
-                <p className="text-xs text-gray-500">Tree Depth</p>
+                <p className="text-2xl font-bold text-primary-600">{treeDepth}</p>
+                <p className="text-xs text-gray-500">Tree depth</p>
               </div>
               <div className="text-center p-3 bg-gray-50 rounded-lg">
-                <p className="text-2xl font-bold text-primary-600">
-                  ~{Math.pow(2, treeDepth)}
-                </p>
-                <p className="text-xs text-gray-500">Max Tree Size</p>
+                <p className="text-2xl font-bold text-primary-600">~{Math.pow(2, treeDepth)}</p>
+                <p className="text-xs text-gray-500">Max tree size</p>
               </div>
               <div className="text-center p-3 bg-gray-50 rounded-lg">
                 <p className="text-2xl font-bold text-primary-600">
                   ~{gasEstimate.toLocaleString()}
                 </p>
-                <p className="text-xs text-gray-500">Gas Estimate</p>
+                <p className="text-xs text-gray-500">Gas estimate</p>
               </div>
             </div>
-          </div>
+          </Card>
 
-          {/* Tree visualization (ASCII) */}
-          <div className="bg-white rounded-lg border border-gray-200 p-6">
-            <h2 className="text-lg font-semibold mb-4">
-              Merkle Path Visualization
-            </h2>
-            <div className="bg-gray-900 text-green-400 p-4 rounded-lg font-mono text-sm overflow-x-auto">
+          <Card title="Merkle path">
+            <div className="bg-gray-900 text-green-400 p-4 rounded-lg font-mono text-sm overflow-x-auto whitespace-pre">
               <TreeAscii
                 leafIndex={proofData.leafIndex}
                 proof={proofData.merkleProof}
@@ -110,13 +286,9 @@ export default function ProofViewer() {
                 status={proofData.status}
               />
             </div>
-          </div>
+          </Card>
 
-          {/* On-chain verification code */}
-          <div className="bg-white rounded-lg border border-gray-200 p-6">
-            <h2 className="text-lg font-semibold mb-4">
-              Solidity Verification Call
-            </h2>
+          <Card title="Solidity verification call">
             <pre className="bg-gray-900 text-gray-100 p-4 rounded-lg text-xs overflow-x-auto">
               {`oracle.verifyMember(
     policyId,
@@ -128,8 +300,8 @@ export default function ProofViewer() {
     0                        // rootIndex (latest)
 );`}
             </pre>
-          </div>
-        </div>
+          </Card>
+        </>
       )}
     </div>
   );
@@ -157,7 +329,7 @@ function TreeAscii({
   let idx = leafIndex;
   for (let i = depth - 1; i >= 0; i--) {
     const level = depth - i;
-    const indent = "  ".repeat(1);
+    const indent = "  ";
     const isLeft = idx % 2 === 0;
     const sibling = shortHash(proof[i]);
 
@@ -172,9 +344,7 @@ function TreeAscii({
     idx = Math.floor(idx / 2);
   }
 
-  lines.push(
-    `  Leaf[${leafIndex}]: status=${status === 1 ? "SOLVENT" : "INSOLVENT"}`
-  );
+  lines.push(`  Leaf[${leafIndex}]: status=${status === 1 ? "SOLVENT" : "INSOLVENT"}`);
 
   return <>{lines.join("\n")}</>;
 }

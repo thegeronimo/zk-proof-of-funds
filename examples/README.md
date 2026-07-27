@@ -2,9 +2,29 @@
 
 This directory contains complete integration examples showing how to use the ZK Proof of Funds solvency system in different contexts.
 
+## Which model should I integrate against?
+
+There are two, and they present the **same identity** to your contract — a
+32-byte value you can key storage by — so you can support either without
+changing your accounting.
+
+| | Monitored mode (V1) | Solvent-set mode (V2) |
+|---|---|---|
+| Interface | `ISolvencyOracle` | `ISolventSetOracle` |
+| User setup | enrolls once with the agent | none — no enrollment at all |
+| Agent knows the user's address | yes | no |
+| What your contract receives | a `memberId` the caller already knew | a nullifier hash *returned* by the proof |
+| Verification cost | ~8k gas (Merkle proof) | SP1 Groth16 verification (~270k) |
+| Time dimension | none | proven streak of consecutive solvent epochs |
+| Anonymity set | enrolled members | every solvent address on the chain |
+
+Choose V1 when gas dominates and enrollment is acceptable. Choose V2 when
+users must not reveal which address they hold funds in, or when you need
+"solvent for >= k epochs" rather than a single snapshot.
+
 ## Solidity Contracts
 
-Example contracts demonstrating the `ISolvencyOracle` integration pattern:
+### Monitored mode — the `ISolvencyOracle` pattern
 
 ### `contracts/SolvencyGatedPool.sol`
 A DeFi lending pool that requires solvency proof for deposits. Only users who prove they hold >= threshold balance can deposit collateral, reducing counterparty risk.
@@ -21,16 +41,36 @@ An NFT collection using solvency proofs as an allowlist mechanism. Replaces trad
 
 **Key pattern**: Gate `mint()` behind `oracle.isMemberSolvent()` with one-mint-per-member enforcement.
 
+### Solvent-set mode — the `ISolventSetOracle` pattern
+
+#### `contracts/SolventSetGatedAirdrop.sol`
+A one-claim-per-person airdrop for wallets that have *continuously* held above
+a threshold, where no one learns which wallets claimed. The claimant never
+enrolled and never revealed an address; the contract learns only a nullifier
+hash.
+
+**Key pattern**: call `oracle.verifyAndConsume()`, then check the returned
+`minStreak` against your own requirement — the oracle enforces that the proof
+attests to *some* minimum, but it cannot know yours. Note also that the payout
+`recipient` is an ordinary argument unrelated to the proven identity: tying it
+to the proving address would undo the unlinkability the proof just bought.
+
 ## TypeScript Integration Scripts
 
 ### `lending-pool-integration.ts`
-Full flow: enrollment, status check, and deposit with proof.
+Monitored mode, full flow: enrollment, status check, and deposit with proof.
 
 ### `governance-voting.ts`
-Voting flow: check eligibility, fetch proof, submit vote.
+Monitored mode voting: check eligibility, fetch proof, submit vote.
 
 ### `nft-gated-mint.ts`
-Mint flow: eligibility check, fetch proof, mint NFT.
+Monitored mode mint: eligibility check, fetch proof, mint NFT.
+
+### `solvent-set-airdrop.ts`
+Solvent-set mode, full flow: download and locally re-verify the set, find
+yourself in it client-side, decode and cross-check the proof's public values,
+then claim. Shows the `zkpof-client` handoff — proof generation is native
+because SP1 cannot prove in JavaScript and the nullifier needs raw key access.
 
 ## How to Run
 
@@ -65,7 +105,9 @@ forge create examples/contracts/SolvencyGatedPool.sol:SolvencyGatedPool \
 
 ## Integration Pattern
 
-All examples follow the same pattern:
+### Monitored mode (V1)
+
+The three `SolvencyGated*` examples follow this pattern:
 
 ```
                     +-----------+
@@ -100,6 +142,44 @@ All examples follow the same pattern:
                     +-----------+
 ```
 
+### Solvent-set mode (V2)
+
+`SolventSetGatedAirdrop` inverts who does the work — note that nothing flows
+from the user to the agent:
+
+```
+                    +-----------+
+                    |   User    |
+                    +-----+-----+
+                          |
+            1. GET /v2/solvent_set/{policyId}/leaves   (downloads ALL of it)
+                          |
+                    +-----v-----+
+                    |  Solvency  |  sees only "someone fetched the set"
+                    |   Agent    |  — never a query about an address
+                    +-----+-----+
+                          |
+            2. Rebuild root + locate self, entirely client-side
+                          |
+                    +-----v------+
+                    | zkpof-client|  (native; SP1 cannot prove in a browser,
+                    |  prove      |   and the nullifier needs the raw key)
+                    +-----+------+
+                          |
+            3. (proofBytes, publicValues) — no address, no enrollment
+                          |
+                    +-----v-----+
+                    | Your dApp  |  oracle.verifyAndConsume(...)
+                    +-----+-----+
+                          |
+            4. Returns nullifierHash + minStreak; you check minStreak >= k
+                          |
+                    +-----v-----+
+                    | On-Chain   |  (SolventSetOracle)
+                    | Oracle     |
+                    +-----------+
+```
+
 ## Gas Costs
 
 | Operation | Gas Cost |
@@ -108,6 +188,18 @@ All examples follow the same pattern:
 | `verifyMember()` | ~8k |
 | `isMemberSolvent()` | ~9k |
 | Deposit with proof | ~30k + proof verification |
+| `publishRoot()` (Stage A) | ~114k (measured, median) |
+| `verifyMembership()` contract logic | ~37k (measured, median) |
+| `verifyAndConsume()` contract logic | ~88k (measured, median) |
+| SP1 Groth16 verification | ~270k |
+
+> The measured V2 figures come from `forge test --gas-report`, which uses
+> `MockSP1Verifier` — they are the oracle's own logic and **exclude** proof
+> verification. Add the ~270k Groth16 cost for a real end-to-end call.
+
+The V2 verification cost is the price of the privacy and the streak guarantee:
+a full Groth16 verification rather than a Merkle path walk. It is constant
+regardless of set size.
 | Vote with proof | ~50k + proof verification |
 | Mint with proof | ~80k + proof verification |
 

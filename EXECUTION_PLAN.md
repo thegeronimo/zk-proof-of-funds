@@ -846,3 +846,137 @@ The path that works is wallet-native PLUME via **ERC-7524**
 - [ ] Scan-range provenance (pin deployment block or a proven checkpoint)
 - [ ] ERC-7524 proof-format adapter (against reference vectors)
 - [ ] Browser-native prover (dedicated circuit + trusted setup ceremony)
+
+---
+
+## Phase 14: Front-End Parity — Surfacing Privacy V2 in the App
+
+Closes PRIVACY_V2.md §6 rollout item 6. Phases 10–13 built the V2 protocol
+(nullifiers, solvent sets, streaks, proven derivation, completeness), but the
+React app still led with the V1 monitored-mode flow and exposed V2 through a
+single read-only panel. Everything below is UI/SDK work against already-shipped
+backend, contract, and crypto code — no protocol changes.
+
+### Constraint that shapes the design
+
+SP1 cannot prove in a browser (PRIVACY_V2.md §7), and PLUME nullifiers need raw
+key access, which browser wallets do not grant. So two steps of the V2 flow are
+*structurally* CLI-bound. The app does not pretend otherwise: it drives the user
+to the exact `zkpof-client` invocation with every flag pre-filled, then accepts
+the CLI's JSON output back and verifies it client-side. The handoff is the
+feature, not a gap to hide.
+
+### Design decisions
+
+- **D1 — Lead with V2.** `/` becomes the guided prove flow. V1 monitored mode
+  moves to `/monitored` and is labeled as such; it is not deleted (trusted-mode
+  policies still use it).
+- **D2 — Three key-handling paths, in preference order.** (a) generated
+  `zkpof-client` command, copy-paste, no key in the browser; (b) feature-detect
+  `eth_getPlumeSignature` (ERC-7524) and report support honestly — consuming a
+  wallet-produced *proof* still needs the §7 adapter; (c) an explicitly gated
+  "local key — dev only" path using `sdk/plume`, which computes the nullifier
+  in-browser and transmits only public data. (c) is off by default behind a
+  warning and never persists the key.
+- **D3 — Trust nothing served.** Every root is rebuilt locally, every set of
+  public values is decoded and cross-checked field-by-field against what the UI
+  independently knows, and the on-chain entry is read directly from
+  `SolventSetOracle` rather than taken from the agent.
+- **D4 — Policies are picked, not pasted.** `config/policies.json` becomes the
+  app's catalog; raw hex entry stays available as an escape hatch.
+
+### Tasks
+
+- [x] **14.1 Foundations.** Vite alias + `fs.allow` for `config/policies.json`;
+  `web/src/config/policies.ts` (typed catalog, threshold/token/chain metadata)
+  and `contracts.ts` (oracle + registry addresses from `VITE_*` env, minimal
+  ABIs); shared UI primitives (`PolicyPicker`, `CopyButton`, `Field`,
+  `CodeBlock`, `Callout`, `StatusPill`, `Stepper`); `usePolicySelection` hook
+  with localStorage persistence so the policy follows the user across tabs.
+- [x] **14.2 SDK parity.** Add `buildSolventSet()` and `triggerEpoch()` (the two
+  backend routes with no client method) and a zero-dep
+  `decodeMembershipPublicValues()` for the 224-byte ABI, with unit tests. Export
+  the V2 admin types.
+- [x] **14.3 Prove flow (`/`).** The centerpiece, four steps: pick policy →
+  download + locally rebuild the set (with provenance) → locate address and read
+  the streak locally → generate the `zkpof-client prove` command, paste its
+  output back, decode and verify the public values, and emit
+  `verifyMembership` / `verifyAndConsume` calldata for the relying dApp.
+- [x] **14.4 Solvent-set explorer (`/set`).** The existing panel plus: on-chain
+  entry comparison (root match, `proven` flag, `publishedAt`, TTL expiry),
+  scope-hash display against `effectiveScopeHash`, a paginated entry table with
+  streak distribution, and a raw-download button.
+- [x] **14.5 Identity (`/identity`).** Derive scope hash and nullifier/memberId
+  for a policy; show that this identity equals the monitored-mode `member_id`;
+  V2 enrollment via the three D2 paths; `isNullifierUsed` check on-chain.
+- [x] **14.6 Verify (`/verify`).** Decode pasted V2 public values without any
+  other context (the dApp-integrator view), plus the retained V1 Merkle proof
+  visualizer, split into two clearly labeled modes.
+- [x] **14.7 Operator (`/operator`).** Build a solvent set (Stage A / Stage B
+  proven / ERC-20 with `balance_slot` and Transfer-log discovery), trigger a V1
+  epoch, and browse members and epoch history.
+- [x] **14.8 Verification.** Seed a dev SQLite DB via `build_from_balances`
+  (no RPC needed), run the real backend, and drive the full flow in a browser.
+  `npm run typecheck` and `npm run build` clean for both `sdk/` and `web/`.
+
+### Deliverables
+
+- Every shipped backend route, SDK function, and oracle read reachable from the UI
+- The V2 flow demonstrable end-to-end against a real agent, with the CLI handoff
+  as an explicit, guided step
+- PRIVACY_V2.md §6 item 6 closed
+
+### Delivered
+
+- **IA reordered around V2**: `/` is the prove flow; monitored mode moved to
+  `/monitored` and is labeled legacy. Old routes redirect.
+- **Policy catalog**: `config/policies.json` drives a picker shared by every
+  screen, persisted in localStorage and surfaced in the header.
+- **CLI handoff made exact**: the prove and identity screens emit fully
+  populated `zkpof-client` commands and verify the JSON that comes back —
+  decoding the 224-byte public values and cross-checking the root against the
+  tree the *browser* rebuilt, plus policy, epoch, chain, scope, and streak.
+- **On-chain provenance**: `SolventSetOracle` reads show whether a root was
+  published at all, whether it was `proven`, when it expires, the effective
+  scope hash, the membership vkey, and whether a nullifier was consumed.
+- **SDK parity**: `buildSolventSet`, `triggerEpoch`, and
+  `decodeMembershipPublicValues` / `checkMembershipPublicValues` (zero-dep,
+  10 unit tests, cross-language vector shared with
+  `crates/common/src/membership.rs`).
+- **`zkpof-devseed`**: seeds a solvent set from synthetic balances via
+  `build_from_balances`, so the whole client flow is exercisable without RPC.
+
+### Fixed in passing
+
+`/submit_proof`, `/proof`, `/status`, and the three `/admin` routes did not
+canonicalize their path parameters, so a `0x`-prefixed policy or member ID
+matched no row and returned an empty result rather than an error — an empty
+member list read as "no members" instead of "wrong format". The V2 routes
+already normalized via `parse_policy_id`; all routes now do (`canonical_hex`).
+
+### Post-phase follow-ups (landed after the initial commit)
+
+- **On-chain read path verified against a live deployment.** The oracle panels
+  had only ever been exercised in their "not configured" state. Deploying
+  `SolventSetOracle` + `PolicyRegistry` to anvil and publishing the seeded
+  agent's exact root confirmed every field (root match, epoch, member count,
+  TTL from the registry, scope hash, membership vkey), both the
+  operator-asserted and proven badge states, and that the generated
+  `verifyMembership` / `verifyAndConsume` selectors match the implementation.
+- **Bug this surfaced:** reads resolved their RPC via `usePublicClient()` with
+  no chain, so they followed wagmi's first configured chain rather than the
+  oracle's. Fixed by pinning `VITE_ORACLE_CHAIN_ID` (falling back to the
+  policy's `chain_id`), plus a warning when a proof's committed chainId
+  disagrees with the oracle's — that combination reverts on-chain.
+- **Docs and integrator parity.** `USER_GUIDE.md` now leads with the
+  no-enrollment flow, has corrected navigation, and documents all 12 API
+  routes (was 6, none of them V2). Added `ISolventSetOracle` and a worked
+  `SolventSetGatedAirdrop` example + TypeScript script.
+
+### Known gaps (unchanged by this phase)
+
+- Proof generation stays in `zkpof-client`: SP1 cannot prove in a browser.
+- `eth_getPlumeSignature` is feature-detected but a wallet-produced proof
+  cannot be consumed without the ERC-7524 format adapter.
+- The end-to-end run below was verified against a seeded agent; a real Groth16
+  proof was not generated, as that needs the SP1 toolchain and a built ELF.

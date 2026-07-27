@@ -11,6 +11,7 @@
 
 use anyhow::{Context, Result};
 use sp1_sdk::blocking::{Elf, Prover, ProveRequest, ProverClient, SP1Stdin};
+use sp1_sdk::{HashableKey, ProvingKey};
 use std::path::PathBuf;
 use tracing::info;
 
@@ -128,7 +129,7 @@ pub fn prove_derivation(
     chain_id: u64,
     threshold_wei: u128,
     token: Option<&TokenConfig>,
-) -> Result<(Vec<u8>, DerivationPublicValues)> {
+) -> Result<(Vec<u8>, DerivationPublicValues, String)> {
     let client = ProverClient::builder().cpu().build();
     let elf = Elf::Static(Box::leak(elf_bytes.into_boxed_slice()));
     let stdin = build_derivation_stdin(
@@ -139,6 +140,9 @@ pub fn prove_derivation(
     let pk = client
         .setup(elf)
         .context("SP1 setup (key generation) failed")?;
+    // Returned alongside the proof: a proof means nothing without the vkey it
+    // was produced under, and setup is far too expensive to run twice.
+    let vkey = pk.verifying_key().bytes32();
 
     info!("Generating SP1 Groth16 derivation proof (this will take a while)");
 
@@ -149,5 +153,5 @@ pub fn prove_derivation(
         .context("SP1 derivation proof generation failed")?;
 
     let public_values = DerivationPublicValues::abi_decode(proof.public_values.as_slice())?;
-    Ok((proof.bytes(), public_values))
+    Ok((proof.bytes(), public_values, vkey))
 }

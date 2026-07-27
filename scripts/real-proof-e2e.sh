@@ -120,12 +120,37 @@ fi
 # ── 3. Real Groth16 proofs (requires Docker or the prover network) ──────────
 
 if [ "${CAN_PROVE}" = "1" ]; then
-  step "Generating real Groth16 proofs"
-  echo "TODO: wire prove_derivation / prove_membership / prove_scan here and"
-  echo "      submit them against a deployed SP1VerifierGroth16."
-  echo "      Tracked as the remaining half of Phase 15.6."
+  step "Generating a real Groth16 derivation proof"
+  # Release build: a debug-built prover is unusably slow.
+  cargo run --release --quiet --bin zkpof-e2e -- derivation \
+    || fail "Groth16 proof generation failed"
+
+  step "Verifying the real proof against the real deployed SP1 verifier"
+  # This is the link nothing else in the repo covers: actual guest ELF ->
+  # actual Groth16 wrap -> actual on-chain verifier. It also asserts that
+  # tampered public values and a wrong vkey are rejected, without which
+  # "it verified" would prove nothing.
+  if ! command -v anvil >/dev/null; then
+    fail "anvil is required for the on-chain verification leg"
+  fi
+  anvil --silent --port 8546 &
+  PROVE_ANVIL_PID=$!
+  trap 'kill ${PROVE_ANVIL_PID} 2>/dev/null || true' EXIT
+  for _ in $(seq 1 50); do
+    cast block-number --rpc-url http://127.0.0.1:8546 >/dev/null 2>&1 && break
+    sleep 0.2
+  done
+
+  export DEPLOYER_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+  (cd "${ROOT}/contracts" && forge script script/RealProofE2E.s.sol \
+      --rpc-url http://127.0.0.1:8546 --broadcast) \
+    || fail "the real proof was NOT accepted by the deployed SP1 verifier"
+
+  kill ${PROVE_ANVIL_PID} 2>/dev/null || true
+  REAL_PROOF_VERIFIED=1
 else
   step "Skipping real Groth16 proofs (no Docker / prover network)"
+  REAL_PROOF_VERIFIED=0
 fi
 
 # ── 4. Contract-level end-to-end + mutation matrix ──────────────────────────
@@ -179,16 +204,30 @@ DONE here:
   - contract-level publish/verify with a one-field-at-a-time mutation matrix
   - live deployment to anvil
 
+NOTES
+
+if [ "${REAL_PROOF_VERIFIED:-0}" = "1" ]; then
+  cat <<'NOTES'
+  - a REAL Groth16 derivation proof, verified by the REAL deployed
+    SP1VerifierGroth16 v6.0.0, with tampered-publics and wrong-vkey both
+    rejected
+
+Still outstanding: the same round trip for the membership and receipt-scan
+programs, and driving it through publishRootProven end to end rather than
+verifying the proof directly.
+NOTES
+else
+  cat <<'NOTES'
+
 STILL REQUIRED for the real-Groth16 claim (needs Docker + ~16 GB RAM, or
 SP1_PROVER=network with a NETWORK_PRIVATE_KEY):
   - generate real Groth16 proofs for membership / derivation / receipt scan
-  - deploy SP1VerifierGroth16 and configure the oracle with the derived vkeys
-  - submit publishRootProven + verifyMembership against that real verifier
-  - re-run the mutation matrix against real proofs, where a mutated public
-    value must fail SNARK verification rather than a contract check
+  - deploy SP1VerifierGroth16 and verify them against it
+  - drive publishRootProven + verifyMembership through that real verifier
 
 Until that passes, the demo is a PROTOCOL SIMULATION: the contract logic is
 verified, the proof system integration is not.
 NOTES
+fi
 
 step "Artifact manifest written to ${MANIFEST}"

@@ -378,7 +378,7 @@ async fn main() -> Result<()> {
                     }))?
                 );
             } else {
-                let (proof_bytes, public_values) = membership_prover::prove_membership(
+                let (proof_bytes, public_values, vkey) = membership_prover::prove_membership(
                     elf, &witness, &root, &common.policy_id, epoch, chain_id, min_streak,
                     &common.scope_hash, &context,
                 )?;
@@ -386,6 +386,11 @@ async fn main() -> Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "mode": "groth16",
+                        // The verifier needs this to check the proof at all,
+                        // and it must match the vkey the oracle is configured
+                        // with — a mismatch is the usual cause of an
+                        // otherwise-valid proof being rejected.
+                        "vkey": vkey,
                         "proof_bytes": hex::encode(proof_bytes),
                         "public_values_abi": hex::encode(public_values.abi_encode()),
                         "nullifier_hash": hex::encode(public_values.nullifier_hash),

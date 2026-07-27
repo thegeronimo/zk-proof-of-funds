@@ -119,6 +119,23 @@ fi
 
 # ── 3. Real Groth16 proofs (requires Docker or the prover network) ──────────
 
+# The cheap tier first: a real recursive STARK proof, verified by SP1's own
+# verifier. No Docker, no gnark, none of the ~8 GB Groth16 circuit artifact —
+# just CPU. It establishes that the guest ran and committed exactly these
+# public values, which is the cryptographic core. Run it always.
+step "Generating a real compressed proof (no Docker required)"
+cargo run --release --quiet --bin zkpof-e2e -- derivation-compressed \
+  || fail "compressed proof generation/verification failed"
+
+# The Groth16 wrap is a separate, narrower claim: EVM verifiability. It needs
+# Succinct's sp1-gnark image, published for amd64 ONLY — so it cannot run on
+# Apple Silicon locally at all, regardless of Docker or RAM.
+if [ "$(uname -m)" = "arm64" ] && [ "${SP1_PROVER:-cpu}" = "cpu" ]; then
+  CAN_PROVE=0
+  printf '\033[33mNOTE: sp1-gnark is amd64-only; Groth16 wrapping cannot run on\n'
+  printf '      this arm64 host. Use SP1_PROVER=network or an x86_64 runner.\033[0m\n'
+fi
+
 if [ "${CAN_PROVE}" = "1" ]; then
   step "Generating a real Groth16 derivation proof"
   # Release build: a debug-built prover is unusably slow.

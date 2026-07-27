@@ -14,11 +14,23 @@
 //! real `SP1VerifierGroth16` and submits them.
 //!
 //! Usage:
-//!   zkpof-e2e derivation     # cheapest — one candidate, synthetic trie
-//!   zkpof-e2e membership     # secp256k1 + hash-to-curve; the expensive one
+//!   zkpof-e2e derivation-compressed  # real proof, no gnark/Docker needed
+//!   zkpof-e2e derivation             # + Groth16 wrap (EVM-verifiable)
+//!   zkpof-e2e membership             # secp256k1 + hash-to-curve; expensive
 //!
-//! Requires the SP1 proving stack (Docker, ~16 GB available to the VM) or
-//! SP1_PROVER=network with NETWORK_PRIVATE_KEY.
+//! ## Two tiers, and why the cheap one is worth running
+//!
+//! `*-compressed` produces a **real** STARK proof — the guest genuinely
+//! executed, and SP1's verifier checks it against the vkey. It needs nothing
+//! but CPU: no Docker, no gnark, and none of the ~8 GB Groth16 circuit
+//! artifact. That is enough to establish that the guest, the witness, and the
+//! committed public values all agree cryptographically.
+//!
+//! The Groth16 wrap is a *separate* claim: that the proof is verifiable by a
+//! Solidity contract. It requires Succinct's `sp1-gnark` Docker image, which
+//! is published for **amd64 only** — so on Apple Silicon this tier cannot run
+//! locally at all, with or without Docker. Use SP1_PROVER=network, or an
+//! x86_64 machine/CI runner.
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
@@ -48,6 +60,75 @@ fn write_bundle(name: &str, value: serde_json::Value) -> Result<()> {
 /// Prove the Stage B derivation statement over a single-candidate synthetic
 /// trie. Cheapest of the three, so it is the honest first check that the
 /// proving stack works at all on this machine.
+/// Prove the derivation statement without the Groth16 wrap.
+///
+/// The cheap tier: a real recursive STARK proof, verified by SP1's own
+/// verifier. Establishes that the guest ran and committed exactly these
+/// public values — no mock, no emulator. What it deliberately does not
+/// establish is EVM verifiability, which is the Groth16 wrap's job.
+fn prove_derivation_compressed() -> Result<()> {
+    use sp1_sdk::blocking::{Elf, Prover, ProveRequest, ProverClient};
+    use sp1_sdk::{HashableKey, ProvingKey};
+
+    let address = [0x42u8; 20];
+    let (state_root, proof_nodes) = fixtures::single_leaf_proof(address, 5 * ONE_ETH);
+    let witness = DerivationWitness {
+        candidates: vec![CandidateProof { address, proof_nodes }],
+        prev_entries: vec![],
+        token_account_proof: vec![],
+    };
+
+    let elf_bytes = derivation_prover::load_derivation_elf()
+        .context("build it first: cd program-solvent-set && cargo prove build")?;
+    let stdin = derivation_prover::build_derivation_stdin(
+        &witness, &state_root, &POLICY_ID, 1, 19_000_000, 0, CHAIN_ID, ONE_ETH, None,
+    );
+
+    let client = ProverClient::builder().cpu().build();
+    let elf = Elf::Static(Box::leak(elf_bytes.into_boxed_slice()));
+
+    println!("SP1 setup (key generation)...");
+    let pk = client.setup(elf).context("SP1 setup failed")?;
+    let vkey = pk.verifying_key().bytes32();
+
+    println!("Generating a real compressed (recursive STARK) proof...");
+    let proof = client
+        .prove(&pk, stdin)
+        .compressed()
+        .run()
+        .context("compressed proof generation failed")?;
+
+    // The point of the exercise: an independent check that the proof is valid
+    // for this vkey. Without this the run would only show that proving did not
+    // crash.
+    client
+        .verify(&proof, pk.verifying_key(), None)
+        .context("SP1 REJECTED the proof it had just generated")?;
+    println!("== REAL COMPRESSED PROOF GENERATED AND VERIFIED ==");
+
+    let public_values =
+        zk_pof_common::solvent_derivation::DerivationPublicValues::abi_decode(
+            proof.public_values.as_slice(),
+        )?;
+    println!("  vkey        : {vkey}");
+    println!("  set root    : 0x{}", hex::encode(public_values.solvent_set_root));
+    println!("  member count: {}", public_values.member_count);
+
+    write_bundle(
+        "derivation-compressed",
+        serde_json::json!({
+            "program": "program-solvent-set",
+            "proof_kind": "compressed",
+            "evm_verifiable": false,
+            "vkey": vkey,
+            "public_values": format!("0x{}", hex::encode(public_values.abi_encode())),
+            "note": "Real recursive STARK proof, verified by the SP1 verifier. \
+                     NOT EVM-verifiable — that needs the Groth16 wrap, whose \
+                     gnark image is amd64-only.",
+        }),
+    )
+}
+
 fn prove_derivation() -> Result<()> {
     let address = [0x42u8; 20];
     let (state_root, proof_nodes) = fixtures::single_leaf_proof(address, 5 * ONE_ETH);
@@ -174,10 +255,12 @@ fn prove_membership() -> Result<()> {
 fn main() -> Result<()> {
     let which = std::env::args().nth(1).unwrap_or_default();
     match which.as_str() {
+        "derivation-compressed" => prove_derivation_compressed(),
         "derivation" => prove_derivation(),
         "membership" => prove_membership(),
         other => bail!(
-            "unknown target {other:?}. Usage: zkpof-e2e <derivation|membership>"
+            "unknown target {other:?}. Usage: zkpof-e2e \
+             <derivation-compressed|derivation|membership>"
         ),
     }
 }

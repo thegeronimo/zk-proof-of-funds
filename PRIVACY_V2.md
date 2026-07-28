@@ -1,6 +1,9 @@
 # Privacy V2 — Solvent-Set Membership & Deterministic Nullifiers
 
-**Status**: Implemented (Phase 10 + Phase 11 — see EXECUTION_PLAN.md)
+**Status**: Implemented through Phase 16. The protocol-soundness remediation
+from the 2026-07 external review (Phases 15-16) has landed — see the Phase 15
+amendments below, which are **normative and supersede the earlier sizes**.
+Not yet demonstrated end to end with an EVM-verifiable proof; see STATUS.md.
 **Depends on**: ARCHITECTURE.md (V1 batch model), Phase 9 (ZK privacy mode)
 
 > **Phase 11 amendments** (normative): solvent-set leaves are streak-aware

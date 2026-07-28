@@ -1142,7 +1142,7 @@ acceptable — nothing is deployed beyond dev/anvil.
 
 ### 15.6 Real cryptographic end-to-end (R6)
 
-- [ ] CI job (self-hosted or Succinct network) that builds every guest ELF,
+- [x] CI job (`.github/workflows/real-proof-e2e.yml`) that builds every guest ELF,
       generates real Groth16 proofs for: membership, native-ETH derivation,
       ERC-20 derivation, receipt scan; verifies each against the **deployed**
       SP1 verifier + oracle on anvil; then mutates one field at a time (proof
@@ -1151,7 +1151,7 @@ acceptable — nothing is deployed beyond dev/anvil.
       rust/SP1 versions, ELF hashes, vkeys, verifier address + bytecode hash,
       public-values schema version, proof size, proving time/memory,
       verification gas.
-- [ ] Until this passes: all demo surfaces label proofs "simulation".
+- [x] Until this passes: all demo surfaces label proofs "simulation".
 
 ### Exit criteria
 

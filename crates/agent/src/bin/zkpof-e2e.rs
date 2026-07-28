@@ -1,5 +1,5 @@
-//! zkpof-e2e — generate **real** Groth16 proofs and emit the artifacts an
-//! on-chain E2E needs (EXECUTION_PLAN.md Phase 15.6).
+//! zkpof-e2e — generate **real** proofs and emit the artifacts an on-chain
+//! E2E needs (EXECUTION_PLAN.md Phase 15.6).
 //!
 //! Everything else in the test suite verifies the code *around* the proof
 //! system: ABI encoding, contract bindings, host/guest mirror equivalence.
@@ -57,9 +57,6 @@ fn write_bundle(name: &str, value: serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-/// Prove the Stage B derivation statement over a single-candidate synthetic
-/// trie. Cheapest of the three, so it is the honest first check that the
-/// proving stack works at all on this machine.
 /// Prove the derivation statement without the Groth16 wrap.
 ///
 /// The cheap tier: a real recursive STARK proof, verified by SP1's own
@@ -129,6 +126,10 @@ fn prove_derivation_compressed() -> Result<()> {
     )
 }
 
+/// Prove the Stage B derivation statement and wrap it to Groth16.
+///
+/// Same single-candidate witness as the compressed tier — the wrap is what
+/// differs, and it is the only part that makes the proof EVM-verifiable.
 fn prove_derivation() -> Result<()> {
     let address = [0x42u8; 20];
     let (state_root, proof_nodes) = fixtures::single_leaf_proof(address, 5 * ONE_ETH);

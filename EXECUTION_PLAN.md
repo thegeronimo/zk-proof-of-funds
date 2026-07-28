@@ -1,5 +1,9 @@
 # ZK Proof of Funds — Solvency Agent Execution Plan
 
+> **Looking for current status?** See [STATUS.md](STATUS.md) — what works,
+> what does not, and what is next, in one page. This file is the full
+> phase-by-phase record.
+
 ## Phase Overview
 
 | Phase | Name | Goal | Estimated Effort | Status |
@@ -19,10 +23,10 @@
 | 12 | Privacy V2 Follow-ups | ERC-20 proven builds, Stage B.2 completeness, wallet crypto, vkeys | 3-5 days | ✅ DONE |
 | 13 | Privacy V2 Closeout | ERC-7524 nullifiers + scopes, on-chain completeness, witness tooling | 3-5 days | ✅ DONE |
 | 14 | Front-End Parity | Guided V2 prove flow, identity, on-chain provenance in the app | 3-5 days | ✅ DONE |
-| 15 | Protocol Soundness | External-review release blockers: MPT, streaks, scan pinning, config versioning, proof binding, real E2E | 10-15 days | 🔴 NEXT |
-| 16 | Ops Hardening & Honest Presentation | Authenticated control plane, fail-closed UI, real verification, copy audit | 5-8 days | 🟠 ∥ 15 |
-| 17 | User-Proof Boundary Rework | Mode A/B split, browser-prover spike (gate G1), demo restructure | 8-12 days | 🟡 after 15 |
-| 18 | Strategic Prototypes | Direct EIP-1186 state proof (gate G2), deferred capabilities | 8-12 days | 🟢 after 15-16 |
+| 15 | Protocol Soundness | External-review release blockers: MPT, streaks, scan pinning, config versioning, proof binding, real E2E | 10-15 days | ✅ DONE (except external `mpt.rs` review) |
+| 16 | Ops Hardening & Honest Presentation | Authenticated control plane, fail-closed UI, real verification, copy audit | 5-8 days | ✅ DONE |
+| 17 | User-Proof Boundary Rework | Mode A/B split, browser-prover spike (gate G1), demo restructure | 8-12 days | 🟡 NEXT (gate G1) |
+| 18 | Strategic Prototypes | Direct EIP-1186 state proof (gate G2), deferred capabilities | 8-12 days | 🟢 after 17 |
 
 **Total estimated effort: 28-46 days (through Phase 14) + 31-47 days (Phases 15-18)**
 

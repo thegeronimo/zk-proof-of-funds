@@ -35,8 +35,10 @@ contract E2EOracle is SolventSetOracle {
 /// the class of bug the external review found (`numBlocks` was decoded and
 /// discarded; the presentation context did not exist at all).
 ///
-/// The SNARK itself is mocked here: local Groth16 wrapping needs Docker and
-/// ~16 GB of RAM, so `scripts/real-proof-e2e.sh` covers that leg separately.
+/// The SNARK itself is mocked here. Real proving lives in
+/// `scripts/real-proof-e2e.sh`: the compressed tier runs anywhere, while the
+/// Groth16 wrap needs Succinct's `sp1-gnark` image, which is published for
+/// amd64 only — so it runs in CI or on an x86_64 host, not on Apple Silicon.
 /// Everything *around* the SNARK — decode, bind, compare, store — is the same
 /// code a real proof travels through, and that is what these mutations probe.
 contract E2EMutationTest is Test {

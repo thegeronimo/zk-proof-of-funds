@@ -75,11 +75,18 @@ export const SOLVENT_SET_ORACLE_ABI = [
         type: "tuple",
         components: [
           { name: "root", type: "bytes32" },
+          { name: "policyConfigHash", type: "bytes32" },
+          { name: "membershipVKey", type: "bytes32" },
+          { name: "derivationVKey", type: "bytes32" },
           { name: "epoch", type: "uint64" },
           { name: "blockNumber", type: "uint64" },
           { name: "publishedAt", type: "uint64" },
+          { name: "validUntil", type: "uint64" },
           { name: "memberCount", type: "uint32" },
-          { name: "proven", type: "bool" },
+          { name: "provenance", type: "uint8" },
+          { name: "scanStartBlock", type: "uint64" },
+          { name: "scanEndBlock", type: "uint64" },
+          { name: "revoked", type: "bool" },
         ],
       },
     ],
@@ -182,12 +189,44 @@ export const POLICY_REGISTRY_ABI = [
   },
 ] as const;
 
+/**
+ * How a root's contents were established. Mirrors
+ * `SolventSetOracle.Provenance` — deliberately not a boolean, because
+ * "balances were proven" and "the candidate list was complete" are different
+ * claims and the old single `proven` flag conflated them.
+ */
+export enum Provenance {
+  /** The operator asserted this set. No cryptographic backing. */
+  OperatorAsserted = 0,
+  /** Every listed candidate's balance was proven. Says nothing about omissions. */
+  BalancesProven = 1,
+  /** Balances proven AND the candidate list covers a proven block range. */
+  RangeScanProven = 2,
+}
+
+/** Human-readable, deliberately non-overstated provenance labels. */
+export const PROVENANCE_LABEL: Record<Provenance, string> = {
+  [Provenance.OperatorAsserted]: "Operator-asserted",
+  [Provenance.BalancesProven]: "Balances proven (list may omit holders)",
+  [Provenance.RangeScanProven]: "Balances proven + list covers scanned range",
+};
+
 /** The on-chain set entry, as returned by `getSetEntry`. */
 export interface OnChainSetEntry {
   root: string;
+  /** Policy semantics in force when this root was published. */
+  policyConfigHash: string;
+  /** The vkeys this root was accepted under (rotation does not affect it). */
+  membershipVKey: string;
+  derivationVKey: string;
   epoch: bigint;
   blockNumber: bigint;
   publishedAt: bigint;
+  /** Absolute expiry, pinned at publication from the source block. */
+  validUntil: bigint;
   memberCount: number;
-  proven: boolean;
+  provenance: Provenance;
+  scanStartBlock: bigint;
+  scanEndBlock: bigint;
+  revoked: boolean;
 }

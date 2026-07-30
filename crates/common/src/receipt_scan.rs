@@ -10,10 +10,13 @@
 //!
 //! ```text
 //! Private:  headers[0..n], per-block receipt-trie nodes
-//! Public:   end_block_hash, num_blocks, token, participants_root, participant_count
+//! Public:   end_block_hash, start_block, end_block, num_blocks, token,
+//!           participants_root, participant_count
 //!
 //! 1. for i in 1..n: parse(headers[i]).parent_hash == keccak(headers[i-1])
-//!    (a contiguous, unbroken header chain)
+//!    AND parse(headers[i]).number == start_block + i
+//!    (a contiguous, unbroken header chain whose *range* is proven, not
+//!    asserted — external review finding R3)
 //! 2. per block: enumerate the ENTIRE receipts trie from the header's
 //!    receiptsRoot — every branch child must resolve (missing node aborts),
 //!    so no receipt can be hidden
@@ -22,13 +25,18 @@
 //! 4. participants_root = CandidatesRoot(participants)   (same commitment the
 //!    derivation proof exposes as candidates_root — equality of the two roots
 //!    is the composition check)
-//! 5. commit abi.encode(end_block_hash, num_blocks, token, participants_root,
-//!                      participant_count)
+//! 5. commit abi.encode(end_block_hash, start_block, end_block, num_blocks,
+//!                      token, participants_root, participant_count)
 //! ```
 //!
-//! An on-chain verifier binds `end_block_hash` to the chain via `blockhash`
-//! and checks `participants_root == derivation.candidates_root` (composition
-//! is documented future work; both commitment surfaces exist as of Phase 12).
+//! An on-chain verifier binds `end_block_hash` to the chain (via EIP-2935,
+//! which serves ~8191 ancestor hashes and so leaves room for a real proving
+//! job), records the covered range, and checks
+//! `participants_root == derivation.candidates_root`.
+//!
+//! **Completeness is relative to the scanned range**, never absolute: a root
+//! published this way is `Provenance.RangeScanProven`, and no surface may
+//! describe it as simply "complete".
 //!
 //! Witness building (fetching raw receipts and reconstructing the tries) is
 //! operator-side tooling, out of scope here — any full node can produce it
@@ -55,6 +63,9 @@ pub struct HeaderInfo {
     pub parent_hash: [u8; 32],
     pub state_root: [u8; 32],
     pub receipts_root: [u8; 32],
+    /// Header item 8. Read from the header itself so the scan's block range
+    /// is *proven* rather than asserted by the operator (review finding R3).
+    pub number: u64,
 }
 
 /// Private inputs to the scan statement.
@@ -71,7 +82,14 @@ pub struct ScanWitness {
 pub struct ScanPublicValues {
     /// `keccak256` of the last (newest) header — bind via `blockhash` on-chain.
     pub end_block_hash: [u8; 32],
-    /// Number of contiguous blocks scanned.
+    /// First block of the scanned range (inclusive). Without this the range
+    /// is unpinned and a one-block scan is indistinguishable from a full
+    /// history scan (external review finding R3).
+    pub start_block: u64,
+    /// Last block of the scanned range (inclusive).
+    pub end_block: u64,
+    /// Number of contiguous blocks scanned; must equal
+    /// `end_block - start_block + 1`.
     pub num_blocks: u64,
     /// The token whose Transfer participants were collected.
     pub token: [u8; 20],
@@ -81,14 +99,19 @@ pub struct ScanPublicValues {
     pub participant_count: u32,
 }
 
-/// ABI-encoded size: five 32-byte words.
-pub const SCAN_PUBLIC_VALUES_LEN: usize = 160;
+/// ABI-encoded size: seven 32-byte words.
+pub const SCAN_PUBLIC_VALUES_LEN: usize = 224;
 
 impl ScanPublicValues {
-    /// `abi.encode(bytes32, uint64, address, bytes32, uint32)` — 160 bytes.
+    /// `abi.encode(bytes32, uint64, uint64, uint64, address, bytes32, uint32)`
+    /// — 224 bytes.
     pub fn abi_encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(SCAN_PUBLIC_VALUES_LEN);
         out.extend_from_slice(&self.end_block_hash);
+        out.extend_from_slice(&[0u8; 24]);
+        out.extend_from_slice(&self.start_block.to_be_bytes());
+        out.extend_from_slice(&[0u8; 24]);
+        out.extend_from_slice(&self.end_block.to_be_bytes());
         out.extend_from_slice(&[0u8; 24]);
         out.extend_from_slice(&self.num_blocks.to_be_bytes());
         out.extend_from_slice(&[0u8; 12]);
@@ -99,7 +122,7 @@ impl ScanPublicValues {
         out
     }
 
-    /// Decode and validate a 160-byte public-values blob.
+    /// Decode and validate a 224-byte public-values blob.
     pub fn abi_decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != SCAN_PUBLIC_VALUES_LEN {
             bail!(
@@ -108,22 +131,41 @@ impl ScanPublicValues {
                 bytes.len()
             );
         }
-        if bytes[32..56] != [0u8; 24] || bytes[64..76] != [0u8; 12] || bytes[128..156] != [0u8; 28]
+        if bytes[32..56] != [0u8; 24]
+            || bytes[64..88] != [0u8; 24]
+            || bytes[96..120] != [0u8; 24]
+            || bytes[128..140] != [0u8; 12]
+            || bytes[192..220] != [0u8; 28]
         {
             bail!("Invalid scan public values: nonzero padding");
         }
         let mut end_block_hash = [0u8; 32];
         end_block_hash.copy_from_slice(&bytes[0..32]);
         let mut token = [0u8; 20];
-        token.copy_from_slice(&bytes[76..96]);
+        token.copy_from_slice(&bytes[140..160]);
         let mut participants_root = [0u8; 32];
-        participants_root.copy_from_slice(&bytes[96..128]);
+        participants_root.copy_from_slice(&bytes[160..192]);
+        let start_block = u64::from_be_bytes(bytes[56..64].try_into().unwrap());
+        let end_block = u64::from_be_bytes(bytes[88..96].try_into().unwrap());
+        let num_blocks = u64::from_be_bytes(bytes[120..128].try_into().unwrap());
+        // The range must be internally consistent; the contract enforces the
+        // same rule, but rejecting here keeps the host mirror honest too.
+        if end_block < start_block || num_blocks != end_block - start_block + 1 {
+            bail!(
+                "Inconsistent scan range: [{}, {}] does not span {} blocks",
+                start_block,
+                end_block,
+                num_blocks
+            );
+        }
         Ok(Self {
             end_block_hash,
-            num_blocks: u64::from_be_bytes(bytes[56..64].try_into().unwrap()),
+            start_block,
+            end_block,
+            num_blocks,
             token,
             participants_root,
-            participant_count: u32::from_be_bytes(bytes[156..160].try_into().unwrap()),
+            participant_count: u32::from_be_bytes(bytes[220..224].try_into().unwrap()),
         })
     }
 }
@@ -150,7 +192,7 @@ pub fn parse_header(header: &[u8]) -> Result<HeaderInfo> {
         bail!("Header is not an RLP list");
     }
 
-    let mut read32 = |offset: &mut usize| -> Result<[u8; 32]> {
+    let read32 = |offset: &mut usize| -> Result<[u8; 32]> {
         ensure!(
             header.len() >= *offset + 33 && header[*offset] == 0xA0,
             "Malformed header: expected 32-byte item at offset {offset}"
@@ -173,7 +215,60 @@ pub fn parse_header(header: &[u8]) -> Result<HeaderInfo> {
     let _tx_root = read32(&mut offset)?; // item 4
     let receipts_root = read32(&mut offset)?; // item 5
 
-    Ok(HeaderInfo { parent_hash, state_root, receipts_root })
+    // items 6-7: logsBloom (256 bytes) and difficulty — skipped; item 8 is
+    // the block number, encoded as a canonical big-endian integer.
+    skip_header_item(header, &mut offset)?; // logsBloom
+    skip_header_item(header, &mut offset)?; // difficulty
+    let number_bytes = read_header_item(header, &mut offset)?; // number
+    ensure!(
+        number_bytes.len() <= 8,
+        "Malformed header: block number too large ({} bytes)",
+        number_bytes.len()
+    );
+    ensure!(
+        number_bytes.first() != Some(&0),
+        "Malformed header: non-canonical block number"
+    );
+    let mut number = 0u64;
+    for byte in number_bytes {
+        number = (number << 8) | *byte as u64;
+    }
+
+    Ok(HeaderInfo { parent_hash, state_root, receipts_root, number })
+}
+
+/// Read one RLP *string* item from a header, advancing `offset`.
+fn read_header_item<'a>(header: &'a [u8], offset: &mut usize) -> Result<&'a [u8]> {
+    ensure!(*offset < header.len(), "Malformed header: truncated at {offset}");
+    let prefix = header[*offset];
+    let (start, len) = if prefix < 0x80 {
+        (*offset, 1usize) // single byte, encodes itself
+    } else if prefix <= 0xB7 {
+        (*offset + 1, (prefix - 0x80) as usize)
+    } else if prefix <= 0xBF {
+        let len_of_len = (prefix - 0xB7) as usize;
+        ensure!(
+            len_of_len <= 8 && *offset + 1 + len_of_len <= header.len(),
+            "Malformed header: bad long-string length"
+        );
+        let mut len = 0usize;
+        for i in 0..len_of_len {
+            len = (len << 8) | header[*offset + 1 + i] as usize;
+        }
+        (*offset + 1 + len_of_len, len)
+    } else {
+        bail!("Malformed header: expected a string item at offset {offset}");
+    };
+    ensure!(
+        start + len <= header.len(),
+        "Malformed header: item overruns the header"
+    );
+    *offset = start + len;
+    Ok(&header[start..start + len])
+}
+
+fn skip_header_item(header: &[u8], offset: &mut usize) -> Result<()> {
+    read_header_item(header, offset).map(|_| ())
 }
 
 /// Exhaustively enumerate every value stored in a trie.
@@ -338,7 +433,9 @@ pub fn execute_scan_statement(witness: &ScanWitness, token: &[u8; 20]) -> Result
         "headers and receipt_nodes must align"
     );
 
-    // 1. Contiguous header chain.
+    // 1. Contiguous header chain — by parent hash *and* by block number, so
+    // the committed range provably describes the blocks actually scanned.
+    let start_block = parse_header(&witness.headers[0])?.number;
     for i in 1..witness.headers.len() {
         let info = parse_header(&witness.headers[i])?;
         let prev_hash = keccak256(&witness.headers[i - 1]);
@@ -346,7 +443,14 @@ pub fn execute_scan_statement(witness: &ScanWitness, token: &[u8; 20]) -> Result
             info.parent_hash == prev_hash,
             "Broken header chain at index {i}"
         );
+        ensure!(
+            info.number == start_block + i as u64,
+            "Header {i} has block number {}, expected {}",
+            info.number,
+            start_block + i as u64
+        );
     }
+    let end_block = start_block + witness.headers.len() as u64 - 1;
 
     // 2-3. Exhaustive receipt enumeration per block.
     let mut participants: BTreeSet<[u8; 20]> = BTreeSet::new();
@@ -361,6 +465,8 @@ pub fn execute_scan_statement(witness: &ScanWitness, token: &[u8; 20]) -> Result
     let participant_list: Vec<[u8; 20]> = participants.into_iter().collect();
     Ok(ScanPublicValues {
         end_block_hash: keccak256(witness.headers.last().unwrap()),
+        start_block,
+        end_block,
         num_blocks: witness.headers.len() as u64,
         token: *token,
         participants_root: candidates_root(&participant_list),
@@ -382,6 +488,17 @@ pub mod fixtures {
         state_root: [u8; 32],
         receipts_root: [u8; 32],
     ) -> Vec<u8> {
+        build_header_at(parent_hash, state_root, receipts_root, 1)
+    }
+
+    /// As [`build_header`], but with an explicit block number (item 8) so the
+    /// scan statement's proven range can be exercised.
+    pub fn build_header_at(
+        parent_hash: [u8; 32],
+        state_root: [u8; 32],
+        receipts_root: [u8; 32],
+        number: u64,
+    ) -> Vec<u8> {
         let mut out = vec![0xF9, 0x02, 0x00]; // list prefix (length bytes unchecked)
         out.push(0xA0);
         out.extend_from_slice(&parent_hash); // item 0
@@ -395,7 +512,19 @@ pub mod fixtures {
         out.extend_from_slice(&[0x44; 32]); // item 4: txRoot
         out.push(0xA0);
         out.extend_from_slice(&receipts_root); // item 5
+        // item 6: logsBloom — 256 bytes (long string: 0xB9 0x0100).
+        out.extend_from_slice(&[0xB9, 0x01, 0x00]);
+        out.extend_from_slice(&[0u8; 256]);
+        // item 7: difficulty (post-merge: 0 → empty string).
+        out.push(0x80);
+        // item 8: number, canonical big-endian.
+        out.extend_from_slice(&rlp_bytes(&be_bytes(number)));
         out
+    }
+
+    /// Minimal big-endian encoding (no leading zeros); empty for zero.
+    fn be_bytes(value: u64) -> Vec<u8> {
+        value.to_be_bytes().into_iter().skip_while(|b| *b == 0).collect()
     }
 
     /// An RLP log entry: [address, topics, data].
@@ -540,10 +669,12 @@ mod tests {
     fn test_scan_multi_block_chain() {
         let r0 = legacy_receipt(&[transfer_log(TOKEN, ALICE, BOB)]);
         let (root0, nodes0) = single_receipt_trie(&r0);
-        let header0 = build_header([0x00; 32], [0x02; 32], root0);
+        let header0 = build_header_at([0x00; 32], [0x02; 32], root0, 19_000_000);
 
         // Block 1: no receipts at all (empty trie), chained to block 0.
-        let header1 = build_header(keccak256(&header0), [0x03; 32], crate::mpt::EMPTY_TRIE_ROOT);
+        let header1 = build_header_at(
+            keccak256(&header0), [0x03; 32], crate::mpt::EMPTY_TRIE_ROOT, 19_000_001,
+        );
 
         let witness = ScanWitness {
             headers: vec![header0, header1.clone()],
@@ -552,6 +683,8 @@ mod tests {
         let public = execute_scan_statement(&witness, &TOKEN).unwrap();
 
         assert_eq!(public.num_blocks, 2);
+        assert_eq!(public.start_block, 19_000_000);
+        assert_eq!(public.end_block, 19_000_001, "range comes from the headers");
         assert_eq!(public.end_block_hash, keccak256(&header1));
         assert_eq!(public.participant_count, 2);
     }
@@ -559,8 +692,10 @@ mod tests {
     #[test]
     fn test_scan_broken_chain_aborts() {
         let (root, nodes) = single_receipt_trie(&legacy_receipt(&[]));
-        let header0 = build_header([0x00; 32], [0x02; 32], root);
-        let header1 = build_header([0xBA; 32], [0x03; 32], crate::mpt::EMPTY_TRIE_ROOT);
+        let header0 = build_header_at([0x00; 32], [0x02; 32], root, 19_000_000);
+        let header1 = build_header_at(
+            [0xBA; 32], [0x03; 32], crate::mpt::EMPTY_TRIE_ROOT, 19_000_001,
+        );
 
         let witness = ScanWitness {
             headers: vec![header0, header1],
@@ -633,6 +768,8 @@ mod tests {
     fn test_scan_abi_roundtrip() {
         let public = ScanPublicValues {
             end_block_hash: [0x01; 32],
+            start_block: 19_000_000,
+            end_block: 19_000_127,
             num_blocks: 128,
             token: TOKEN,
             participants_root: [0x02; 32],
@@ -645,6 +782,6 @@ mod tests {
         let mut bad = encoded.clone();
         bad[33] = 0xFF; // dirty padding
         assert!(ScanPublicValues::abi_decode(&bad).is_err());
-        assert!(ScanPublicValues::abi_decode(&encoded[..159]).is_err());
+        assert!(ScanPublicValues::abi_decode(&encoded[..223]).is_err());
     }
 }

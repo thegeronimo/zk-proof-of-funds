@@ -11,6 +11,7 @@
 
 use anyhow::{Context, Result};
 use sp1_sdk::blocking::{Elf, Prover, ProveRequest, ProverClient, SP1Stdin};
+use sp1_sdk::{HashableKey, ProvingKey};
 use std::path::PathBuf;
 use tracing::info;
 
@@ -46,6 +47,7 @@ pub fn build_derivation_stdin(
     policy_id: &[u8; 32],
     epoch: u64,
     block_number: u64,
+    prev_block_number: u64,
     chain_id: u64,
     threshold_wei: u128,
     token: Option<&TokenConfig>,
@@ -56,6 +58,7 @@ pub fn build_derivation_stdin(
     stdin.write(policy_id);
     stdin.write(&epoch);
     stdin.write(&block_number);
+    stdin.write(&prev_block_number);
     stdin.write(&chain_id);
     stdin.write(&threshold_wei);
     let token_raw: Option<([u8; 20], u64)> = token.map(|c| (c.address, c.balance_slot));
@@ -85,6 +88,7 @@ pub fn execute_derivation_program(
     policy_id: &[u8; 32],
     epoch: u64,
     block_number: u64,
+    prev_block_number: u64,
     chain_id: u64,
     threshold_wei: u128,
     token: Option<&TokenConfig>,
@@ -92,7 +96,8 @@ pub fn execute_derivation_program(
     let client = ProverClient::builder().cpu().build();
     let elf = Elf::Static(Box::leak(elf_bytes.into_boxed_slice()));
     let stdin = build_derivation_stdin(
-        witness, state_root, policy_id, epoch, block_number, chain_id, threshold_wei, token,
+        witness, state_root, policy_id, epoch, block_number, prev_block_number, chain_id,
+        threshold_wei, token,
     );
 
     let (public_values, report) = client
@@ -120,19 +125,24 @@ pub fn prove_derivation(
     policy_id: &[u8; 32],
     epoch: u64,
     block_number: u64,
+    prev_block_number: u64,
     chain_id: u64,
     threshold_wei: u128,
     token: Option<&TokenConfig>,
-) -> Result<(Vec<u8>, DerivationPublicValues)> {
+) -> Result<(Vec<u8>, DerivationPublicValues, String)> {
     let client = ProverClient::builder().cpu().build();
     let elf = Elf::Static(Box::leak(elf_bytes.into_boxed_slice()));
     let stdin = build_derivation_stdin(
-        witness, state_root, policy_id, epoch, block_number, chain_id, threshold_wei, token,
+        witness, state_root, policy_id, epoch, block_number, prev_block_number, chain_id,
+        threshold_wei, token,
     );
 
     let pk = client
         .setup(elf)
         .context("SP1 setup (key generation) failed")?;
+    // Returned alongside the proof: a proof means nothing without the vkey it
+    // was produced under, and setup is far too expensive to run twice.
+    let vkey = pk.verifying_key().bytes32();
 
     info!("Generating SP1 Groth16 derivation proof (this will take a while)");
 
@@ -143,5 +153,5 @@ pub fn prove_derivation(
         .context("SP1 derivation proof generation failed")?;
 
     let public_values = DerivationPublicValues::abi_decode(proof.public_values.as_slice())?;
-    Ok((proof.bytes(), public_values))
+    Ok((proof.bytes(), public_values, vkey))
 }

@@ -218,11 +218,28 @@ pub struct ZkProofResult {
     pub chain_id: u64,
 }
 
-/// SP1 ELF binary for the batch solvency program.
-/// Built by `cd program && cargo prove build`.
-const SP1_ELF_BYTES: &[u8] = include_bytes!(
-    "../../../program/target/elf-compilation/riscv64im-succinct-zkvm-elf/release/zk-pof-program"
-);
+/// Location of the built batch-solvency ELF, relative to this crate.
+///
+/// Loaded at runtime (like the V2 provers) so the agent builds without the
+/// SP1 toolchain and without a prebuilt ELF in the checkout.
+pub const BATCH_ELF_RELATIVE_PATH: &str =
+    "../../program/target/elf-compilation/riscv64im-succinct-zkvm-elf/release/zk-pof-program";
+
+/// Absolute path to the batch ELF for this checkout.
+pub fn batch_elf_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(BATCH_ELF_RELATIVE_PATH)
+}
+
+/// Load the batch ELF from disk.
+fn load_batch_elf() -> Result<Vec<u8>> {
+    let path = batch_elf_path();
+    std::fs::read(&path).with_context(|| {
+        format!(
+            "Batch ELF not found at {} — build it with `cd program && cargo prove build`",
+            path.display()
+        )
+    })
+}
 
 /// Build an SP1Stdin from batch proof inputs.
 ///
@@ -305,7 +322,7 @@ fn decode_and_abi_encode_public_values(
 /// Returns the public values and solvency root.
 pub fn execute_sp1_program(inputs: &BatchProofInputs) -> Result<ZkProofResult> {
     let client = ProverClient::builder().cpu().build();
-    let elf = Elf::Static(SP1_ELF_BYTES);
+    let elf = Elf::Static(Box::leak(load_batch_elf()?.into_boxed_slice()));
     let stdin = build_sp1_stdin(inputs);
 
     info!(
@@ -337,7 +354,7 @@ pub fn execute_sp1_program(inputs: &BatchProofInputs) -> Result<ZkProofResult> {
 /// on batch size and hardware). Use `execute_sp1_program()` for testing.
 pub fn generate_sp1_proof(inputs: &BatchProofInputs) -> Result<ZkProofResult> {
     let client = ProverClient::builder().cpu().build();
-    let elf = Elf::Static(SP1_ELF_BYTES);
+    let elf = Elf::Static(Box::leak(load_batch_elf()?.into_boxed_slice()));
     let stdin = build_sp1_stdin(inputs);
     let pk = client.setup(elf)
         .context("SP1 setup (key generation) failed")?;

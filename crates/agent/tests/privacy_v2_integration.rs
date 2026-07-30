@@ -17,7 +17,8 @@ use zk_pof_agent::db::Database;
 use zk_pof_agent::enrollment::{parse_policy_id, register_nullifier_member, NullifierEnrollment};
 use zk_pof_agent::solvent_set_service::SolventSetService;
 use zk_pof_common::membership::{
-    execute_membership_statement, MembershipPublicValues, MembershipWitness, PUBLIC_VALUES_LEN,
+    execute_membership_statement, MembershipPublicValues, MembershipWitness,
+    PresentationContext, PUBLIC_VALUES_LEN,
 };
 use zk_pof_common::plume;
 use zk_pof_common::solvent_derivation::{
@@ -46,6 +47,20 @@ fn address_hex_for(sk: &[u8; 32]) -> String {
 
 fn scope_for(policy_id: &[u8; 32]) -> [u8; 32] {
     plume::default_scope_hash(policy_id)
+}
+
+/// A presentation context for tests: any fixed, fully-populated binding will
+/// do — what matters is that the statement commits to it verbatim.
+fn test_context() -> PresentationContext {
+    PresentationContext {
+        policy_config_hash: [0xC0; 32],
+        verifier: [0x0A; 20],
+        verifier_chain_id: CHAIN_ID,
+        action_id: [0xAC; 32],
+        beneficiary: [0xBE; 20],
+        nonce: 1,
+        deadline: 99_999_999,
+    }
 }
 
 fn client_rebuild_set(service: &SolventSetService<'_>, epoch: u64) -> SolventSet {
@@ -104,7 +119,7 @@ fn test_full_solvent_set_membership_flow_with_streaks() {
         siblings: siblings.clone(),
     };
     let public_values =
-        execute_membership_statement(&witness, &build2.root, &policy_id, 2, CHAIN_ID, 2, &scope_for(&policy_id)).unwrap();
+        execute_membership_statement(&witness, &build2.root, &policy_id, 2, CHAIN_ID, 2, &scope_for(&policy_id), &test_context()).unwrap();
 
     assert_eq!(public_values.solvent_set_root, build2.root);
     assert_eq!(public_values.epoch, 2);
@@ -114,7 +129,7 @@ fn test_full_solvent_set_membership_flow_with_streaks() {
     // A stricter policy (min streak 3) rejects the same witness — rented
     // solvency cannot fake holding duration.
     assert!(
-        execute_membership_statement(&witness, &build2.root, &policy_id, 2, CHAIN_ID, 3, &scope_for(&policy_id)).is_err()
+        execute_membership_statement(&witness, &build2.root, &policy_id, 2, CHAIN_ID, 3, &scope_for(&policy_id), &test_context()).is_err()
     );
 
     // The whale that joined this epoch has streak 1 and fails min-streak 2.
@@ -128,7 +143,7 @@ fn test_full_solvent_set_membership_flow_with_streaks() {
         siblings: w_siblings,
     };
     assert!(
-        execute_membership_statement(&whale_witness, &build2.root, &policy_id, 2, CHAIN_ID, 2, &scope_for(&policy_id))
+        execute_membership_statement(&whale_witness, &build2.root, &policy_id, 2, CHAIN_ID, 2, &scope_for(&policy_id), &test_context())
             .is_err()
     );
 
@@ -192,7 +207,7 @@ fn test_non_member_cannot_prove_membership() {
         leaf_index: leaf_index as u64,
         siblings,
     };
-    assert!(execute_membership_statement(&stolen, &build.root, &policy_id, 1, CHAIN_ID, 1, &scope_for(&policy_id)).is_err());
+    assert!(execute_membership_statement(&stolen, &build.root, &policy_id, 1, CHAIN_ID, 1, &scope_for(&policy_id), &test_context()).is_err());
 }
 
 /// Stage B: the proven build path — synthetic EIP-1186 proofs through the
@@ -242,7 +257,7 @@ fn test_proven_build_from_account_proofs() {
     // program will commit for permissionless publication).
     let policy_id = parse_policy_id(POLICY_HEX).unwrap();
     let reexecuted = execute_derivation_statement(
-        &proven.witness, &state_root, &policy_id, 2, 19_000_100, CHAIN_ID, ONE_ETH, None,
+        &proven.witness, &state_root, &policy_id, 2, 19_000_100, 19_000_000, CHAIN_ID, ONE_ETH, None,
     )
     .unwrap();
     assert_eq!(reexecuted, proven.public_values);
@@ -282,10 +297,13 @@ fn test_sp1_membership_guest_matches_native_mirror() {
     };
 
     let scope = scope_for(&policy_id);
-    let native =
-        execute_membership_statement(&witness, &root, &policy_id, 1, CHAIN_ID, 2, &scope).unwrap();
+    let context = test_context();
+    let native = execute_membership_statement(
+        &witness, &root, &policy_id, 1, CHAIN_ID, 2, &scope, &context,
+    )
+    .unwrap();
     let guest = zk_pof_agent::membership_prover::execute_membership_program(
-        elf, &witness, &root, &policy_id, 1, CHAIN_ID, 2, &scope,
+        elf, &witness, &root, &policy_id, 1, CHAIN_ID, 2, &scope, &context,
     )
     .unwrap();
 
@@ -325,11 +343,11 @@ fn test_sp1_derivation_guest_matches_native_mirror() {
     };
 
     let native = execute_derivation_statement(
-        &witness, &state_root, &policy_id, 5, 19_000_100, CHAIN_ID, ONE_ETH, None,
+        &witness, &state_root, &policy_id, 5, 19_000_100, 19_000_000, CHAIN_ID, ONE_ETH, None,
     )
     .unwrap();
     let guest = zk_pof_agent::derivation_prover::execute_derivation_program(
-        elf, &witness, &state_root, &policy_id, 5, 19_000_100, CHAIN_ID, ONE_ETH, None,
+        elf, &witness, &state_root, &policy_id, 5, 19_000_100, 19_000_000, CHAIN_ID, ONE_ETH, None,
     )
     .unwrap();
 
@@ -372,11 +390,11 @@ fn test_sp1_derivation_guest_erc20_matches_native_mirror() {
     };
 
     let native = execute_derivation_statement(
-        &witness, &state_root, &policy_id, 2, 19_000_100, CHAIN_ID, ONE_ETH, Some(&config),
+        &witness, &state_root, &policy_id, 2, 19_000_100, 19_000_000, CHAIN_ID, ONE_ETH, Some(&config),
     )
     .unwrap();
     let guest = zk_pof_agent::derivation_prover::execute_derivation_program(
-        elf, &witness, &state_root, &policy_id, 2, 19_000_100, CHAIN_ID, ONE_ETH, Some(&config),
+        elf, &witness, &state_root, &policy_id, 2, 19_000_100, 19_000_000, CHAIN_ID, ONE_ETH, Some(&config),
     )
     .unwrap();
 
@@ -413,11 +431,15 @@ fn test_sp1_scan_guest_matches_native_mirror() {
     );
     let r2 = scan_fixtures::legacy_receipt(&[]);
     let (receipts_root, nodes) = scan_fixtures::three_receipt_trie(&r0, &r1, &r2);
-    let header0 = scan_fixtures::build_header([0x00; 32], [0x02; 32], receipts_root);
-    let header1 = scan_fixtures::build_header(
+    // Sequential block numbers: the scan statement now proves its own range
+    // from header item 8, so a chain has to be numbered as well as linked.
+    let header0 =
+        scan_fixtures::build_header_at([0x00; 32], [0x02; 32], receipts_root, 19_000_000);
+    let header1 = scan_fixtures::build_header_at(
         zk_pof_common::solvent_derivation::fixtures::keccak256(&header0),
         [0x03; 32],
         zk_pof_common::mpt::EMPTY_TRIE_ROOT,
+        19_000_001,
     );
 
     let witness = ScanWitness {
@@ -435,4 +457,9 @@ fn test_sp1_scan_guest_matches_native_mirror() {
     );
     assert_eq!(guest.abi_encode(), native.abi_encode());
     assert_eq!(guest.participant_count, 2);
+    // The committed range is derived from the headers, so the guest proves it
+    // rather than taking the operator's word for it.
+    assert_eq!(guest.start_block, 19_000_000);
+    assert_eq!(guest.end_block, 19_000_001);
+    assert_eq!(guest.num_blocks, 2);
 }

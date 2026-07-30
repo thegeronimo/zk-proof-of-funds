@@ -30,8 +30,14 @@ import { defaultScopeHash } from "@zk-proof-of-funds/sdk/plume";
 import { AGENT_PUBLIC_URL } from "../services/apiClient";
 import { usePolicySelection } from "../hooks/usePolicySelection";
 import { useSolventSet, findMembership } from "../hooks/useSolventSet";
-import { useOnChainSet, blocksUntilExpiry } from "../hooks/useOnChainSet";
-import { ORACLE_ADDRESS, SOLVENT_SET_ORACLE_ABI, HAS_ORACLE } from "../config/contracts";
+import { useOnChainSet, blocksUntilExpiry, provenanceGate } from "../hooks/useOnChainSet";
+import {
+  ORACLE_ADDRESS,
+  SOLVENT_SET_ORACLE_ABI,
+  HAS_ORACLE,
+  Provenance,
+  PROVENANCE_LABEL,
+} from "../config/contracts";
 import { formatThreshold, assetLabel } from "../config/policies";
 import PolicyPicker from "./PolicyPicker";
 import {
@@ -126,8 +132,41 @@ export default function ProveFlow() {
 
   const lookupAddress = isConnected && address ? address : manualAddress.trim();
 
-  // The scope the nullifier binds to. The contract is authoritative when it is
-  // reachable; otherwise the policy's default derivation is what the CLI uses.
+  /**
+   * Whether it is safe to prove against this policy's published root.
+   *
+   * Production fails closed: the served root, the browser's own rebuild, and
+   * the on-chain entry must all agree, and the entry must be live, unrevoked,
+   * and meet the policy's provenance requirement. The sandbox escape hatch is
+   * opt-in via `VITE_ALLOW_UNVERIFIED_PROVENANCE=1`, and says so loudly.
+   */
+  const gate = useMemo(() => {
+    const base = provenanceGate(onChain, set.info?.root ?? null, set.rootVerified);
+    // Without the authoritative scope we cannot know which identity namespace
+    // the proof must bind to, so the flow stops rather than guessing.
+    if (onChain.configured && onChain.scopeHash === null && !onChain.loading) {
+      return {
+        ok: false,
+        reasons: [
+          ...base.reasons,
+          "The policy's scope could not be read from the oracle; a proof built on a guessed scope would bind the wrong identity.",
+        ],
+      };
+    }
+    return base;
+  }, [onChain, set.info, set.rootVerified]);
+  const sandboxMode = import.meta.env.VITE_ALLOW_UNVERIFIED_PROVENANCE === "1";
+  const mayProceed = gate.ok || sandboxMode;
+
+  // The scope the nullifier binds to.
+  //
+  // The contract is authoritative, full stop. Falling back to the local
+  // derivation when the on-chain read fails looks harmless — the default is
+  // usually right — but a policy configured with a *shared* scope would
+  // silently produce a proof bound to the wrong identity namespace, which
+  // then fails on-chain or, worse, verifies as a different member (review
+  // finding R7). So the derived value is only ever used as a display hint,
+  // and the flow is gated on the authoritative read having succeeded.
   const derivedScope = useMemo(() => {
     if (!isValid) return null;
     try {
@@ -136,6 +175,7 @@ export default function ProveFlow() {
       return null;
     }
   }, [policyId, isValid]);
+  const scopeIsAuthoritative = onChain.scopeHash !== null;
   const effectiveScope = onChain.scopeHash ?? derivedScope;
   const scopeIsCustom =
     onChain.scopeHash !== null &&
@@ -165,8 +205,10 @@ export default function ProveFlow() {
   }, []);
 
   async function loadSet() {
-    const result = await set.load(policyId);
-    void onChain.load(policyId);
+    // Await the on-chain read: the provenance gate below depends on it, and
+    // firing it off unawaited meant the user could advance before the answer
+    // arrived — failing *open* on exactly the check that matters (review R7).
+    const [result] = await Promise.all([set.load(policyId), onChain.load(policyId)]);
     if (result.info) {
       setMembership(null);
       setMembershipChecked(false);
@@ -192,20 +234,42 @@ export default function ProveFlow() {
   }
 
   const proveCommand = useMemo(() => {
+    // No key placeholder: the CLI refuses `--sk` outright and prompts for the
+    // key on a hidden TTY instead. Emitting a `--sk <KEY>` template taught
+    // users to paste a live private key into their shell history (review §5).
     const parts = [
       "zkpof-client prove",
-      "  --sk <YOUR_32_BYTE_HEX_KEY>",
       `  --policy ${policyId}`,
       `  --agent ${agentUrl}`,
       `  --min-streak ${minStreak || "1"}`,
       `  --chain-id ${chainId || "1"}`,
     ];
+    // Presentation context — mandatory, or the proof is a bearer token.
+    if (ORACLE_ADDRESS) parts.push(`  --verifier ${ORACLE_ADDRESS}`);
+    if (onChain.entry) parts.push(`  --config-hash ${onChain.entry.policyConfigHash}`);
+    if (address) parts.push(`  --beneficiary ${address}`);
+    if (onChain.blockNumber !== null) {
+      parts.push(`  --deadline ${onChain.blockNumber + 300n}`);
+    }
+    if (onChain.chainId) parts.push(`  --verifier-chain-id ${onChain.chainId}`);
     // Only pass --scope when the policy uses a non-default (shared) scope;
     // otherwise the CLI derives the same value the contract expects.
     if (scopeIsCustom && onChain.scopeHash) parts.push(`  --scope ${onChain.scopeHash}`);
     if (executeOnly) parts.push("  --execute-only");
     return parts.join(" \\\n");
-  }, [policyId, agentUrl, minStreak, chainId, executeOnly, scopeIsCustom, onChain.scopeHash]);
+  }, [
+    policyId,
+    agentUrl,
+    minStreak,
+    chainId,
+    executeOnly,
+    scopeIsCustom,
+    onChain.scopeHash,
+    onChain.entry,
+    onChain.blockNumber,
+    onChain.chainId,
+    address,
+  ]);
 
   function verifyCliOutput() {
     setDecodeError(null);
@@ -223,7 +287,10 @@ export default function ProveFlow() {
         policyId,
         epoch: set.info?.epoch,
         chainId: chainId ? Number(chainId) : undefined,
-        scopeHash: effectiveScope ?? undefined,
+        // Only the authoritative scope is worth cross-checking against.
+        // Checking a locally-derived guess would turn a real mismatch into a
+        // green tick.
+        scopeHash: scopeIsAuthoritative ? (effectiveScope ?? undefined) : undefined,
         requiredMinStreak: minStreak ? Number(minStreak) : undefined,
       });
       setDecoded(values);
@@ -266,10 +333,10 @@ export default function ProveFlow() {
 
   return (
     <div className="max-w-3xl mx-auto">
-      <PageHeader title="Prove solvency">
-        Prove you hold enough funds without revealing which address holds them. The set of
-        qualifying addresses is public; your position in it stays private, and this page never
-        sends your address anywhere.
+      <PageHeader title="Prove a threshold balance">
+        Prove you control an account that met the policy's balance threshold at a past reference
+        block, without revealing which account. The set of qualifying addresses is public; your
+        position in it stays private.
       </PageHeader>
 
       <Stepper steps={STEPS} current={step} furthest={furthest} onSelect={setStep} />
@@ -352,8 +419,38 @@ export default function ProveFlow() {
 
           {set.info && <OnChainPanel onChain={onChain} servedRoot={set.info.root} expiry={expiry} />}
 
+          {set.info && !gate.ok && (
+            <Callout
+              tone={sandboxMode ? "warn" : "bad"}
+              title={
+                sandboxMode
+                  ? "Sandbox mode — proceeding despite unverified provenance"
+                  : "Cannot prove against this set yet"
+              }
+            >
+              <ul className="list-disc pl-5 space-y-1">
+                {gate.reasons.map((reason) => (
+                  <li key={reason}>{reason}</li>
+                ))}
+              </ul>
+              {sandboxMode ? (
+                <p className="mt-2">
+                  <code className="font-mono">VITE_ALLOW_UNVERIFIED_PROVENANCE=1</code> is set, so
+                  the flow continues anyway. Never do this in production — a proof built here may
+                  be unverifiable, or verify against something other than what you think.
+                </p>
+              ) : (
+                <p className="mt-2">
+                  Resolve the above, or set{" "}
+                  <code className="font-mono">VITE_ALLOW_UNVERIFIED_PROVENANCE=1</code> to explore
+                  the flow without a published root.
+                </p>
+              )}
+            </Callout>
+          )}
+
           {set.info && (
-            <Button onClick={() => advance(2)} disabled={set.rootVerified === false} full>
+            <Button onClick={() => advance(2)} disabled={!mayProceed} full>
               Continue
             </Button>
           )}
@@ -475,8 +572,20 @@ export default function ProveFlow() {
               >
                 <TextInput value={minStreak} onChange={setMinStreak} mono />
               </Field>
-              <Field label="Chain ID" hint="The chain the proof will be verified on.">
-                <TextInput value={chainId} onChange={setChainId} mono />
+              <Field
+                label="Chain ID"
+                hint={
+                  onChain.chainId
+                    ? "Fixed by the oracle: the source chain and the verifier chain are the same chain, so this is not a free choice."
+                    : "The chain the proof will be verified on."
+                }
+              >
+                <TextInput
+                  value={onChain.chainId ? String(onChain.chainId) : chainId}
+                  onChange={setChainId}
+                  disabled={onChain.chainId !== null}
+                  mono
+                />
               </Field>
               <Field label="Mode" hint="Execute-only skips Groth16 — useful to sanity-check first.">
                 <label className="flex items-center gap-2 text-sm text-gray-700 mt-2">
@@ -593,8 +702,10 @@ function OnChainPanel({
         onChain.chainId ? ` · chain ${onChain.chainId}` : ""
       }`}
       actions={
-        onChain.entry.proven ? (
-          <StatusPill tone="good">✓ proven derivation</StatusPill>
+        onChain.entry.provenance === Provenance.RangeScanProven ? (
+          <StatusPill tone="good">balances proven · list covers scanned range</StatusPill>
+        ) : onChain.entry.provenance === Provenance.BalancesProven ? (
+          <StatusPill tone="warn">balances proven · list may omit holders</StatusPill>
         ) : (
           <StatusPill tone="warn">operator-asserted</StatusPill>
         )
@@ -619,16 +730,48 @@ function OnChainPanel({
             <StatusPill tone="bad">expired</StatusPill>
           )}
         </Row>
+        <Row label="Provenance">{PROVENANCE_LABEL[onChain.entry.provenance]}</Row>
+        {onChain.entry.provenance === Provenance.RangeScanProven && (
+          <Row label="Scanned range">
+            blocks {onChain.entry.scanStartBlock.toLocaleString()}–
+            {onChain.entry.scanEndBlock.toLocaleString()}
+          </Row>
+        )}
         <Row label="Completeness">
           {onChain.requiresCompleteness ? "required (Stage B.2)" : "not required"}
         </Row>
       </DefinitionList>
-      {!onChain.entry.proven && (
+      {onChain.entry.provenance === Provenance.OperatorAsserted && (
         <div className="mt-4">
           <Callout tone="warn">
             This root was published with <code className="font-mono">publishRoot</code> — the
             operator asserted the membership list rather than proving it. Proofs against it still
             verify, but the set's contents rest on trusting the operator.
+          </Callout>
+        </div>
+      )}
+      {onChain.entry.provenance === Provenance.BalancesProven && (
+        <div className="mt-4">
+          <Callout tone="warn">
+            Every listed address's balance was proven against the block's state root. That says
+            nothing about who was <em>left out</em> — the candidate list is still the operator's.
+          </Callout>
+        </div>
+      )}
+      {onChain.entry.provenance === Provenance.RangeScanProven && (
+        <div className="mt-4">
+          <Callout tone="warn">
+            Completeness holds <em>relative to blocks{" "}
+            {onChain.entry.scanStartBlock.toLocaleString()}–
+            {onChain.entry.scanEndBlock.toLocaleString()} only</em>. Holders whose last transfer
+            predates that range can still be absent.
+          </Callout>
+        </div>
+      )}
+      {onChain.entry.revoked && (
+        <div className="mt-4">
+          <Callout tone="bad" title="This root has been revoked">
+            The oracle owner revoked this entry. Verification against it reverts.
           </Callout>
         </div>
       )}
@@ -691,10 +834,22 @@ function ProofResult({
         </DefinitionList>
 
         <div className="mt-4">
+          <Callout tone="info" title="What this proof actually says">
+            The prover controls the signing key of an externally-owned account whose address was
+            in a committed set of addresses classified as meeting the threshold at the reference
+            block(s). It does not establish beneficial ownership, exclusive key control, absence
+            of liabilities or encumbrances, that the funds were not borrowed, or that the balance
+            still exists now.
+          </Callout>
+        </div>
+
+        <div className="mt-4">
           <Callout tone="info" title="About that identity">
-            The nullifier hash is stable for this key and policy and unlinkable across policies.
-            It is the same value a monitored-mode enrollment would produce, so relying protocols
-            treat both modes identically.
+            The nullifier hash is stable for this key and scope. Policies using different scopes
+            produce values that are not linkable from the nullifiers themselves; policies may
+            share a scope on purpose, and side channels can still correlate uses. It is the same
+            value a monitored-mode enrollment would produce, so relying protocols treat both
+            modes identically.
           </Callout>
         </div>
 

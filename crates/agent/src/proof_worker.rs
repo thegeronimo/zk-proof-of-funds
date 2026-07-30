@@ -223,7 +223,7 @@ pub struct ZkProofResult {
 /// Loaded at runtime (like the V2 provers) so the agent builds without the
 /// SP1 toolchain and without a prebuilt ELF in the checkout.
 pub const BATCH_ELF_RELATIVE_PATH: &str =
-    "../../../program/target/elf-compilation/riscv64im-succinct-zkvm-elf/release/zk-pof-program";
+    "../../program/target/elf-compilation/riscv64im-succinct-zkvm-elf/release/zk-pof-program";
 
 /// Absolute path to the batch ELF for this checkout.
 pub fn batch_elf_path() -> std::path::PathBuf {

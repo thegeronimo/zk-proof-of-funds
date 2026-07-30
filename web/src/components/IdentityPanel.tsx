@@ -232,9 +232,10 @@ export default function IdentityPanel() {
   return (
     <div className="max-w-3xl mx-auto">
       <PageHeader title="Identity">
-        Your nullifier is a deterministic, policy-scoped identity derived from your key. One key
-        gives exactly one identity per policy, and identities for different policies cannot be
-        linked to each other.
+        Your nullifier is a deterministic, scope-bound identity derived from your key. One key
+        gives exactly one identity per scope. When two policies use <em>different</em> scopes,
+        their nullifier values alone do not link — but policies can deliberately share a scope,
+        and timing, an unusual streak, or network metadata can still correlate uses.
       </PageHeader>
 
       <div className="space-y-6">

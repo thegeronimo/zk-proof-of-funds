@@ -1,16 +1,23 @@
 /**
  * Decoding and checking Privacy V2 membership public values (PRIVACY_V2.md §4.2).
  *
- * `program-membership/` commits a single 224-byte blob:
+ * `program-membership/` commits a single 448-byte blob:
  *
  * ```text
  * abi.encode(bytes32 solventSetRoot, bytes32 policyId, uint64 epoch,
  *            bytes32 nullifierHash, uint64 chainId, uint64 minStreak,
- *            bytes32 scopeHash)
+ *            bytes32 scopeHash, bytes32 policyConfigHash, address verifier,
+ *            uint64 verifierChainId, bytes32 actionId, address beneficiary,
+ *            uint64 nonce, uint64 deadline)
  * ```
  *
- * Seven 32-byte words, with the three `uint64`s left-padded — so decoding is
- * fixed-offset slicing and needs no ABI library, keeping the core SDK zero-dep.
+ * Fourteen 32-byte words, with the `uint64`s and `address`es left-padded — so
+ * decoding is fixed-offset slicing and needs no ABI library, keeping the core
+ * SDK zero-dep.
+ *
+ * The last seven fields are the **presentation context**: without them a
+ * proof is a bearer token any observer can replay at another verifier or
+ * front-run out of the mempool (external review finding R5).
  *
  * A relying party must never take these values on faith from whoever handed
  * them over: `checkMembershipPublicValues` re-checks every field against what
@@ -21,7 +28,7 @@
  */
 
 /** Byte length of the committed public-values blob. */
-export const MEMBERSHIP_PUBLIC_VALUES_LEN = 224;
+export const MEMBERSHIP_PUBLIC_VALUES_LEN = 448;
 
 /** The decoded membership statement. */
 export interface MembershipPublicValues {
@@ -39,6 +46,20 @@ export interface MembershipPublicValues {
   minStreak: bigint;
   /** The scope the nullifier is bound to (0x-prefixed). */
   scopeHash: string;
+  /** Semantic fingerprint of the policy the proof was made under (0x-prefixed). */
+  policyConfigHash: string;
+  /** The only verifier contract this proof may be submitted to (0x-prefixed). */
+  verifier: string;
+  /** The chain that verifier lives on. */
+  verifierChainId: bigint;
+  /** Application-defined action this proof authorizes (0x-prefixed). */
+  actionId: string;
+  /** The only address permitted to consume this proof (0x-prefixed). */
+  beneficiary: string;
+  /** Caller-chosen uniqueness value. */
+  nonce: bigint;
+  /** Last block at which the proof may be presented. */
+  deadline: bigint;
 }
 
 function stripPrefix(hex: string): string {
@@ -54,11 +75,11 @@ function wordToBigInt(hex: string, index: number): bigint {
 }
 
 /**
- * Decode a 224-byte membership public-values blob.
+ * Decode a 448-byte membership public-values blob.
  *
  * @param publicValuesHex Hex string, 0x prefix optional — the
  *   `public_values_abi` field of `zkpof-client prove` output.
- * @throws If the blob is not exactly 224 bytes of valid hex.
+ * @throws If the blob is not exactly 448 bytes of valid hex.
  */
 export function decodeMembershipPublicValues(
   publicValuesHex: string
@@ -77,9 +98,15 @@ export function decodeMembershipPublicValues(
   // uint64 words must be left-padded with zeros, matching the Rust decoder
   // (crates/common/src/membership.rs) — a nonzero high half means the blob was
   // not produced by the membership program.
-  for (const index of [2, 4, 5]) {
+  for (const index of [2, 4, 5, 9, 12, 13]) {
     if (!/^0{48}/.test(word(hex, index))) {
       throw new Error("Invalid public values: nonzero padding in a uint64 word");
+    }
+  }
+  // address words are left-padded with 12 zero bytes.
+  for (const index of [8, 11]) {
+    if (!/^0{24}/.test(word(hex, index))) {
+      throw new Error("Invalid public values: nonzero padding in an address word");
     }
   }
   return {
@@ -90,6 +117,13 @@ export function decodeMembershipPublicValues(
     chainId: wordToBigInt(hex, 4),
     minStreak: wordToBigInt(hex, 5),
     scopeHash: `0x${word(hex, 6)}`,
+    policyConfigHash: `0x${word(hex, 7)}`,
+    verifier: `0x${word(hex, 8).slice(24)}`,
+    verifierChainId: wordToBigInt(hex, 9),
+    actionId: `0x${word(hex, 10)}`,
+    beneficiary: `0x${word(hex, 11).slice(24)}`,
+    nonce: wordToBigInt(hex, 12),
+    deadline: wordToBigInt(hex, 13),
   };
 }
 
@@ -102,11 +136,21 @@ export interface MembershipExpectation {
   scopeHash?: string;
   /** The policy's "solvent for >= k epochs" requirement. */
   requiredMinStreak?: number | bigint;
+  /** The semantic fingerprint the relying app pins. */
+  policyConfigHash?: string;
+  /** The verifier contract this proof must name. */
+  verifier?: string;
+  /** The action this proof must authorize. */
+  actionId?: string;
+  /** The address that must be permitted to consume it. */
+  beneficiary?: string;
+  /** Current block: the proof's deadline must not have passed. */
+  currentBlock?: number | bigint;
 }
 
 /** One failed expectation. */
 export interface MembershipCheckFailure {
-  field: keyof MembershipExpectation | "minStreak";
+  field: keyof MembershipExpectation | "minStreak" | "deadline";
   expected: string;
   actual: string;
 }
@@ -170,6 +214,28 @@ export function checkMembershipPublicValues(
       field: "minStreak",
       expected: `>= ${expected.requiredMinStreak}`,
       actual: String(values.minStreak),
+    });
+  }
+
+  for (const field of [
+    "policyConfigHash",
+    "verifier",
+    "actionId",
+    "beneficiary",
+  ] as const) {
+    const want = expected[field];
+    if (want !== undefined && !sameHex(values[field], want)) {
+      failures.push({ field, expected: want, actual: values[field] });
+    }
+  }
+  if (
+    expected.currentBlock !== undefined &&
+    BigInt(expected.currentBlock) > values.deadline
+  ) {
+    failures.push({
+      field: "deadline",
+      expected: `>= ${expected.currentBlock}`,
+      actual: String(values.deadline),
     });
   }
 

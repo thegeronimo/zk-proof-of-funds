@@ -16,6 +16,7 @@ import {
   POLICY_REGISTRY_ADDRESS,
   SOLVENT_SET_ORACLE_ABI,
   POLICY_REGISTRY_ABI,
+  Provenance,
   type OnChainSetEntry,
 } from "../config/contracts";
 
@@ -122,11 +123,18 @@ export function useOnChainSet(policyChainId?: number) {
           });
           entry = {
             root: raw.root,
+            policyConfigHash: raw.policyConfigHash,
+            membershipVKey: raw.membershipVKey,
+            derivationVKey: raw.derivationVKey,
             epoch: raw.epoch,
             blockNumber: raw.blockNumber,
             publishedAt: raw.publishedAt,
+            validUntil: raw.validUntil,
             memberCount: raw.memberCount,
-            proven: raw.proven,
+            provenance: raw.provenance as Provenance,
+            scanStartBlock: raw.scanStartBlock,
+            scanEndBlock: raw.scanEndBlock,
+            revoked: raw.revoked,
           };
         }
 
@@ -173,8 +181,78 @@ export function useOnChainSet(policyChainId?: number) {
   return { ...state, load };
 }
 
-/** Blocks left before a published root expires; null when TTL is unknown. */
+/**
+ * Blocks left before a published root expires; null when unknown.
+ *
+ * Read from the entry's own pinned `validUntil`, never recomputed from the
+ * policy's current TTL — the owner can change that, and a historical
+ * attestation's lifetime must not move under it (review §4.6).
+ */
 export function blocksUntilExpiry(state: OnChainSetState): bigint | null {
-  if (!state.entry || state.rootTTLBlocks === null || state.blockNumber === null) return null;
-  return state.entry.publishedAt + state.rootTTLBlocks - state.blockNumber;
+  if (!state.entry || state.blockNumber === null) return null;
+  return state.entry.validUntil - state.blockNumber;
+}
+
+/** Why a policy is not safe to prove against right now. */
+export interface ProvenanceGate {
+  ok: boolean;
+  reasons: string[];
+}
+
+/**
+ * Decide whether it is safe to generate a proof against this policy's
+ * published root.
+ *
+ * The app previously *displayed* provenance warnings but let the user
+ * continue regardless — including when no oracle was configured, the read
+ * failed, no root was published, or the agent and chain disagreed (review
+ * finding R7). In production the flow fails closed: every one of these has
+ * to hold, and the specific failures are named so the user knows what broke.
+ *
+ * @param servedRoot The root the agent served.
+ * @param localRootVerified Whether the browser's own rebuild matched it.
+ */
+export function provenanceGate(
+  state: OnChainSetState,
+  servedRoot: string | null,
+  localRootVerified: boolean | null
+): ProvenanceGate {
+  const reasons: string[] = [];
+
+  if (localRootVerified === false) {
+    reasons.push("The tree rebuilt in this browser does not hash to the root the agent served.");
+  } else if (localRootVerified === null) {
+    reasons.push("The served set has not been rebuilt and verified locally yet.");
+  }
+
+  if (!state.configured) {
+    reasons.push("No SolventSetOracle is configured, so nothing can be checked against the chain.");
+  } else if (state.error) {
+    reasons.push(`The on-chain read failed: ${state.error}`);
+  } else if (state.loading) {
+    reasons.push("The on-chain read has not finished.");
+  } else if (!state.entry) {
+    reasons.push("No root has been published on-chain for this policy.");
+  } else {
+    if (servedRoot && state.entry.root.toLowerCase() !== servedRoot.toLowerCase()) {
+      reasons.push("The agent's root differs from the root published on-chain.");
+    }
+    if (state.entry.revoked) {
+      reasons.push("This root has been revoked by the oracle owner.");
+    }
+    const remaining = blocksUntilExpiry(state);
+    if (remaining !== null && remaining <= 0n) {
+      reasons.push("The published root has expired; verification would revert.");
+    }
+    if (
+      state.requiresCompleteness &&
+      state.entry.provenance !== Provenance.RangeScanProven
+    ) {
+      reasons.push(
+        "This policy requires a completeness-proven root, but the published root is not one."
+      );
+    }
+  }
+
+  return { ok: reasons.length === 0, reasons };
 }

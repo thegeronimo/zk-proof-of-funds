@@ -16,7 +16,7 @@ import type { SolventSetPath } from "@zk-proof-of-funds/sdk";
 import { usePolicySelection } from "../hooks/usePolicySelection";
 import { useSolventSet, findMembership, streakHistogram } from "../hooks/useSolventSet";
 import { useOnChainSet, blocksUntilExpiry } from "../hooks/useOnChainSet";
-import { HAS_ORACLE } from "../config/contracts";
+import { HAS_ORACLE, Provenance, PROVENANCE_LABEL } from "../config/contracts";
 import PolicyPicker from "./PolicyPicker";
 import {
   Button,
@@ -88,10 +88,12 @@ export default function SolventSetPanel() {
 
   return (
     <div className="max-w-4xl mx-auto">
-      <PageHeader title="Solvent set">
-        Every address meeting the policy threshold at the reference block, with the number of
-        consecutive epochs it has qualified. Public data by construction — on a transparent chain,
-        solvency already is.
+      <PageHeader title="Qualifying-address set">
+        The addresses the operator checked that met the policy threshold at the reference block,
+        with the number of consecutive epochs each has qualified. This is an auditor view: a
+        curated, threshold-filtered, longitudinally-labelled list of wealthy accounts. The
+        underlying balances are already public on-chain, but this list is a materially cheaper
+        targeting artefact than reconstructing it yourself — publish it deliberately.
       </PageHeader>
 
       <div className="space-y-6">
@@ -365,8 +367,10 @@ function OnChainRecord({
         onChain.chainId ? ` · chain ${onChain.chainId}` : ""
       }`}
       actions={
-        onChain.entry.proven ? (
-          <StatusPill tone="good">✓ proven derivation</StatusPill>
+        onChain.entry.provenance === Provenance.RangeScanProven ? (
+          <StatusPill tone="good">balances proven · list covers scanned range</StatusPill>
+        ) : onChain.entry.provenance === Provenance.BalancesProven ? (
+          <StatusPill tone="warn">balances proven · list may omit holders</StatusPill>
         ) : (
           <StatusPill tone="warn">operator-asserted</StatusPill>
         )
@@ -392,6 +396,16 @@ function OnChainRecord({
             <StatusPill tone="bad">expired</StatusPill>
           )}
         </Row>
+        <Row label="Provenance">{PROVENANCE_LABEL[onChain.entry.provenance]}</Row>
+        {onChain.entry.provenance === Provenance.RangeScanProven && (
+          <Row label="Scanned range">
+            blocks {onChain.entry.scanStartBlock.toLocaleString()}–
+            {onChain.entry.scanEndBlock.toLocaleString()}
+          </Row>
+        )}
+        <Row label="Config hash">
+          <Hex value={onChain.entry.policyConfigHash} truncate />
+        </Row>
         <Row label="Completeness">
           {onChain.requiresCompleteness ? "required (Stage B.2)" : "not required"}
         </Row>
@@ -402,11 +416,26 @@ function OnChainRecord({
           {onChain.membershipVKey ? <Hex value={onChain.membershipVKey} truncate /> : "—"}
         </Row>
       </DefinitionList>
-      {!onChain.entry.proven && (
+      {onChain.entry.provenance === Provenance.OperatorAsserted && (
         <div className="mt-4">
           <Callout tone="warn" title="Stage A root">
             Published with <code className="font-mono">publishRoot</code>: the operator asserted
             this membership list rather than proving each balance against the block's state root.
+          </Callout>
+        </div>
+      )}
+      {onChain.entry.provenance === Provenance.BalancesProven && (
+        <div className="mt-4">
+          <Callout tone="warn" title="Balances proven, list unproven">
+            Each listed address's balance was proven against the block's state root. Whether any
+            qualifying holder was <em>omitted</em> from the candidate list is not proven here.
+          </Callout>
+        </div>
+      )}
+      {onChain.entry.revoked && (
+        <div className="mt-4">
+          <Callout tone="bad" title="Revoked">
+            The oracle owner revoked this root; verification against it reverts.
           </Callout>
         </div>
       )}

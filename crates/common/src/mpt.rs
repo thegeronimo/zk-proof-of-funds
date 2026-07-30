@@ -42,15 +42,25 @@ pub(crate) fn to_nibbles(key: &[u8; 32]) -> [u8; 64] {
 ///   1 → extension, odd length (next nibble is first path nibble)
 ///   2 → leaf, even length (next nibble is padding 0)
 ///   3 → leaf, odd length (next nibble is first path nibble)
+///
+/// Enforces canonical encoding: the flag nibble must be 0-3 and the padding
+/// nibble in the even case must be zero.
 pub(crate) fn decode_hp(encoded: &[u8]) -> Result<(Vec<u8>, bool)> {
     ensure!(!encoded.is_empty(), "Empty HP-encoded path");
     let first_nibble = encoded[0] >> 4;
+    ensure!(first_nibble <= 3, "Invalid HP flag nibble: {}", first_nibble);
     let is_leaf = first_nibble >= 2;
     let is_odd = first_nibble & 1 == 1;
 
     let mut nibbles = Vec::new();
     if is_odd {
         nibbles.push(encoded[0] & 0x0F);
+    } else {
+        ensure!(
+            encoded[0] & 0x0F == 0,
+            "Non-canonical HP padding nibble: {}",
+            encoded[0] & 0x0F
+        );
     }
     for &byte in &encoded[1..] {
         nibbles.push(byte >> 4);
@@ -129,10 +139,14 @@ pub struct AccountState {
 ///
 /// # Returns
 /// The account balance as a 32-byte big-endian U256.
-/// Returns `[0u8; 32]` if the account does not exist (empty proof).
+/// Returns `[0u8; 32]` only when the account is **proven absent**: either the
+/// state root is the empty-trie root (with an empty proof), or the proof is a
+/// valid non-inclusion path (empty branch child or diverging leaf/extension).
+/// An empty proof against any other root is an error, never absence.
 ///
 /// # Errors
-/// Returns an error if the proof is invalid (wrong hash chain, malformed RLP, etc.).
+/// Returns an error if the proof is invalid (wrong hash chain, malformed RLP,
+/// empty proof against a nonempty root, etc.).
 pub fn verify_account_balance(
     state_root: &[u8; 32],
     address: &[u8; 20],
@@ -176,6 +190,21 @@ pub fn verify_account_state(
     }
 }
 
+/// Walk a raw trie key, returning the leaf value's inner payload.
+///
+/// Exposed for the differential test suite (`tests/mpt_differential.rs`),
+/// which builds tries with an independent implementation and needs to verify
+/// against raw keys rather than going through the account/storage wrappers
+/// that hash their input first.
+#[doc(hidden)]
+pub fn walk_trie_for_test(
+    root: &[u8; 32],
+    trie_key: &[u8; 32],
+    proof_nodes: &[Vec<u8>],
+) -> Result<Option<Vec<u8>>> {
+    walk_trie(root, trie_key, proof_nodes)
+}
+
 /// The state-trie key of an account: `keccak256(address)`.
 ///
 /// Clients can compute this locally and submit it instead of the plaintext
@@ -197,20 +226,15 @@ pub fn erc20_balance_slot(holder: &[u8; 20], slot_index: u64) -> [u8; 32] {
 /// slot value as a 32-byte big-endian U256.
 ///
 /// `slot` is the storage slot (e.g. from [`erc20_balance_slot`]); the trie
-/// key is `keccak256(slot)`. An absent slot (empty proof against the empty
-/// trie root, or a proven-absent path) is zero.
+/// key is `keccak256(slot)`. An absent slot is zero — but absence must be
+/// **proven**: either the storage root is the empty-trie root (with an empty
+/// proof), or the proof is a valid non-inclusion path. An empty proof against
+/// a nonempty storage root is an error.
 pub fn verify_storage_value(
     storage_root: &[u8; 32],
     slot: &[u8; 32],
     proof_nodes: &[Vec<u8>],
 ) -> Result<[u8; 32]> {
-    if *storage_root == EMPTY_TRIE_ROOT {
-        ensure!(
-            proof_nodes.is_empty(),
-            "Nonempty storage proof against the empty trie root"
-        );
-        return Ok([0u8; 32]);
-    }
     let storage_key = keccak256(slot);
     match walk_trie(storage_root, &storage_key, proof_nodes)? {
         Some(value_rlp) => decode_storage_word(&value_rlp),
@@ -218,124 +242,212 @@ pub fn verify_storage_value(
     }
 }
 
+/// One step of the trie walk: what the current node resolved to.
+enum Step {
+    /// Reached the value for our key (the leaf value's inner payload).
+    Value(Vec<u8>),
+    /// The key is **proven absent**: empty branch child at our nibble, or a
+    /// leaf/extension path that diverges from our key.
+    Absent,
+    /// Descend into a hash-referenced child (the next supplied proof node).
+    Hash([u8; 32]),
+    /// Descend into an embedded child node (< 32 bytes encoded, carried
+    /// inline in its parent — no separate proof node, no hash check).
+    Inline(Vec<u8>),
+}
+
 /// Walk an MPT proof for `trie_key` from `root`, returning the leaf value's
-/// inner payload, or `None` when the path is proven absent.
+/// inner payload, or `None` when the path is **proven** absent.
 ///
-/// An empty node list is treated as "absent" (matches `eth_getProof` for
-/// nonexistent keys in an empty trie).
+/// Soundness invariants enforced here:
+/// - An empty node list is accepted only against [`EMPTY_TRIE_ROOT`]. For any
+///   other root, absence requires a valid non-inclusion path: a walk that
+///   terminates at an empty branch child or at a leaf/extension whose path
+///   diverges from the key. (An empty list proves nothing about a nonempty
+///   trie — see the 2026-07 external review, finding R1.)
+/// - Embedded (< 32-byte) child nodes are descended into inline, as Ethereum
+///   tries embed them; a supposed inline child ≥ 32 bytes encoded is rejected.
+/// - A leaf only yields a value if it consumes the entire remaining key.
+/// - The terminal node (value or absence) must be the last supplied node —
+///   trailing proof nodes are rejected.
+/// - Node encodings must be canonical: exactly one RLP list with no trailing
+///   bytes, canonical hex-prefix paths, and 0- or 32-byte hash references.
 fn walk_trie(
     root: &[u8; 32],
     trie_key: &[u8; 32],
     proof_nodes: &[Vec<u8>],
 ) -> Result<Option<Vec<u8>>> {
-    if proof_nodes.is_empty() {
+    if *root == EMPTY_TRIE_ROOT {
+        ensure!(
+            proof_nodes.is_empty(),
+            "Nonempty proof against the empty trie root"
+        );
         return Ok(None);
     }
+    ensure!(
+        !proof_nodes.is_empty(),
+        "Empty proof against nonempty trie root {}",
+        hex::encode(root),
+    );
 
     let nibbles = to_nibbles(trie_key);
-
-    let mut expected_hash = *root;
     let mut key_offset: usize = 0;
-    let mut account_rlp: Option<Vec<u8>> = None;
+    let mut node_index: usize = 0;
+    let mut expected_hash = *root;
 
-    for (i, node_rlp) in proof_nodes.iter().enumerate() {
-        // Verify this node's hash matches what we expect
+    loop {
+        // Fetch the next hash-referenced node and check it against the chain.
+        ensure!(
+            node_index < proof_nodes.len(),
+            "Proof ended before reaching a terminal node"
+        );
+        let node_rlp = &proof_nodes[node_index];
+        node_index += 1;
         let node_hash = keccak256(node_rlp);
         ensure!(
             node_hash == expected_hash,
             "MPT proof node hash mismatch at index {} (expected {}, got {})",
-            i,
+            node_index - 1,
             hex::encode(expected_hash),
             hex::encode(node_hash),
         );
 
-        // Decode the node
-        let payload = decode_rlp_list(node_rlp)?;
-        let item_count = count_rlp_items(payload)?;
-
-        if item_count == 17 {
-            // Branch node: 16 children + 1 value
-            ensure!(key_offset < nibbles.len(), "Key exhausted at branch node");
-            let child_index = nibbles[key_offset] as usize;
-            key_offset += 1;
-
-            // Read the child reference at child_index
-            let mut buf = payload;
-            for _ in 0..child_index {
-                skip_rlp_item(&mut buf)?;
-            }
-            let child_raw = read_rlp_item_raw(&mut buf)?;
-
-            // Decode the child reference
-            let mut child_buf = child_raw;
-            let child_header = Header::decode(&mut child_buf)
-                .map_err(|e| anyhow::anyhow!("Invalid child header: {}", e))?;
-
-            if child_header.list {
-                bail!("Inline branch child not expected in state trie account proof");
-            } else if child_header.payload_length == 32 {
-                expected_hash.copy_from_slice(child_buf);
-            } else if child_header.payload_length == 0 {
-                ensure!(
-                    i == proof_nodes.len() - 1,
-                    "Empty branch child not at end of proof"
-                );
-                return Ok(None);
-            } else {
-                bail!("Unexpected branch child length: {}", child_header.payload_length);
-            }
-        } else if item_count == 2 {
-            // Extension or Leaf node
-            let mut buf = payload;
-            let path_bytes = decode_rlp_bytes(&mut buf)?;
-            let (path_nibbles, is_leaf) = decode_hp(path_bytes)?;
-
-            // Verify the path matches our key
-            for (j, &nibble) in path_nibbles.iter().enumerate() {
-                ensure!(
-                    key_offset + j < nibbles.len(),
-                    "Key exhausted in extension/leaf path"
-                );
-                ensure!(
-                    nibbles[key_offset + j] == nibble,
-                    "Path mismatch at nibble offset {}",
-                    key_offset + j,
-                );
-            }
-            key_offset += path_nibbles.len();
-
-            if is_leaf {
-                // Leaf node: second item is the RLP-encoded account value
-                let value_raw = read_rlp_item_raw(&mut buf)?;
-                let mut val_buf = value_raw;
-                let val_header = Header::decode(&mut val_buf)
-                    .map_err(|e| anyhow::anyhow!("Invalid leaf value header: {}", e))?;
-                if val_header.list {
-                    account_rlp = Some(value_raw.to_vec());
-                } else {
-                    account_rlp = Some(val_buf[..val_header.payload_length].to_vec());
+        // Process this node, descending through any embedded children without
+        // consuming further proof nodes (they are part of this node's bytes).
+        let mut current: Vec<u8> = node_rlp.clone();
+        loop {
+            match process_node(&current, &nibbles, &mut key_offset)? {
+                Step::Value(value) => {
+                    ensure!(
+                        node_index == proof_nodes.len(),
+                        "Trailing proof nodes after the terminal node"
+                    );
+                    return Ok(Some(value));
                 }
-            } else {
-                // Extension node: second item is the child reference
-                let child_raw = read_rlp_item_raw(&mut buf)?;
-                let mut child_buf = child_raw;
-                let child_header = Header::decode(&mut child_buf)
-                    .map_err(|e| anyhow::anyhow!("Invalid extension child header: {}", e))?;
-
-                if child_header.list {
-                    bail!("Inline extension child not expected in state trie account proof");
-                } else if child_header.payload_length == 32 {
-                    expected_hash.copy_from_slice(child_buf);
-                } else {
-                    bail!("Unexpected extension child length: {}", child_header.payload_length);
+                Step::Absent => {
+                    ensure!(
+                        node_index == proof_nodes.len(),
+                        "Trailing proof nodes after a non-inclusion terminal"
+                    );
+                    return Ok(None);
+                }
+                Step::Hash(h) => {
+                    expected_hash = h;
+                    break; // outer loop consumes the next proof node
+                }
+                Step::Inline(bytes) => {
+                    current = bytes; // keep walking inside this proof node
                 }
             }
-        } else {
-            bail!("Unexpected RLP item count: {}", item_count);
         }
     }
+}
 
-    Ok(account_rlp)
+/// Decode and process a single trie node, advancing `key_offset`.
+fn process_node(node_rlp: &[u8], nibbles: &[u8; 64], key_offset: &mut usize) -> Result<Step> {
+    // The node must be exactly one RLP list — no trailing bytes.
+    let payload = decode_rlp_list_exact(node_rlp)?;
+    let item_count = count_rlp_items(payload)?;
+
+    if item_count == 17 {
+        // Branch node: 16 children + 1 value slot.
+        // Keys here are fixed-length (64 nibbles, keccak-derived), so a value
+        // can never legitimately terminate at a branch's value slot.
+        ensure!(*key_offset < nibbles.len(), "Key exhausted at branch node");
+        let child_index = nibbles[*key_offset] as usize;
+        *key_offset += 1;
+
+        let mut buf = payload;
+        for _ in 0..child_index {
+            skip_rlp_item(&mut buf)?;
+        }
+        let child_raw = read_rlp_item_raw(&mut buf)?;
+        decode_child_ref(child_raw)
+    } else if item_count == 2 {
+        // Extension or Leaf node.
+        let mut buf = payload;
+        let path_bytes = decode_rlp_bytes(&mut buf)?;
+        let (path_nibbles, is_leaf) = decode_hp(path_bytes)?;
+
+        // A path that diverges from our key (or overshoots it) proves the key
+        // is not in this subtree — valid non-inclusion.
+        let remaining = &nibbles[*key_offset..];
+        if path_nibbles.len() > remaining.len()
+            || path_nibbles[..] != remaining[..path_nibbles.len()]
+        {
+            return Ok(Step::Absent);
+        }
+        *key_offset += path_nibbles.len();
+
+        if is_leaf {
+            // A leaf yields our value only if it consumed the entire key.
+            ensure!(
+                *key_offset == nibbles.len(),
+                "Leaf does not consume the full key ({} of {} nibbles)",
+                *key_offset,
+                nibbles.len(),
+            );
+            // The leaf value is an RLP string whose payload is the value
+            // (for accounts, that payload is itself the RLP account list).
+            let value_bytes = decode_rlp_bytes(&mut buf)?;
+            Ok(Step::Value(value_bytes.to_vec()))
+        } else {
+            ensure!(!path_nibbles.is_empty(), "Empty extension path");
+            let child_raw = read_rlp_item_raw(&mut buf)?;
+            match decode_child_ref(child_raw)? {
+                Step::Absent => bail!("Extension child reference is empty"),
+                step => Ok(step),
+            }
+        }
+    } else {
+        bail!("Unexpected RLP item count in trie node: {}", item_count);
+    }
+}
+
+/// Decode a child reference inside a branch or extension node: a 32-byte hash
+/// string, an empty string (absent child), or an embedded node (an RLP list
+/// whose full encoding is shorter than 32 bytes).
+fn decode_child_ref(child_raw: &[u8]) -> Result<Step> {
+    let mut child_buf = child_raw;
+    let child_header = Header::decode(&mut child_buf)
+        .map_err(|e| anyhow::anyhow!("Invalid child reference header: {}", e))?;
+
+    if child_header.list {
+        // Embedded node: the standard MPT rule embeds children whose encoding
+        // is < 32 bytes directly in the parent, so no hash check applies —
+        // its bytes are already authenticated as part of the parent.
+        ensure!(
+            child_raw.len() < 32,
+            "Embedded child node must be shorter than 32 bytes (got {})",
+            child_raw.len(),
+        );
+        Ok(Step::Inline(child_raw.to_vec()))
+    } else if child_header.payload_length == 32 {
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&child_buf[..32]);
+        Ok(Step::Hash(hash))
+    } else if child_header.payload_length == 0 {
+        Ok(Step::Absent)
+    } else {
+        bail!(
+            "Unexpected child reference length: {}",
+            child_header.payload_length
+        );
+    }
+}
+
+/// Decode an RLP list that must span `data` exactly (no trailing bytes).
+fn decode_rlp_list_exact(data: &[u8]) -> Result<&[u8]> {
+    let mut buf = data;
+    let header =
+        Header::decode(&mut buf).map_err(|e| anyhow::anyhow!("Invalid RLP list header: {}", e))?;
+    ensure!(header.list, "Expected RLP list");
+    ensure!(
+        buf.len() == header.payload_length,
+        "Trailing bytes after trie node ({} extra)",
+        buf.len() - header.payload_length,
+    );
+    Ok(&buf[..header.payload_length])
 }
 
 /// Decode an Ethereum account from RLP: RLP([nonce, balance, storageRoot, codeHash]).
@@ -372,10 +484,14 @@ fn decode_storage_word(value_rlp: &[u8]) -> Result<[u8; 32]> {
 }
 
 /// Left-pad big-endian integer bytes into a 32-byte U256 word.
+///
+/// Enforces canonical RLP integer encoding (no leading zero bytes) so two
+/// different encodings can never decode to the same value.
 fn left_pad_u256(bytes: &[u8]) -> Result<[u8; 32]> {
     let mut result = [0u8; 32];
     if !bytes.is_empty() {
         ensure!(bytes.len() <= 32, "Integer too large: {} bytes", bytes.len());
+        ensure!(bytes[0] != 0, "Non-canonical integer: leading zero byte");
         let offset = 32 - bytes.len();
         result[offset..].copy_from_slice(bytes);
     }
@@ -432,24 +548,34 @@ mod tests {
         assert!(!balance_meets_threshold(&balance, three_eth));
     }
 
+    // ── Empty-proof soundness (external review finding R1) ──────────────
+
     #[test]
-    fn test_empty_proof_returns_zero() {
+    fn test_empty_proof_against_nonempty_root_is_rejected() {
+        // The R1 vulnerability: an empty proof must NOT be accepted as proof
+        // of absence against an arbitrary nonempty root.
         let state_root = [0xAA; 32];
         let address = [0xBB; 20];
-        let result = verify_account_balance(&state_root, &address, &[]).unwrap();
-        assert_eq!(result, [0u8; 32]);
+        let err = verify_account_balance(&state_root, &address, &[]).unwrap_err();
+        assert!(err.to_string().contains("Empty proof against nonempty"));
+
+        let state_err = verify_account_state(&state_root, &address, &[]).unwrap_err();
+        assert!(state_err.to_string().contains("Empty proof against nonempty"));
+
+        let slot = erc20_balance_slot(&address, 0);
+        let storage_err = verify_storage_value(&state_root, &slot, &[]).unwrap_err();
+        assert!(storage_err.to_string().contains("Empty proof against nonempty"));
     }
 
     #[test]
-    fn test_absent_account_has_empty_storage_root() {
-        let state = verify_account_state(&[0xAA; 32], &[0xBB; 20], &[]).unwrap();
+    fn test_empty_proof_against_empty_root_is_absent() {
+        // The ONLY root an empty proof is valid against.
+        let address = [0xBB; 20];
+        let state = verify_account_state(&EMPTY_TRIE_ROOT, &address, &[]).unwrap();
         assert_eq!(state.balance, [0u8; 32]);
         assert_eq!(state.storage_root, EMPTY_TRIE_ROOT);
-    }
 
-    #[test]
-    fn test_storage_value_empty_root_is_zero() {
-        let slot = erc20_balance_slot(&[0xBB; 20], 0);
+        let slot = erc20_balance_slot(&address, 0);
         let value = verify_storage_value(&EMPTY_TRIE_ROOT, &slot, &[]).unwrap();
         assert_eq!(value, [0u8; 32]);
         // A nonempty proof against the empty root is malformed.
@@ -544,18 +670,6 @@ mod tests {
     }
 
     #[test]
-    fn test_account_balance_with_key_matches_address_path() {
-        // Equivalent verification through the precomputed trie key.
-        let state_root = [0xAA; 32];
-        let address = [0xBB; 20];
-        let key = keccak256(&address);
-        assert_eq!(
-            verify_account_balance(&state_root, &address, &[]).unwrap(),
-            verify_account_balance_with_key(&state_root, &key, &[]).unwrap()
-        );
-    }
-
-    #[test]
     fn test_invalid_proof_node_hash() {
         let state_root = [0xAA; 32];
         let address = [0xBB; 20];
@@ -564,6 +678,303 @@ mod tests {
         let result = verify_account_balance(&state_root, &address, &[bad_node]);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("hash mismatch"));
+    }
+
+    // ── Inclusion / non-inclusion over constructed tries ────────────────
+
+    use crate::solvent_derivation::fixtures::{rlp_bytes, rlp_list, single_leaf_trie, two_leaf_trie};
+
+    /// RLP-encode an account: [nonce, balance, storageRoot, codeHash].
+    fn account_rlp(nonce: u64, balance: u128, storage_root: &[u8; 32]) -> Vec<u8> {
+        let int_bytes = |v: u128| -> Vec<u8> {
+            v.to_be_bytes().into_iter().skip_while(|b| *b == 0).collect()
+        };
+        rlp_list(&[
+            rlp_bytes(&int_bytes(nonce as u128)),
+            rlp_bytes(&int_bytes(balance)),
+            rlp_bytes(storage_root),
+            rlp_bytes(&keccak256(&[])), // empty code hash
+        ])
+    }
+
+    #[test]
+    fn test_account_inclusion_single_leaf() {
+        let address = [0x11; 20];
+        let key = keccak256(&address);
+        let balance: u128 = 5_000_000_000_000_000_000;
+        let acct = account_rlp(7, balance, &EMPTY_TRIE_ROOT);
+        let (root, proof) = single_leaf_trie(key, acct);
+
+        let state = verify_account_state(&root, &address, &proof).unwrap();
+        assert!(balance_meets_threshold(&state.balance, balance));
+        assert!(!balance_meets_threshold(&state.balance, balance + 1));
+        assert_eq!(state.storage_root, EMPTY_TRIE_ROOT);
+
+        // The precomputed-key path must agree byte for byte.
+        assert_eq!(
+            verify_account_balance(&root, &address, &proof).unwrap(),
+            verify_account_balance_with_key(&root, &key, &proof).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_non_inclusion_via_diverging_leaf() {
+        // A single-leaf trie holding key A proves any other key absent: the
+        // walk hits the leaf, the path diverges, and that IS the proof.
+        let addr_a = [0x11; 20];
+        let key_a = keccak256(&addr_a);
+        let (root, proof) = single_leaf_trie(key_a, account_rlp(0, 42, &EMPTY_TRIE_ROOT));
+
+        // Find an address whose trie key diverges from A's (first nibble).
+        let mut addr_b = [0x22; 20];
+        let mut filler = 0x22u8;
+        while keccak256(&addr_b)[0] >> 4 == key_a[0] >> 4 {
+            filler += 1;
+            addr_b = [filler; 20];
+        }
+
+        let state = verify_account_state(&root, &addr_b, &proof).unwrap();
+        assert_eq!(state.balance, [0u8; 32], "diverging leaf proves absence");
+        assert_eq!(state.storage_root, EMPTY_TRIE_ROOT);
+    }
+
+    #[test]
+    fn test_non_inclusion_via_empty_branch_child() {
+        // Two-leaf trie: querying a key whose first nibble hits an empty
+        // branch slot is proven absent by the branch node alone.
+        let addr_a = [0x01; 20];
+        let key_a = keccak256(&addr_a);
+        let (_addr_b, key_b) = {
+            let mut filler = 2u8;
+            loop {
+                let a = [filler; 20];
+                let k = keccak256(&a);
+                if k[0] >> 4 != key_a[0] >> 4 {
+                    break (a, k);
+                }
+                filler += 1;
+            }
+        };
+        let (root, proof_a, _proof_b) = two_leaf_trie(
+            key_a,
+            account_rlp(0, 100, &EMPTY_TRIE_ROOT),
+            key_b,
+            account_rlp(0, 200, &EMPTY_TRIE_ROOT),
+        );
+
+        // A third address hitting an unoccupied first nibble: absent with
+        // just the branch node as proof.
+        let (addr_c, _key_c) = {
+            let mut filler = 100u8;
+            loop {
+                let a = [filler; 20];
+                let k = keccak256(&a);
+                if k[0] >> 4 != key_a[0] >> 4 && k[0] >> 4 != key_b[0] >> 4 {
+                    break (a, k);
+                }
+                filler += 1;
+            }
+        };
+        let branch_only = vec![proof_a[0].clone()];
+        let state = verify_account_state(&root, &addr_c, &branch_only).unwrap();
+        assert_eq!(state.balance, [0u8; 32], "empty branch child proves absence");
+
+        // But the branch node alone must NOT prove absence of key A, whose
+        // slot is occupied — the proof just ends early.
+        let err = verify_account_state(&root, &addr_a, &branch_only).unwrap_err();
+        assert!(err.to_string().contains("Proof ended before reaching a terminal node"));
+    }
+
+    #[test]
+    fn test_embedded_child_nodes_are_walked() {
+        // Two keys sharing 63 nibbles → extension → branch with two INLINE
+        // leaves (each < 32 bytes encoded). Real Ethereum storage tries embed
+        // such nodes; the walker must descend into them.
+        let mut key_a = [0x55u8; 32];
+        let mut key_b = [0x55u8; 32];
+        key_a[31] = 0x51; // last nibble 1
+        key_b[31] = 0x52; // last nibble 2
+        let (root, nodes) = build_trie(&[
+            (key_a.to_vec(), vec![0x2A]), // storage word 42
+            (key_b.to_vec(), vec![0x37]),
+        ]);
+        // Everything inline except the root extension node.
+        assert_eq!(nodes.len(), 1, "fixture must exercise inline children");
+
+        let value = walk_trie(&root, &key_a, &nodes).unwrap().unwrap();
+        assert_eq!(decode_storage_word(&rlp_bytes(&value)).unwrap()[31], 0x2A);
+        let value_b = walk_trie(&root, &key_b, &nodes).unwrap().unwrap();
+        assert_eq!(decode_storage_word(&rlp_bytes(&value_b)).unwrap()[31], 0x37);
+
+        // A key hitting an empty slot of the embedded branch: proven absent.
+        let mut key_c = [0x55u8; 32];
+        key_c[31] = 0x53;
+        assert!(walk_trie(&root, &key_c, &nodes).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_trailing_proof_nodes_rejected() {
+        let address = [0x11; 20];
+        let key = keccak256(&address);
+        let (root, mut proof) = single_leaf_trie(key, account_rlp(0, 42, &EMPTY_TRIE_ROOT));
+        proof.push(vec![0xC0]); // garbage after the terminal node
+        let err = verify_account_state(&root, &address, &proof).unwrap_err();
+        assert!(err.to_string().contains("Trailing proof nodes"));
+    }
+
+    #[test]
+    fn test_leaf_must_consume_full_key() {
+        // A leaf whose path is a strict prefix of the key must not yield a
+        // value — hand-build one with only the first 10 nibbles.
+        let address = [0x11; 20];
+        let key = keccak256(&address);
+        let mut hp = vec![0x20]; // leaf, even
+        hp.extend_from_slice(&key[..5]); // 10 nibbles only
+        let leaf = rlp_list(&[rlp_bytes(&hp), rlp_bytes(&account_rlp(0, 42, &EMPTY_TRIE_ROOT))]);
+        let root = keccak256(&leaf);
+        let err = verify_account_state(&root, &address, &[leaf]).unwrap_err();
+        assert!(err.to_string().contains("Leaf does not consume the full key"));
+    }
+
+    #[test]
+    fn test_non_canonical_encodings_rejected() {
+        let address = [0x11; 20];
+        let key = keccak256(&address);
+
+        // Leading-zero balance is a non-canonical RLP integer.
+        let bad_acct = rlp_list(&[
+            rlp_bytes(&[]),
+            rlp_bytes(&[0x00, 0x2A]), // 42 with a leading zero
+            rlp_bytes(&EMPTY_TRIE_ROOT),
+            rlp_bytes(&keccak256(&[])),
+        ]);
+        let (root, proof) = single_leaf_trie(key, bad_acct);
+        let err = verify_account_state(&root, &address, &proof).unwrap_err();
+        assert!(err.to_string().contains("leading zero"));
+
+        // Invalid HP flag nibble (>= 4).
+        let mut bad_hp = vec![0x40];
+        bad_hp.extend_from_slice(&key);
+        let bad_leaf = rlp_list(&[rlp_bytes(&bad_hp), rlp_bytes(&account_rlp(0, 1, &EMPTY_TRIE_ROOT))]);
+        let bad_root = keccak256(&bad_leaf);
+        let err = verify_account_state(&bad_root, &address, &[bad_leaf]).unwrap_err();
+        assert!(err.to_string().contains("Invalid HP flag"));
+
+        // Non-zero padding nibble in an even-length HP path.
+        let mut pad_hp = vec![0x21];
+        pad_hp.extend_from_slice(&key);
+        let pad_leaf = rlp_list(&[rlp_bytes(&pad_hp), rlp_bytes(&account_rlp(0, 1, &EMPTY_TRIE_ROOT))]);
+        let pad_root = keccak256(&pad_leaf);
+        let err = verify_account_state(&pad_root, &address, &[pad_leaf]).unwrap_err();
+        assert!(err.to_string().contains("padding nibble"));
+
+        // Trailing bytes after the node's RLP list.
+        let mut hp = vec![0x20];
+        hp.extend_from_slice(&key);
+        let mut padded_leaf = rlp_list(&[rlp_bytes(&hp), rlp_bytes(&account_rlp(0, 1, &EMPTY_TRIE_ROOT))]);
+        padded_leaf.push(0x00);
+        let padded_root = keccak256(&padded_leaf);
+        let err = verify_account_state(&padded_root, &address, &[padded_leaf]).unwrap_err();
+        assert!(err.to_string().contains("Trailing bytes"));
+    }
+
+    #[test]
+    fn test_oversized_embedded_child_rejected() {
+        // A branch child that is an RLP list but >= 32 bytes encoded must be
+        // hash-referenced, never embedded.
+        let address = [0x11; 20];
+        let key = keccak256(&address);
+        let first_nibble = (key[0] >> 4) as usize;
+
+        let big_inline = rlp_list(&[rlp_bytes(&[0xAB; 20]), rlp_bytes(&[0xCD; 10])]);
+        assert!(big_inline.len() >= 32);
+        let mut branch_items: Vec<Vec<u8>> = (0..17).map(|_| rlp_bytes(&[])).collect();
+        branch_items[first_nibble] = big_inline;
+        let branch = rlp_list(&branch_items);
+        let root = keccak256(&branch);
+
+        let err = verify_account_state(&root, &address, &[branch]).unwrap_err();
+        assert!(err.to_string().contains("Embedded child node must be shorter"));
+    }
+
+    // ── Randomized round-trip: build_trie ↔ walk_trie ───────────────────
+
+    /// Extract the ordered proof path for `trie_key` from an unordered node
+    /// set (as returned by `build_trie`), using the same node decoder.
+    fn extract_proof(
+        root: &[u8; 32],
+        trie_key: &[u8; 32],
+        nodes: &[Vec<u8>],
+    ) -> Vec<Vec<u8>> {
+        use std::collections::HashMap;
+        let by_hash: HashMap<[u8; 32], &Vec<u8>> =
+            nodes.iter().map(|n| (keccak256(n), n)).collect();
+        let nibbles = to_nibbles(trie_key);
+        let mut key_offset = 0usize;
+        let mut proof = Vec::new();
+        let mut hash = *root;
+        loop {
+            let node = by_hash.get(&hash).expect("node on path must exist");
+            proof.push((*node).clone());
+            let mut current: Vec<u8> = (*node).clone();
+            loop {
+                match process_node(&current, &nibbles, &mut key_offset).expect("valid node") {
+                    Step::Value(_) | Step::Absent => return proof,
+                    Step::Hash(h) => {
+                        hash = h;
+                        break;
+                    }
+                    Step::Inline(bytes) => current = bytes,
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_randomized_inclusion_and_absence() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(0x5eed_2026_07_27);
+
+        for round in 0..10 {
+            let n = 1 + (round * 37) % 200;
+            let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..n)
+                .map(|_| {
+                    let key: [u8; 32] = rng.gen();
+                    let value_len = 1 + rng.gen_range(0..60usize);
+                    let value: Vec<u8> = (0..value_len).map(|_| rng.gen::<u8>().max(1)).collect();
+                    (key.to_vec(), value)
+                })
+                .collect();
+            let mut deduped = entries.clone();
+            deduped.sort();
+            deduped.dedup_by(|a, b| a.0 == b.0);
+
+            let (root, nodes) = build_trie(&deduped);
+
+            // Every stored key must verify with its extracted proof.
+            for (key_bytes, value) in &deduped {
+                let key: [u8; 32] = key_bytes.as_slice().try_into().unwrap();
+                let proof = extract_proof(&root, &key, &nodes);
+                let got = walk_trie(&root, &key, &proof).unwrap().expect("stored key present");
+                assert_eq!(&got, value);
+            }
+
+            // Random absent keys must be provably absent (never an error, and
+            // never a value).
+            for _ in 0..20 {
+                let key: [u8; 32] = rng.gen();
+                if deduped.iter().any(|(k, _)| k.as_slice() == key) {
+                    continue;
+                }
+                let proof = extract_proof(&root, &key, &nodes);
+                assert!(walk_trie(&root, &key, &proof).unwrap().is_none());
+                // And with the proof truncated, absence must NOT be accepted.
+                if proof.len() > 1 {
+                    let truncated = proof[..proof.len() - 1].to_vec();
+                    assert!(walk_trie(&root, &key, &truncated).is_err());
+                }
+            }
+        }
     }
 }
 
@@ -580,7 +991,7 @@ mod tests {
 /// helper needs no trust.
 ///
 /// Keys must be unique. Values are stored verbatim (already-encoded receipts).
-pub fn build_trie(entries: &[(Vec<u8>, Vec<u8>)]) -> (([u8; 32]), Vec<Vec<u8>>) {
+pub fn build_trie(entries: &[(Vec<u8>, Vec<u8>)]) -> ([u8; 32], Vec<Vec<u8>>) {
     if entries.is_empty() {
         return (EMPTY_TRIE_ROOT, Vec::new());
     }

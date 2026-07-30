@@ -1,6 +1,9 @@
 # Privacy V2 — Solvent-Set Membership & Deterministic Nullifiers
 
-**Status**: Implemented (Phase 10 + Phase 11 — see EXECUTION_PLAN.md)
+**Status**: Implemented through Phase 16. The protocol-soundness remediation
+from the 2026-07 external review (Phases 15-16) has landed — see the Phase 15
+amendments below, which are **normative and supersede the earlier sizes**.
+Not yet demonstrated end to end with an EVM-verifiable proof; see STATUS.md.
 **Depends on**: ARCHITECTURE.md (V1 batch model), Phase 9 (ZK privacy mode)
 
 > **Phase 11 amendments** (normative): solvent-set leaves are streak-aware
@@ -24,6 +27,40 @@
 > cross-policy shared identity an opt-in configuration. Membership public
 > values are 224 bytes (adds `scopeHash`). Stage B.2 composition is enforced
 > on-chain by `publishRootProvenComplete` (§4.3-§4.4).
+>
+> **Phase 15 amendments** (normative, supersede the sizes above — external
+> review remediation, see EXECUTION_PLAN.md "External Review (2026-07)"):
+>
+> - **Membership public values are 448 bytes.** They add a *presentation
+>   context* — `policyConfigHash`, `verifier`, `verifierChainId`, `actionId`,
+>   `beneficiary`, `nonce`, `deadline`. Without it a proof is a bearer token:
+>   replayable at another verifier and front-runnable out of the mempool.
+>   `verifyAndConsume` requires `beneficiary == msg.sender`, and nullifier
+>   consumption is namespaced by `(consumer, policyConfigHash, actionId)`
+>   rather than shared across every caller of a policy.
+> - **Derivation public values are 448 bytes**, adding `prevBlockNumber`. The
+>   statement requires `blockNumber > prevBlockNumber`, and the contract binds
+>   `prevBlockNumber` to the stored previous entry — so a streak can no longer
+>   be manufactured by re-proving one snapshot across many epochs. Epochs must
+>   be sequential and each reference block must fall inside its own window,
+>   derived from the new `Policy.startBlock`.
+> - **Scan public values are 224 bytes**, adding `startBlock`/`endBlock`. The
+>   range is *proven* from header item 8 (block number), not asserted, and is
+>   stored on-chain. `endBlockHash` is bound through EIP-2935 (8191 blocks)
+>   instead of `blockhash(block.number - 1)`.
+> - **`proven: bool` is replaced by an immutable `Provenance` enum**
+>   (`OperatorAsserted` / `BalancesProven` / `RangeScanProven`). Completeness
+>   is always *relative to a recorded block range*; no surface may call a root
+>   simply "complete".
+> - **Roots pin their own semantics**: each `SetEntry` stores
+>   `policyConfigHash`, both vkey hashes, and an immutable `validUntil`
+>   computed from the source block. Policies freeze on first publication.
+> - **An empty set has a root**: `SHA256("zkpof-empty-solvent-set-v1")`, so an
+>   epoch where nobody qualified is publishable. `bytes32(0)` still means "no
+>   root at all", and `prevBlockNumber == 0` is the first-epoch discriminator.
+> - **The MPT verifier no longer treats an empty proof as proof of absence**
+>   against an arbitrary root — the flaw that allowed silent censorship from a
+>   root advertised as complete.
 
 ---
 
@@ -389,10 +426,24 @@ Stage C (light-client-verified state enumeration) remains open.
   the cost of new trust; out of scope.
 - **Non-encumbrance**: proving funds aren't borrowed, key-shared, or pledged
   elsewhere is not possible on a transparent account chain. The economic
-  mitigation — streak solvency with blockhash-randomized reference blocks
-  (§4.1) — landed in Phase 11 and raises the cost of rented solvency to
-  roughly the cost of real solvency over the streak window, but it is a price,
-  not a proof.
+  mitigation — streak solvency with randomized reference blocks (§4.1) —
+  landed in Phase 11 and was made temporally sound in Phase 15, but it is a
+  price, not a proof.
+
+  **What a streak of N actually means.** The address met the threshold at
+  **N sampled blocks, one per epoch** — not continuously, and not at any
+  block in between. Phase 15 guarantees those N observations are genuinely
+  distinct and ordered (sequential epochs, strictly advancing reference
+  blocks inside their own windows, each bound to the previous entry on-chain),
+  which is what stops one funded snapshot being replayed into an arbitrarily
+  long streak. It does **not** turn N samples into continuous holding: funds
+  can leave and return between samples. Because the sample points are drawn
+  from entropy the holder cannot predict in advance, evading them means
+  holding the balance most of the time anyway — that is the deterrent, and it
+  is economic, not cryptographic.
+
+  Interfaces must not describe a streak as "held for N epochs". The accurate
+  phrasing is "met the threshold at N sampled observations".
 
 ---
 

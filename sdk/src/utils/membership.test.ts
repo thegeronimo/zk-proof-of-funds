@@ -21,7 +21,20 @@ const VECTOR =
   "0000000000aa36a7" + // chainId = 11155111 (sepolia)
   "00".repeat(24) +
   "000000000000000c" + // minStreak = 12
-  "07".repeat(32); // scopeHash
+  "07".repeat(32) + // scopeHash
+  // --- presentation context ---
+  "c0".repeat(32) + // policyConfigHash
+  "00".repeat(12) +
+  "ee".repeat(20) + // verifier
+  "00".repeat(24) +
+  "0000000000000001" + // verifierChainId = 1
+  "ac".repeat(32) + // actionId
+  "00".repeat(12) +
+  "be".repeat(20) + // beneficiary
+  "00".repeat(24) +
+  "0000000000000007" + // nonce = 7
+  "00".repeat(24) +
+  "0000000001298be0"; // deadline = 19_500_000
 
 describe("decodeMembershipPublicValues", () => {
   it("decodes the cross-language vector", () => {
@@ -34,6 +47,13 @@ describe("decodeMembershipPublicValues", () => {
     expect(values.chainId).toBe(11155111n);
     expect(values.minStreak).toBe(12n);
     expect(values.scopeHash).toBe(`0x${"07".repeat(32)}`);
+    expect(values.policyConfigHash).toBe(`0x${"c0".repeat(32)}`);
+    expect(values.verifier).toBe(`0x${"ee".repeat(20)}`);
+    expect(values.verifierChainId).toBe(1n);
+    expect(values.actionId).toBe(`0x${"ac".repeat(32)}`);
+    expect(values.beneficiary).toBe(`0x${"be".repeat(20)}`);
+    expect(values.nonce).toBe(7n);
+    expect(values.deadline).toBe(19_500_000n);
   });
 
   it("accepts a 0x prefix and surrounding whitespace", () => {
@@ -43,12 +63,12 @@ describe("decodeMembershipPublicValues", () => {
 
   it("rejects a wrong-length blob", () => {
     expect(() => decodeMembershipPublicValues(VECTOR.slice(0, -2))).toThrow(
-      /expected 224 bytes, got 223/
+      /expected 448 bytes, got 447/
     );
   });
 
   it("rejects non-hex input", () => {
-    expect(() => decodeMembershipPublicValues("zz".repeat(224))).toThrow(/not valid hex/);
+    expect(() => decodeMembershipPublicValues("zz".repeat(448))).toThrow(/not valid hex/);
   });
 
   it("rejects nonzero padding in a uint64 word", () => {

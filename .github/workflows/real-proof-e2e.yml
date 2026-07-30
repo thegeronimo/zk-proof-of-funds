@@ -1,0 +1,126 @@
+# The real-proof end-to-end (EXECUTION_PLAN.md Phase 15.6).
+#
+# This is the one leg that cannot run on an Apple Silicon dev machine:
+# Succinct's `sp1-gnark` image — which SP1 shells out to for the Groth16 wrap —
+# is published for **amd64 only**. GitHub's ubuntu runners are amd64, so CI is
+# the natural home for it rather than a local prerequisite.
+#
+# Split into two jobs deliberately:
+#
+#   fast   — everything that does not need the proving stack. Runs on every
+#            push, in a couple of minutes. This is where the mutation matrix
+#            lives, and the mutation matrix is what actually establishes that
+#            each public value is bound.
+#
+#   proof  — the expensive real-proof round trip. Downloads ~8 GB of Groth16
+#            circuit artifacts and takes tens of minutes, so it runs on demand
+#            and on a schedule, not on every commit.
+#
+# Until `proof` has passed on a commit, that commit's demo surfaces must say
+# "protocol simulation": the contract logic is verified, the proof-system
+# integration is not.
+
+name: real-proof-e2e
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Weekly: the expensive leg should not gate day-to-day work, but it must
+    # not silently rot either.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  fast:
+    name: Contracts, Rust, SDK, web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Contract suite (includes the E2E mutation matrix)
+        working-directory: contracts
+        run: forge test -vv
+
+      - name: Rust suite
+        # The SP1 emulator tests are #[ignore]d — they need built guest ELFs
+        # and take tens of minutes, so they belong in the proof job.
+        run: cargo test --workspace
+
+      - name: SDK
+        working-directory: sdk
+        run: |
+          npm ci
+          npx vitest run
+
+      - name: Web typecheck + build
+        working-directory: web
+        run: |
+          npm ci
+          npx tsc --noEmit
+          npm run build
+
+  proof:
+    name: Real Groth16 proof against the deployed verifier
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Free disk space
+        # The Groth16 circuit artifacts are ~8 GB and the runner ships with a
+        # lot of preinstalled tooling we do not need.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - name: Install the SP1 toolchain
+        run: |
+          curl -L https://sp1up.succinct.xyz | bash
+          echo "$HOME/.sp1/bin" >> "$GITHUB_PATH"
+          "$HOME/.sp1/bin/sp1up"
+
+      - name: Cache the Groth16 circuit artifacts
+        # ~8 GB, identical for every build of every program — fetch it once.
+        uses: actions/cache@v4
+        with:
+          path: ~/.sp1/circuits
+          key: sp1-circuits-${{ runner.os }}-v6.1.0
+
+      - name: Build the guest ELFs
+        run: |
+          for guest in program program-membership program-solvent-set program-receipt-scan; do
+            (cd "$guest" && cargo prove build)
+          done
+
+      - name: SP1 guest-vs-host equivalence
+        # The #[ignore]d emulator tests: the real ELFs must commit
+        # byte-identical public values to the host mirrors, or the mirrors
+        # have drifted from the circuits.
+        run: cargo test --test privacy_v2_integration -- --ignored
+
+      - name: Real-proof E2E
+        # Compressed tier, then the Groth16 wrap, then the proof through the
+        # real deployed SP1VerifierGroth16 on anvil — including asserting that
+        # tampered public values and a wrong vkey are rejected.
+        run: bash scripts/real-proof-e2e.sh --skip-build
+
+      - name: Upload the artifact manifest and proof bundles
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          path: target/e2e/

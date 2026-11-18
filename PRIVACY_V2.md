@@ -115,7 +115,7 @@ V2 fixes all three with two constructions:
 | Verifier learns address | No | No | No |
 | Anonymity set | Enrolled members | Enrolled members | **All solvent addresses on chain** |
 | User work per epoch | None | Submit fresh MPT proof | **None** (set updates without user) |
-| User work at use time | None | None | One small client-side proof (~seconds) |
+| User work at use time | None | None | One small client-side proof (minutes on a desktop CPU today; ~seconds is the Phase 17 target — see docs/PERFORMANCE.md) |
 | One identity per address | Not enforced (malleable memberId) | Not enforced | **Enforced (nullifier)** |
 | Correctness of status bits | SP1 batch proof | Host-side MPT verify (trusted) | SP1 membership proof (per use) + published set root |
 
@@ -417,6 +417,35 @@ set is itself proven). For native-ETH policies completeness is still
 unproven — there is no log trail for plain balance changes, which is why
 Stage C (light-client-verified state enumeration) remains open.
 
+#### Candidates versus the solvent set (worked example)
+
+The **candidate set** is the input to derivation: every address the agent
+checks this epoch. The **solvent set** is the output: the candidates whose
+balance met the threshold at the reference block. Neither is a list of users —
+nobody enrolls, and the agent never learns which solvent addresses belong to
+people who will later prove membership.
+
+For an ERC-20 policy the candidates are every address that appears as `from`
+or `to` in one of the token's `Transfer` events over the scanned range,
+whatever its balance is now. With a 10,000 USDC threshold:
+
+| Address | In a `Transfer` event? | Balance at block B | Candidate? | In solvent set? |
+|---|---|---|---|---|
+| A | Yes | 50,000 | Yes | Yes |
+| B | Yes | 200 | Yes | No |
+| C | Yes | 0 (sent it all away) | Yes | No |
+| D | Never touched the token | 0 | No | No |
+
+The agent cannot know in advance that only A qualifies, so the derivation
+proof verifies a storage proof for A, B and C, and only A lands in the
+published set. Two consequences:
+
+- **Completeness.** An address can only hold the token if it has received a
+  transfer, so "everyone who ever appeared in a `Transfer`" contains every
+  holder. That is the superset Stage B.2 commits to.
+- **Cost.** Proving work scales with the candidate count (three here), not the
+  solvent-set size (one) — see docs/PERFORMANCE.md.
+
 ### 4.5 What V2 deliberately does not solve
 
 - **The trilemma**: continuous automation + middleware-blind privacy + no new
@@ -444,6 +473,42 @@ Stage C (light-client-verified state enumeration) remains open.
 
   Interfaces must not describe a streak as "held for N epochs". The accurate
   phrasing is "met the threshold at N sampled observations".
+
+### 4.6 What leaks and what does not
+
+In the solvent-set flow the member's public key and address never leave their
+machine. Inside the membership program `pk` is an intermediate value: derived
+from `sk`, used to compute the address and the nullifier, then discarded. The
+committed public values are the set root, policy, epoch, chain, scope,
+`minStreak` (not the actual streak), `nullifierHash`, and the presentation
+context. The nullifier cannot be used to test a guessed key: checking
+`N = h · sk` against a candidate `pk` requires that key's `sk`.
+
+| Party | Learns address or `pk`? | Why |
+|---|---|---|
+| Agent / operator | No | The member downloads the full public set and searches it locally |
+| Relying protocol, oracle | No | They receive only the proof and the public values |
+| Chain observers | No | Same data as the relying protocol |
+
+Ways a member can still be linked, none of which the proof can prevent:
+
+- **The submitting address.** `verifyAndConsume` requires
+  `beneficiary == msg.sender`. Submitting from the funded wallet itself
+  reveals it; so does funding a fresh submitting address for gas from the
+  funded wallet. Members who need unlinkability must submit from, and fund, an
+  unrelated address.
+- **Delegated proving.** A delegated prover receives `sk` — strictly worse
+  than leaking `pk`.
+- **Reuse within a scope.** The nullifier is identical every time the same key
+  acts in the same scope. That reveals nothing about the key, but it shows
+  that two actions came from the same hidden member.
+- **Small sets.** The anonymity set is everyone meeting the threshold. For a
+  high threshold or an obscure token it may be small enough to narrow down by
+  timing or other side information.
+- **Monitored-mode enrollment is different.** `POST /v2/enroll` (§3.2a,
+  `zkpof-client enroll`) deliberately sends `pk` to the agent with a DLEQ
+  proof, because in monitored mode the agent watches the address anyway. Only
+  the `witness` / `prove` path is address-private.
 
 ---
 

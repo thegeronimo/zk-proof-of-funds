@@ -16,10 +16,12 @@
 //!   7. nullifier_hash = SHA256(N_compressed)
 //!
 //! The exact streak stays private; the proof reveals only that it meets the
-//! policy minimum. Public values committed as one ABI blob (224 bytes) so
+//! policy minimum. Public values committed as one ABI blob (448 bytes) so
 //! Solidity decodes it directly: abi.encode(bytes32 solventSetRoot,
 //! bytes32 policyId, uint64 epoch, bytes32 nullifierHash, uint64 chainId,
-//! uint64 minStreak, bytes32 scopeHash).
+//! uint64 minStreak, bytes32 scopeHash, bytes32 policyConfigHash,
+//! address verifier, uint64 verifierChainId, bytes32 actionId,
+//! address beneficiary, uint64 nonce, uint64 deadline).
 //!
 //! The statement is implemented once, in `zk_pof_common::membership`, shared
 //! byte-for-byte with the host-side mirror used for witness generation and

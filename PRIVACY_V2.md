@@ -492,11 +492,17 @@ context. The nullifier cannot be used to test a guessed key: checking
 
 Ways a member can still be linked, none of which the proof can prevent:
 
-- **The submitting address.** `verifyAndConsume` requires
-  `beneficiary == msg.sender`. Submitting from the funded wallet itself
-  reveals it; so does funding a fresh submitting address for gas from the
-  funded wallet. Members who need unlinkability must submit from, and fund, an
-  unrelated address.
+- **The submitting address.** The proof authorises the action by itself; no
+  signature from the funded wallet is needed, and `beneficiary` names the
+  relying contract that calls `verifyAndConsume`, not the member. So the
+  transaction that carries the proof to the relying contract can come from
+  any address or a relayer. Sending it from the funded wallet reveals that
+  wallet, as does funding a fresh submitting address for gas from it. Use an
+  unrelated address or a relayer.
+- **Unbound arguments.** Anything the relying contract takes outside the
+  proof (a payout recipient, an account identifier) is not covered by it, so
+  whoever submits the transaction can change it. Integrators should bind
+  such values into the proof, for example through `actionId`.
 - **Delegated proving.** A delegated prover receives `sk` — strictly worse
   than leaking `pk`.
 - **Reuse within a scope.** The nullifier is identical every time the same key
